@@ -1,0 +1,107 @@
+:root,
+:host,
+:host > * {
+    font-family: var(--font-family);
+    background-color: var(--color-background);
+    color: var(--color-text);
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: 0.15px;
+}
+:host([lang="ja"]), :host([lang="ja"]) > * {
+    letter-spacing: 0;
+    line-height: 1.7;
+}
+
+a {
+    color: var(--color-link); 
+    text-decoration: none;
+    transition: color var(--transition-standard);
+}
+
+a:visited {
+    color: var(--color-link);
+}
+
+a:hover {
+    color: var(--color-link);
+    text-decoration: underline;
+    opacity: 0.8;
+}
+
+a.button {
+    text-align: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+
+a.button::after {
+    content: ' ↗';
+    font-size: 80%;
+}
+
+input[type='text'],
+input[type='number'],
+textarea {
+    color: var(--color-text);
+    background-color: transparent;
+    border: 1px solid var(--color-input-border);
+    border-radius: var(--border-radius-sm);
+    padding: 8px 12px;
+    font-size: 14px;
+    transition: border-color var(--transition-standard), box-shadow var(--transition-standard);
+}
+
+input[type='text']:focus,
+input[type='number']:focus,
+textarea:focus {
+    outline: none;
+    border-color: var(--md-sys-color-primary);
+    box-shadow: 0 0 0 2px var(--md-sys-color-primary-container);
+}
+
+input[type='checkbox'] {
+    accent-color: var(--md-sys-color-primary);
+    height: 1.25rem;
+    width: 1.25rem;
+    cursor: pointer;
+}
+
+button,
+a.button,
+input[type='submit'] {
+    color: var(--md-sys-color-on-primary);
+    background-color: var(--md-sys-color-primary);
+    border: none;
+    border-radius: var(--border-radius-pill);
+    padding: 8px 20px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    box-shadow: var(--md-sys-elevation-1);
+    transition: background-color var(--transition-standard), box-shadow var(--transition-standard), transform var(--transition-standard);
+}
+
+button:disabled {
+    background-color: var(--md-sys-color-surface-container-high);
+    color: var(--md-sys-color-on-surface-variant);
+    box-shadow: none;
+    cursor: not-allowed;
+    opacity: 0.8;
+}
+
+button:enabled:hover,
+a.button:hover,
+input[type='submit']:hover {
+    box-shadow: var(--md-sys-elevation-2);
+    background-color: color-mix(in srgb, var(--md-sys-color-primary) 92%, black);
+}
+
+button:enabled:active,
+a.button:active,
+input[type='submit']:active {
+    box-shadow: none;
+    transform: translateY(1px);
+}
+

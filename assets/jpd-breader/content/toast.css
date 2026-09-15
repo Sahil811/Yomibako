@@ -1,0 +1,80 @@
+:host {
+    all: initial;
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    right: auto;
+    top: auto;
+    transform: translateX(-50%);
+    z-index: 2147483646; /* below popup 2147483647, so it stays visible */
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    align-items: center;
+    min-width: 280px;
+    max-width: min(420px, 90vw);
+    pointer-events: none;
+    font-family: var(--font-family, 'Inter', 'Roboto', sans-serif);
+}
+
+.toast {
+    background-color: var(--md-sys-color-surface-container, var(--color-background));
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    padding: 0.7rem 1rem 0.7rem 1.2rem;
+    display: flex;
+    flex-direction: row;
+    gap: 0.8rem;
+    align-items: center;
+    
+    color: var(--color-text, #fff);
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: var(--md-sys-elevation-2, 0 4px 15px rgba(0,0,0,0.15));
+    pointer-events: auto;
+    
+    animation: toast-enter 0.3s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes toast-enter {
+    from { 
+        opacity: 0;
+        transform: translateY(10px) scale(0.97);
+    }
+    to { 
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+.toast .buttons {
+    margin-left: auto;
+    display: flex;
+    flex-direction: row;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.toast button {
+    padding: 0;
+    margin: 0;
+    width: 2.2rem;
+    height: 2.2rem;
+    border-radius: 50%;
+    cursor: pointer;
+    background-color: transparent;
+    color: inherit;
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background-color 0.2s, transform 0.2s;
+}
+
+.toast button:hover {
+    background-color: rgba(150, 150, 150, 0.2);
+    transform: scale(1.05);
+}
