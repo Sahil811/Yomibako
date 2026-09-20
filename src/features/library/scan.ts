@@ -81,7 +81,22 @@ function buildOcrMap(ocrDir: Directory | null): Map<string, string> | null {
   }
 }
 
-const yieldToUI = () => new Promise<void>((r) => setTimeout(r, 0));
+export type ScanControl = {
+  /** Return true when the scan should abort ASAP (unmount). */
+  isCancelled?: () => boolean;
+  /** Resolve when it is safe to continue (used to pause while user navigates). */
+  waitWhilePaused?: () => Promise<void>;
+};
+
+const yieldToUI = (ms = 25) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function yieldCooperatively(control?: ScanControl): Promise<boolean> {
+  if (control?.isCancelled?.()) return false;
+  if (control?.waitWhilePaused) await control.waitWhilePaused();
+  if (control?.isCancelled?.()) return false;
+  await yieldToUI();
+  return !control?.isCancelled?.();
+}
 
 // Phase 1 (instant, 1 SAF call already done): shells from names only.
 // pageCount 0 + no cover until fillDetails runs. Non-volume dirs get
@@ -204,12 +219,16 @@ async function fillDetails(
   out: Volume[],
   total: { pages: number },
   onProgress?: (done: number, totalDirs: number) => void,
-  onUpdate?: () => void
+  onUpdate?: () => void,
+  control?: ScanControl
 ) {
   const byUri = new Map(level.dirs.map((d) => [d.uri, d]));
   let n = 0;
   const totalDirs = shells.length;
   for (const shell of shells) {
+    if (control?.isCancelled?.()) break;
+    if (control?.waitWhilePaused) await control.waitWhilePaused();
+    if (control?.isCancelled?.()) break;
     const dir = byUri.get(shell.uri);
     if (!dir) {
       n++;
@@ -221,12 +240,14 @@ async function fillDetails(
     }
     pushVolumeDetail(out, shell, media, total);
     n++;
-    // list() is sync native — yield + report every 10 volumes so the
-    // UI stays alive instead of looking stuck.
-    if (n % 10 === 0) {
-      await reportFillProgress(n, totalDirs, onProgress, onUpdate);
-    }
+    // list() is sync native — each call can be 50-500ms on SAF with 100s
+    // of images. Yield EVERY volume with a real frame gap so tab presses
+    // and volume taps run between volumes instead of queuing 10s+ behind
+    // a batch. Slower total scan, but taps stay <500ms.
+    await reportFillProgress(n, totalDirs, onProgress, onUpdate);
+    if (!(await yieldCooperatively(control))) break;
   }
+  if (control?.isCancelled?.()) return;
   onProgress?.(n, totalDirs);
   onUpdate?.();
 }
@@ -252,7 +273,13 @@ function isCountableChildDir(name: string): boolean {
 
 function countFolderContents(dir: Directory): FolderCounts {
   const counts: FolderCounts = { images: 0, readable: 0, childDirs: 0 };
-  for (const item of dir.list()) {
+  let items: (File | Directory)[];
+  try {
+    items = dir.list();
+  } catch {
+    return counts;
+  }
+  for (const item of items) {
     if (item instanceof Directory) {
       if (isCountableChildDir(item.name)) {
         counts.childDirs++;
@@ -319,11 +346,15 @@ function isDirectVolumeFolder(top: Level, dir: Directory): boolean {
 async function partitionShelfDirs(
   top: Level,
   rootName: string,
-  onProgress?: (seriesName: string, done: number, totalDirs: number) => void
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
+  control?: ScanControl
 ): Promise<{ seriesFolders: Directory[]; directVolumeFolders: Directory[] }> {
   const seriesFolders: Directory[] = [];
   const directVolumeFolders: Directory[] = [];
   for (let index = 0; index < top.dirs.length; index++) {
+    if (control?.isCancelled?.()) break;
+    if (control?.waitWhilePaused) await control.waitWhilePaused();
+    if (control?.isCancelled?.()) break;
     const dir = top.dirs[index];
     const shape = inspectFolder(dir);
     if (shape === 'series') {
@@ -331,9 +362,9 @@ async function partitionShelfDirs(
     } else if (shape === 'volume' || isDirectVolumeFolder(top, dir)) {
       directVolumeFolders.push(dir);
     }
-    if ((index + 1) % 8 === 0) {
+    if ((index + 1) % 4 === 0) {
       onProgress?.(rootName, index + 1, top.dirs.length);
-      await yieldToUI();
+      if (!(await yieldCooperatively(control))) break;
     }
   }
   return { seriesFolders, directVolumeFolders };
@@ -343,13 +374,16 @@ async function scanSingleSeriesRoot(
   rootUri: string,
   rootName: string,
   onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
-  onUpdate?: (series: Series[]) => void
+  onUpdate?: (series: Series[]) => void,
+  control?: ScanControl
 ): Promise<Series[]> {
   const single = await scanSeries(
     rootUri,
     rootName,
     (done, total) => onProgress?.(rootName, done, total),
-    (shell) => onUpdate?.([{ ...shell, sourceRootUri: rootUri }])
+    (shell) => onUpdate?.([{ ...shell, sourceRootUri: rootUri }]),
+    undefined,
+    control
   );
   const tagged = { ...single, sourceRootUri: rootUri };
   onUpdate?.(tagged.volumes.length ? [tagged] : []);
@@ -362,19 +396,22 @@ async function scanShelfLooseVolumes(
   directVolumeFolders: Directory[],
   results: Series[],
   publish: (draft?: Series) => void,
-  onProgress?: (seriesName: string, done: number, totalDirs: number) => void
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
+  control?: ScanControl
 ): Promise<void> {
   // Mixed shelves may contain loose volumes alongside series folders. Keep
   // those loose volumes together under the selected root's name.
   if (directVolumeFolders.length === 0) {
     return;
   }
+  if (control?.isCancelled?.()) return;
   const direct = await scanSeries(
     rootUri,
     rootName,
     (done, total) => onProgress?.(rootName, done, total),
     undefined,
-    new Set(directVolumeFolders.map((folder) => folder.uri))
+    new Set(directVolumeFolders.map((folder) => folder.uri)),
+    control
   );
   if (direct.volumes.length) {
     results.push({ ...direct, sourceRootUri: rootUri });
@@ -387,21 +424,27 @@ async function scanShelfSeriesFolders(
   seriesFolders: Directory[],
   results: Series[],
   publish: (draft?: Series) => void,
-  onProgress?: (seriesName: string, done: number, totalDirs: number) => void
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
+  control?: ScanControl
 ): Promise<void> {
   for (const folder of seriesFolders) {
+    if (control?.isCancelled?.()) break;
+    if (control?.waitWhilePaused) await control.waitWhilePaused();
+    if (control?.isCancelled?.()) break;
     const name = decodedName(folder.name);
     const scanned = await scanSeries(
       folder.uri,
       name,
       (done, total) => onProgress?.(name, done, total),
-      (shell) => publish({ ...shell, sourceRootUri: rootUri })
+      (shell) => publish({ ...shell, sourceRootUri: rootUri }),
+      undefined,
+      control
     );
     if (scanned.volumes.length) {
       results.push({ ...scanned, sourceRootUri: rootUri });
       publish();
     }
-    await yieldToUI();
+    if (!(await yieldCooperatively(control))) break;
   }
 }
 
@@ -409,33 +452,37 @@ export async function scanLibrary(
   rootUri: string,
   rootName: string,
   onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
-  onUpdate?: (series: Series[]) => void
+  onUpdate?: (series: Series[]) => void,
+  control?: ScanControl
 ): Promise<Series[]> {
   const top = readLevel(rootUri);
   if (!top || top.dirs.length === 0) {
-    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate);
+    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate, control);
   }
 
   const { numericMajority } = computeVolumeMajority(top);
   if (numericMajority) {
-    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate);
+    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate, control);
   }
 
-  const { seriesFolders, directVolumeFolders } = await partitionShelfDirs(top, rootName, onProgress);
+  const { seriesFolders, directVolumeFolders } = await partitionShelfDirs(top, rootName, onProgress, control);
+  if (control?.isCancelled?.()) return [];
 
   // A normal series root contains volume-like children only.
   if (seriesFolders.length === 0) {
-    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate);
+    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate, control);
   }
 
   const results: Series[] = [];
   const publish = (draft?: Series) => {
+    if (control?.isCancelled?.()) return;
     const all = draft ? [...results, draft] : [...results];
     onUpdate?.(all.filter((item) => item.volumes.length > 0));
   };
 
-  await scanShelfLooseVolumes(rootUri, rootName, directVolumeFolders, results, publish, onProgress);
-  await scanShelfSeriesFolders(rootUri, seriesFolders, results, publish, onProgress);
+  await scanShelfLooseVolumes(rootUri, rootName, directVolumeFolders, results, publish, onProgress, control);
+  if (control?.isCancelled?.()) return results;
+  await scanShelfSeriesFolders(rootUri, seriesFolders, results, publish, onProgress, control);
 
   return results;
 }
@@ -569,16 +616,17 @@ function snapshotSeries(state: SeriesScanState): Series {
   };
 }
 
-async function fillSeriesLevel(level: Level, state: SeriesScanState): Promise<void> {
+async function fillSeriesLevel(level: Level, state: SeriesScanState & { control?: ScanControl }): Promise<void> {
   const ocrMap = buildOcrMap(level.ocrDir);
   const shells = shellsForLevel(level, state.seriesName, ocrMap).filter(
     (shell) => level.uri !== state.rootUri || !state.topDirectoryUris || state.topDirectoryUris.has(shell.uri)
   );
   // Instant UI: names + html links after just 1 listing…
   state.onShell?.({ name: state.seriesName, rootUri: state.rootUri, volumes: shells, totalPages: 0 });
-  // …then counts/covers stream in every 10 volumes.
+  // …then counts/covers stream in small batches (see fillDetails).
   await fillDetails(level, shells, state.volumes, state.total, state.onProgress, () =>
-    state.onShell?.(snapshotSeries(state))
+    state.onShell?.(snapshotSeries(state)),
+    state.control
   );
 }
 
@@ -643,13 +691,16 @@ async function attemptNestedDescents(
   return { descended: false, next: null };
 }
 
-async function descendNestedLevels(top: Level, state: SeriesScanState): Promise<void> {
+async function descendNestedLevels(top: Level, state: SeriesScanState & { control?: ScanControl }): Promise<void> {
   // Nested case: e.g. mokuro/Detective Conan/Detective Conan/volumes
   // (double nesting from unzip/file manager). Descend while the current
   // level yields 0 volumes but contains a subfolder that itself looks like
   // a series root (many subdirs, ~0 images). Max 3 levels deep.
   let current: Level | null = top;
   for (let depth = 0; depth < 3 && state.volumes.length === 0 && current && current.dirs.length > 0; depth++) {
+    if (state.control?.isCancelled?.()) break;
+    if (state.control?.waitWhilePaused) await state.control.waitWhilePaused();
+    if (state.control?.isCancelled?.()) break;
     const candidates = collectNestedCandidates(current, depth);
     const outcome = await attemptNestedDescents(candidates, state);
     if (!outcome.descended) {
@@ -673,7 +724,8 @@ export async function scanSeries(
   // Called with name-only shells right after the single root listing,
   // so the caller can show the library instantly while details fill in.
   onShell?: (shell: Series) => void,
-  topDirectoryUris?: Set<string>
+  topDirectoryUris?: Set<string>,
+  control?: ScanControl
 ): Promise<Series> {
   const top = readLevel(rootUri);
   if (!top) return { name: seriesName, rootUri, volumes: [], totalPages: 0 };
@@ -683,7 +735,7 @@ export async function scanSeries(
     return bare;
   }
 
-  const state: SeriesScanState = {
+  const state: SeriesScanState & { control?: ScanControl } = {
     rootUri,
     seriesName,
     volumes: [],
@@ -691,9 +743,11 @@ export async function scanSeries(
     onProgress,
     onShell,
     topDirectoryUris,
+    control,
   };
 
   await fillSeriesLevel(top, state);
+  if (control?.isCancelled?.()) return { name: seriesName, rootUri, volumes: state.volumes, totalPages: state.total.pages };
   await descendNestedLevels(top, state);
 
   state.volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));

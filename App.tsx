@@ -11,13 +11,13 @@ import ErrorBoundary from './src/components/system/ErrorBoundary';
 export default function App() {
   const scheme = useColorScheme();
   // The hidden jpdb.io session view spawns a second renderer + network fetch
-  // on cold start. Defer it until after first paint so startup stays fast;
-  // cookie-gated jobs queue until the bridge is ready.
+  // on cold start. Defer it well past the library scan so tab presses and
+  // volume taps never compete with it; cookie-gated jobs queue until ready.
   const [sessionReady, setSessionReady] = useState(false);
   useEffect(() => {
     // InteractionManager is deprecated — a plain idle-time delay keeps the
     // hidden session view off the critical startup path without it.
-    const timer = setTimeout(() => setSessionReady(true), 1500);
+    const timer = setTimeout(() => setSessionReady(true), 6000);
     return () => clearTimeout(timer);
   }, []);
   return (

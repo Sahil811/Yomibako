@@ -63,9 +63,17 @@ const TabButton = React.memo(function TabButton({ isFocused, colors, onPress, la
   );
 });
 
+const lastTabNav: Record<string, number> = {};
 function TabBarTab({ route, isFocused, colors, navigation }: any) {
   const meta = TAB_META[route.name] ?? { label: route.name, icon: 'book' as IconName };
   const onPress = React.useCallback(() => {
+    // Queued taps during a freeze can fire back-to-back. One navigation
+    // per 1.5s per tab — extras are duplicates.
+    const nowTap = Date.now();
+    if (nowTap - (lastTabNav[route.name] ?? 0) < 1500) {
+      return;
+    }
+    lastTabNav[route.name] = nowTap;
     const e = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
     if (!isFocused && !e.defaultPrevented) {
       Haptics.selectionAsync();
@@ -129,7 +137,7 @@ function TabsWrapperRenderTabBar(props: any) {
 function TabsWrapper() {
   return (
     <View style={{ flex: 1 }}>
-      <Tab.Navigator tabBar={TabsWrapperRenderTabBar} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true }}>
+      <Tab.Navigator tabBar={TabsWrapperRenderTabBar} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true, lazy: true }}>
         <Tab.Screen name="Library" component={LibraryScreen} />
         <Tab.Screen name="Browser" component={BrowserScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />

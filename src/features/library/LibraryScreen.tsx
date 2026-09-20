@@ -514,15 +514,24 @@ function mergeHydratedIntoLibrary(latest: Series[], hydrated: Series[]): Series[
   return mergeSeries(latest, filterHydratedToLive(latest, hydrated));
 }
 
+let lastFocusRefresh = 0;
 function refreshLibraryOnFocus(
   libraryRef: React.RefObject<Series[]>,
-  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>
+  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>,
+  scanningRef?: React.RefObject<boolean>,
+  control?: import('./scan').ScanControl
 ): void {
   const current = libraryRef.current;
   if (!current.length) {
     return;
   }
-  void withSavedProgress(current).then((hydrated) => {
+  // Returning from Reader/Browser fires focus; re-hydrating 100+ SecureStore
+  // reads on every return queues taps behind storage. Throttle to 5s and
+  // skip entirely while a rescan is already hydrating.
+  if (scanningRef?.current) return;
+  if (Date.now() - lastFocusRefresh < 5000) return;
+  lastFocusRefresh = Date.now();
+  void withSavedProgress(current, control).then((hydrated) => {
     setLibrary((latest) => mergeHydratedIntoLibrary(latest, hydrated));
   });
 }
@@ -649,7 +658,36 @@ type ScanRefs = {
   goneRef: React.RefObject<boolean>;
   libraryRef: React.RefObject<Series[]>;
   removedRef: React.RefObject<Set<string>>;
+  pausedRef?: React.RefObject<boolean>;
+  lastAbsorbRef?: React.RefObject<number>;
+  lastProgressRef?: React.RefObject<number>;
 };
+
+function scanControlFromRefs(refs: ScanRefs): import('./scan').ScanControl {
+  return {
+    isCancelled: () => !!refs.goneRef.current,
+    waitWhilePaused: async () => {
+      // While the user is on Browser/Settings/Reader, park the SAF walk
+      // instead of competing with navigation + WebView for the JS thread.
+      // Cap the park at ~30s per checkpoint so a missed focus event can
+      // never wedge the scan forever.
+      let waited = 0;
+      while (refs.pausedRef?.current && !refs.goneRef.current && waited < 30000) {
+        await new Promise<void>((r) => setTimeout(r, 200));
+        waited += 200;
+      }
+    },
+  };
+}
+
+function shouldThrottleAbsorb(refs: ScanRefs, force: boolean): boolean {
+  if (force) return false;
+  const last = refs.lastAbsorbRef?.current ?? 0;
+  // Streaming drafts arrive per volume; each one sorts + re-renders
+  // 100+ cards. Throttle to 1 UI commit per 800ms — taps stay instant.
+  if (Date.now() - last < 800) return true;
+  return false;
+}
 
 async function scanOneRoot(
   uri: string,
@@ -662,26 +700,38 @@ async function scanOneRoot(
     return;
   }
   const name = await resolveRootDisplayName(uri, 'Manga');
+  const control = scanControlFromRefs(refs);
   try {
     const found = await scanLibrary(
       uri,
       name,
       (seriesName, done, total) => {
-        if (!refs.goneRef.current) {
-          setScanProgress(`${seriesName} · ${done}/${total} folders`);
-        }
+        if (refs.goneRef.current) return;
+        // Progress text re-renders the header; throttle so taps don't wait
+        // behind a progress storm.
+        const last = refs.lastProgressRef?.current ?? 0;
+        if (Date.now() - last < 500 && done < total) return;
+        if (refs.lastProgressRef) refs.lastProgressRef.current = Date.now();
+        setScanProgress(`${seriesName} · ${done}/${total} folders`);
       },
       (draft) => {
         if (refs.goneRef.current) {
           return;
         }
+        const isFinal = draft.length > 0 && draft.every((s) => s.totalPages > 0);
+        if (shouldThrottleAbsorb(refs, isFinal)) return;
+        if (refs.lastAbsorbRef) refs.lastAbsorbRef.current = Date.now();
         absorb(draft);
         if (draft.length) {
           setLoading(false);
         }
-      }
+      },
+      control
     );
-    const hydrated = await withSavedProgress(found);
+    if (refs.goneRef.current) return;
+    if (control.waitWhilePaused) await control.waitWhilePaused();
+    if (refs.goneRef.current) return;
+    const hydrated = await withSavedProgress(found, control);
     if (!refs.goneRef.current) {
       absorb(hydrated);
     }
@@ -873,10 +923,13 @@ async function rescanAllRoots(
   setLoading(true);
   try {
     const roots = await getRoots().catch(() => [] as string[]);
+    const control = scanControlFromRefs(refs);
     for (const uri of roots) {
       if (refs.goneRef.current) {
         break;
       }
+      if (control.waitWhilePaused) await control.waitWhilePaused();
+      if (refs.goneRef.current) break;
       await scanOneRoot(uri, refs, setScanProgress, setLoading, absorb);
     }
     // Snapshot the finished scan so the next cold start paints instantly.
@@ -890,22 +943,39 @@ async function rescanAllRoots(
   }
 }
 
-async function withSavedProgress(items: Series[]): Promise<Series[]> {
-  return Promise.all(items.map(async (series) => {
-    const volumes = await Promise.all(series.volumes.map(async (volume) => {
-      const saved = await getSavedReading(volume.progressKey ?? volume.uri);
-      if (!saved) return { ...volume, progress: 0, lastOpened: undefined };
-      const total = volume.pageCount || saved.total || 1;
-      const denominator = Math.max(1, total - 1);
-      return {
-        ...volume,
-        pageCount: total,
-        progress: Math.max(0, Math.min(1, saved.page / denominator)),
-        lastOpened: saved.updatedAt,
-      };
-    }));
-    return recount(series, volumes);
-  }));
+async function hydrateOneVolume(volume: Volume): Promise<Volume> {
+  const saved = await getSavedReading(volume.progressKey ?? volume.uri);
+  if (!saved) return { ...volume, progress: 0, lastOpened: undefined };
+  const total = volume.pageCount || saved.total || 1;
+  const denominator = Math.max(1, total - 1);
+  return {
+    ...volume,
+    pageCount: total,
+    progress: Math.max(0, Math.min(1, saved.page / denominator)),
+    lastOpened: saved.updatedAt,
+  };
+}
+
+async function withSavedProgress(items: Series[], control?: import('./scan').ScanControl): Promise<Series[]> {
+  // SecureStore on Android is EncryptedSharedPreferences + Keystore:
+  // ~10-50ms per read and the bridge serializes. Firing 100+ reads in one
+  // Promise.all wedges startup. Batch 8 at a time + real frame gap + pause
+  // while the user is navigating so tab presses never queue behind hydration.
+  const out: Series[] = [];
+  for (const series of items) {
+    if (control?.isCancelled?.()) break;
+    if (control?.waitWhilePaused) await control.waitWhilePaused();
+    const volumes: Volume[] = [];
+    for (let i = 0; i < series.volumes.length; i += 8) {
+      if (control?.isCancelled?.()) break;
+      if (control?.waitWhilePaused) await control.waitWhilePaused();
+      const batch = series.volumes.slice(i, i + 8);
+      volumes.push(...(await Promise.all(batch.map(hydrateOneVolume))));
+      await new Promise<void>((r) => setTimeout(r, 25));
+    }
+    out.push(recount(series, volumes));
+  }
+  return out;
 }
 
 function SelectionAppBar({ colors, selectionLength, filteredIds, selectedVolumes, onExit, onSelectAll, onRemove }: {
@@ -1380,6 +1450,9 @@ export default function LibraryScreen() {
   const removedRef = useRef<Set<string>>(new Set());
   const scanningRef = useRef(false);
   const goneRef = useRef(false);
+  const pausedRef = useRef(false);
+  const lastAbsorbRef = useRef(0);
+  const lastProgressRef = useRef(0);
   const snackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   libraryRef.current = library;
 
@@ -1437,9 +1510,29 @@ export default function LibraryScreen() {
 
   // Walks every granted root. Also used by "Rescan folders", so volumes added
   // on the device show up without restarting the app.
+  // pausedRef parks the SAF walk while the user is on Browser/Settings/Reader
+  // so tab presses and volume taps never queue behind the scan.
   const rescan = useCallback(async () => {
-    await rescanAllRoots({ goneRef, libraryRef, removedRef, scanningRef }, setLoading, setScanProgress, absorb);
+    await rescanAllRoots({ goneRef, libraryRef, removedRef, scanningRef, pausedRef, lastAbsorbRef, lastProgressRef }, setLoading, setScanProgress, absorb);
   }, [absorb]);
+
+  // Pause the background SAF walk the moment the user leaves the shelf.
+  // Library stays mounted under the tab navigator, so without this the scan
+  // keeps blocking the JS thread while Browser/Settings try to mount.
+  useEffect(() => {
+    const onFocus = () => {
+      pausedRef.current = false;
+    };
+    const onBlur = () => {
+      pausedRef.current = true;
+    };
+    const unFocus = nav.addListener('focus', onFocus);
+    const unBlur = nav.addListener('blur', onBlur);
+    return () => {
+      unFocus();
+      unBlur();
+    };
+  }, [nav]);
 
   const restoreCachedLibrary = useCallback(async () => {
     setRemoved(await loadRemoved().catch(() => new Set<string>()));
@@ -1447,11 +1540,35 @@ export default function LibraryScreen() {
     // then let the live scan below reconcile. absorb() still applies the
     // removal set, so hidden series cannot return from the cache.
     const roots = await getRoots().catch(() => [] as string[]);
+    // setLibrary is async — libraryRef is still [] here, so count the cache
+    // directly.
+    let cachedCount = 0;
     if (roots.length && !goneRef.current) {
       const cached = await loadLibraryIndex(roots);
+      cachedCount = cached.reduce((n, s) => n + s.volumes.length, 0);
       if (cached.length && !goneRef.current) {
-        absorb(await withSavedProgress(cached));
+        // Paint shells instantly; hydrate progress in background so the
+        // first tap never waits behind 100+ SecureStore reads.
+        absorb(cached);
+        const control = scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef });
+        void withSavedProgress(cached, control).then((hydrated) => {
+          if (!goneRef.current) {
+            setLibrary((current) => mergeSeries(current, hydrated));
+          }
+        });
       }
+    }
+    // A single sync SAF listing can't be preempted by any yield. When the
+    // shelf is already visible, defer the walk 20s so taps get a responsive
+    // window first; manual Rescan still runs immediately. The wait itself
+    // yields, unlike list(), so taps stay responsive.
+    const delayMs = cachedCount > 0 ? 20000 : 300;
+    await new Promise<void>((r) => setTimeout(r, delayMs));
+    if (goneRef.current) return;
+    // User already navigating (e.g. reading a volume) — skip the walk
+    // entirely; it will run on next Library focus via manual Rescan.
+    if (pausedRef.current) {
+      return;
     }
     await rescan();
   }, [absorb, rescan, setRemoved]);
@@ -1464,18 +1581,38 @@ export default function LibraryScreen() {
     void restoreCachedLibrary();
   }, [restoreCachedLibrary]);
 
-  useEffect(() => nav.addListener('focus', () => refreshLibraryOnFocus(libraryRef, setLibrary)), [nav]);
+  useEffect(() => nav.addListener('focus', () => refreshLibraryOnFocus(
+    libraryRef,
+    setLibrary,
+    scanningRef,
+    scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef })
+  )), [nav]);
 
   const pickFolder = useCallback(async () => {
     await runPickFolderFlow({ removedRef, setLoading, setScanProgress, setRemoved, setLibrary, setActiveSeriesUri, absorb });
   }, [absorb, setRemoved]);
 
+  const lastOpenRef = useRef(0);
   const openVolume = useCallback((volume: Volume) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    if (series) {
-      const next = markVolumeOpened(series, volume.id);
-      setLibrary((current) => mergeSeries(current, [next]));
+    // Queued taps during a freeze can fire back-to-back, opening multiple
+    // Readers each copying ~50MB. Ignore repeats within 1.5s.
+    const nowTap = Date.now();
+    if (nowTap - lastOpenRef.current < 1500) {
+      return;
     }
+    lastOpenRef.current = nowTap;
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    // Park the background scan BEFORE navigating so Reader mount + volume
+    // copy don't compete with the SAF walk for the JS thread.
+    pausedRef.current = true;
+    // Defer the shelf state write until after navigation commits — the
+    // merge + sort of 100+ volumes otherwise delays the transition.
+    requestAnimationFrame(() => {
+      if (series) {
+        const next = markVolumeOpened(series, volume.id);
+        setLibrary((current) => mergeSeries(current, [next]));
+      }
+    });
     nav.navigate('Reader', { volume, series });
   }, [nav, series]);
 
