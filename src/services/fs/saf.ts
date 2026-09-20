@@ -28,6 +28,15 @@ export async function getRoots(): Promise<string[]> {
   return raw ? JSON.parse(raw) : [];
 }
 
+// Forget a granted root so restoring the library no longer rescans it.
+export async function removeRoot(uri: string) {
+  const existing = await getRoots();
+  const next = existing.filter((item) => item !== uri);
+  if (next.length !== existing.length) {
+    await setItemAsync(SAF_ROOT_KEY, JSON.stringify(next));
+  }
+}
+
 // Unified list — works for file:// and content:// via new Directory API
 export async function listDirectory(uri: string): Promise<FsEntry[]> {
   try {

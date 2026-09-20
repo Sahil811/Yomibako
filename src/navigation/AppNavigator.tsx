@@ -10,17 +10,16 @@ import Animated, { useSharedValue, useAnimatedStyle, withSpring } from 'react-na
 import LibraryScreen from '../features/library/LibraryScreen';
 import ReaderScreen from '../features/reader/ReaderScreen';
 import SettingsScreen from '../features/library/SettingsScreen';
-import BrowseScreen from '../features/library/BrowseScreen';
 import BrowserScreen from '../features/browser/BrowserScreen';
 import { lightColors, darkColors } from '../theme/colors';
 import { Icon, type IconName } from '../components/ui/Icon';
+import ErrorBoundary from '../components/system/ErrorBoundary';
 
 const Stack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
 
 const TAB_META: Record<string, { label: string; icon: IconName }> = {
   Library: { label: 'Library', icon: 'library' },
-  Browse: { label: 'Browse', icon: 'browse' },
   Browser: { label: 'Browser', icon: 'browser' },
   Settings: { label: 'Settings', icon: 'settings' },
 };
@@ -62,6 +61,11 @@ function TabBar({ state, descriptors, navigation }: any) {
   const scheme = useColorScheme();
   const colors = scheme === 'light' ? lightColors : darkColors;
   const insets = useSafeAreaInsets();
+  const activeRoute = state.routes[state.index];
+
+  // Browser reading mode owns the whole window. Its small floating collapse
+  // control restores this bar, so no navigation path is lost.
+  if (activeRoute?.name === 'Browser' && activeRoute?.params?.immersive) return null;
 
   return (
     <View style={[s.barContainer, { paddingBottom: Math.max(insets.bottom, Platform.OS === 'ios' ? 6 : 8) }]}>
@@ -105,11 +109,21 @@ function TabsWrapper() {
     <View style={{ flex: 1 }}>
       <Tab.Navigator tabBar={(p) => <TabBar {...p} />} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true }}>
         <Tab.Screen name="Library" component={LibraryScreen} />
-        <Tab.Screen name="Browse" component={BrowseScreen} />
         <Tab.Screen name="Browser" component={BrowserScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />
       </Tab.Navigator>
     </View>
+  );
+}
+
+// The reader drives a WebView, injected page scripts, orientation locks and
+// Reanimated gestures at once. Guarding it separately means a bad volume drops
+// the user back on the shelf instead of taking down the whole app.
+function GuardedReader(props: any) {
+  return (
+    <ErrorBoundary label="Reader" resetLabel="Back to library" onReset={() => props.navigation.goBack()}>
+      <ReaderScreen {...props} />
+    </ErrorBoundary>
   );
 }
 
@@ -140,7 +154,7 @@ export default function AppNavigator() {
         }}
       >
         <Stack.Screen name="Tabs" component={TabsWrapper} />
-        <Stack.Screen name="Reader" component={ReaderScreen} options={{ animation: 'fade', orientation: 'all', gestureEnabled: true }} />
+        <Stack.Screen name="Reader" component={GuardedReader} options={{ animation: 'fade', orientation: 'default', gestureEnabled: true }} />
       </Stack.Navigator>
     </NavigationContainer>
   );

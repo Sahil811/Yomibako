@@ -24,13 +24,20 @@ export type IconName =
   | 'pause'
   | 'plus'
   | 'check'
+  | 'checkCircle'
+  | 'circle'
+  | 'trash'
+  | 'more'
   | 'ai'
   | 'sort'
   | 'reload'
   | 'info'
   | 'lang'
   | 'lock'
-  | 'audio';
+  | 'audio'
+  | 'repeat'
+  | 'expand'
+  | 'collapse';
 
 function Strokes({ color, strokeWidth, children }: { color: string; strokeWidth: number; children: React.ReactNode }) {
   return <>{children}</>;
@@ -146,6 +153,33 @@ function Glyph({ name, color, strokeWidth }: { name: IconName; color: string; st
       );
     case 'check':
       return <Polyline points="20 6 9 17 4 12" {...p} />;
+    case 'checkCircle':
+      return (
+        <>
+          <Circle cx="12" cy="12" r="10" fill={color} stroke="none" />
+          <Polyline points="7.6 12.3 10.7 15.4 16.4 9.2" stroke="#FFFFFF" strokeWidth={2.3} fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </>
+      );
+    case 'circle':
+      return <Circle cx="12" cy="12" r="9.5" {...p} />;
+    case 'trash':
+      return (
+        <>
+          <Line x1="3.5" y1="6" x2="20.5" y2="6" {...p} />
+          <Path d="M18.5 6l-.9 13.1A2 2 0 0 1 15.6 21H8.4a2 2 0 0 1-2-1.9L5.5 6" {...p} />
+          <Path d="M9.5 6V4.4A1.4 1.4 0 0 1 10.9 3h2.2a1.4 1.4 0 0 1 1.4 1.4V6" {...p} />
+          <Line x1="10.3" y1="10.5" x2="10.3" y2="17" {...p} />
+          <Line x1="13.7" y1="10.5" x2="13.7" y2="17" {...p} />
+        </>
+      );
+    case 'more':
+      return (
+        <>
+          <Circle cx="12" cy="5" r="1.7" fill={color} stroke="none" />
+          <Circle cx="12" cy="12" r="1.7" fill={color} stroke="none" />
+          <Circle cx="12" cy="19" r="1.7" fill={color} stroke="none" />
+        </>
+      );
     case 'ai':
       return <Path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" {...p} />;
     case 'sort':
@@ -195,6 +229,41 @@ function Glyph({ name, color, strokeWidth }: { name: IconName; color: string; st
         <>
           <Polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" {...p} />
           <Path d="M15.54 8.46a5 5 0 0 1 0 7.07" {...p} />
+        </>
+      );
+    case 'repeat':
+      return (
+        <>
+          <Polyline points="17 1 21 5 17 9" {...p} />
+          <Path d="M3 11V9a4 4 0 0 1 4-4h14" {...p} />
+          <Polyline points="7 23 3 19 7 15" {...p} />
+          <Path d="M21 13v2a4 4 0 0 1-4 4H3" {...p} />
+        </>
+      );
+    case 'expand':
+      return (
+        <>
+          <Polyline points="8 3 3 3 3 8" {...p} />
+          <Line x1="3" y1="3" x2="9" y2="9" {...p} />
+          <Polyline points="16 3 21 3 21 8" {...p} />
+          <Line x1="21" y1="3" x2="15" y2="9" {...p} />
+          <Polyline points="3 16 3 21 8 21" {...p} />
+          <Line x1="3" y1="21" x2="9" y2="15" {...p} />
+          <Polyline points="21 16 21 21 16 21" {...p} />
+          <Line x1="21" y1="21" x2="15" y2="15" {...p} />
+        </>
+      );
+    case 'collapse':
+      return (
+        <>
+          <Polyline points="3 8 8 8 8 3" {...p} />
+          <Line x1="8" y1="8" x2="3" y2="3" {...p} />
+          <Polyline points="21 8 16 8 16 3" {...p} />
+          <Line x1="16" y1="8" x2="21" y2="3" {...p} />
+          <Polyline points="3 16 8 16 8 21" {...p} />
+          <Line x1="8" y1="16" x2="3" y2="21" {...p} />
+          <Polyline points="21 16 16 16 16 21" {...p} />
+          <Line x1="16" y1="16" x2="21" y2="21" {...p} />
         </>
       );
     default:

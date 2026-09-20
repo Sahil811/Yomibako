@@ -596,25 +596,65 @@ export const kanjiApi = {
 };
 
 export const geminiApi = {
-  async explainWord({ apiKey, prompt, signal }: { apiKey: string; prompt: string; signal?: AbortSignal }): Promise<string> {
-    const res = await requestWithRetry(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent',
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey } as any,
-        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] }),
-        signal: signal as any,
-      },
-      { timeoutMs: 45000, safeToRetry: true, retries: 2 }
-    );
-    if (!res.ok) {
-      const t = await res.text().catch(() => '');
-      throw new JpdbError(`Gemini ${res.status} ${t.slice(0, 200)}`, res.status);
+  // Ordered fallbacks. The first is a moving alias that always resolves to a
+  // current model, so the feature keeps working as Google retires versions.
+  models: ['gemini-flash-latest', 'gemini-2.5-flash', 'gemini-2.0-flash'] as const,
+
+  async explainWord({ apiKey, prompt, model, signal }: { apiKey: string; prompt: string; model?: string; signal?: AbortSignal }): Promise<string> {
+    const key = (apiKey ?? '').trim();
+    if (!key) throw new JpdbError('No Gemini API key set');
+
+    const tried = model ? [model, ...this.models.filter((m) => m !== model)] : [...this.models];
+    let lastError: JpdbError | null = null;
+
+    for (const name of tried) {
+      const res = await requestWithRetry(
+        `https://generativelanguage.googleapis.com/v1beta/models/${name}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key } as any,
+          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] }),
+          signal: signal as any,
+        },
+        { timeoutMs: 45000, safeToRetry: true, retries: 2 }
+      );
+
+      if (res.ok) {
+        const data = await res.json().catch(() => null as any);
+        const parts = data?.candidates?.[0]?.content?.parts;
+        const text = Array.isArray(parts) ? parts.map((p: any) => p?.text ?? '').join('').trim() : '';
+        if (text) return text;
+        // 200 with no text = safety block or empty candidate. Surface why.
+        const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason;
+        throw new JpdbError(reason ? `Gemini returned no text (${reason})` : 'Gemini returned an empty response', 200);
+      }
+
+      const body = await res.text().catch(() => '');
+      lastError = new JpdbError(`Gemini: ${geminiErrorMessage(body, res.status)}`, res.status);
+      // A 404 means this model id is gone; try the next candidate. Every other
+      // status (bad key 400/401/403, rate limit 429, server 5xx) would repeat
+      // identically for every model, so fail fast instead of looping.
+      if (res.status === 404) continue;
+      throw lastError;
     }
-    const data = await res.json();
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    throw lastError ?? new JpdbError('Gemini request failed');
   },
 };
+
+// Gemini errors are JSON: { error: { code, message, status } }. Fall back to a
+// trimmed raw body, then the bare status, so the UI always has something real.
+function geminiErrorMessage(body: string, status: number): string {
+  try {
+    const parsed = JSON.parse(body);
+    const message = parsed?.error?.message;
+    if (message) return String(message);
+  } catch {}
+  const trimmed = body.trim();
+  if (status === 429) return 'rate limit reached — wait a moment and retry';
+  if (status === 401 || status === 403) return 'API key rejected — check it in Settings';
+  return trimmed ? trimmed.slice(0, 200) : `HTTP ${status}`;
+}
+
 
 export const youtubeApi = {
   async fetchWatchPage(url: string, signal?: AbortSignal): Promise<string> {

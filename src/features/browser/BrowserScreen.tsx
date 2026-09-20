@@ -1,20 +1,24 @@
 import React, { useCallback, useRef, useState } from 'react';
-import { View, Text, StyleSheet, TextInput, Pressable, useColorScheme, Alert, ScrollView, Platform } from 'react-native';
+import { View, Text, StyleSheet, TextInput, Pressable, useColorScheme, Alert, ScrollView, Platform, BackHandler } from 'react-native';
 import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BlurView } from 'expo-blur';
+import { StatusBar } from 'expo-status-bar';
 import * as Haptics from 'expo-haptics';
 import { darkColors, lightColors } from '../../theme/colors';
 import { Icon, type IconName } from '../../components/ui/Icon';
 import { getItemAsync } from '../../services/storage';
 import { jpdbApi } from '../../services/jpdb/api';
+import { loadConfig } from '../../services/jpdb/config';
+import { useWordAudio } from '../shared/useWordAudio';
 import { BROWSER_CSS, BROWSER_JS } from './browserBundle';
 import WordSheet from '../reader/WordSheet';
+import QuizModal from '../quiz/QuizModal';
 
 const QUICK_TILES: { label: string; url: string; icon: IconName }[] = [
+  { label: 'TTSU', url: 'https://reader.ttsu.app/', icon: 'bookOpen' },
   { label: 'Wikipedia', url: 'https://ja.wikipedia.org/wiki/日本語', icon: 'book' },
   { label: 'Syosetu', url: 'https://ncode.syosetu.com/n9669bk/', icon: 'file' },
-  { label: 'TTSU', url: 'https://reader.ttsu.app/', icon: 'bookOpen' },
   { label: 'Readwok', url: 'https://app.readwok.com/', icon: 'library' },
   { label: 'Bunpro', url: 'https://bunpro.jp/', icon: 'lang' },
   { label: 'NHK News', url: 'https://www3.nhk.or.jp/news/', icon: 'browser' },
@@ -35,13 +39,13 @@ function domainOf(url: string): string {
   }
 }
 
-export default function BrowserScreen({ route }: any) {
+export default function BrowserScreen({ route, navigation }: any) {
   const scheme = useColorScheme();
   const isDark = scheme === 'dark';
   const colors = isDark ? darkColors : lightColors;
   const insets = useSafeAreaInsets();
 
-  const [url, setUrl] = useState('https://ja.wikipedia.org/wiki/日本語');
+  const [url, setUrl] = useState('https://reader.ttsu.app/');
   const [input, setInput] = useState(url);
   const [isFocused, setFocused] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -49,7 +53,86 @@ export default function BrowserScreen({ route }: any) {
   const [bridgeReady, setBridgeReady] = useState(false);
   const [parseCount, setParseCount] = useState(0);
   const [parseError, setParseError] = useState<string | null>(null);
+  const [immersive, setImmersive] = useState(false);
+  const [webFrame, setWebFrame] = useState({ x: 0, y: 0, width: 0, height: 0 });
+  const [quizWords, setQuizWords] = useState<any[] | null>(null);
+  /** Measured so the floating quiz button can clear the bottom toolbar. */
+  const [toolbarH, setToolbarH] = useState(58);
   const webRef = useRef<WebView>(null);
+  const webFrameRef = useRef<View>(null);
+  const lookupRequest = useRef(0);
+  const interactionRef = useRef({ showPopupOnHover: true, playSoundOnHover: false });
+
+  const { cancel: cancelHoverAudio, scheduleHover: scheduleHoverAudio, playNow: playWordAudio } = useWordAudio();
+
+  const dismissLookup = useCallback(() => {
+    lookupRequest.current++;
+    cancelHoverAudio(true);
+    setWord(null);
+  }, [cancelHoverAudio]);
+
+  const presentLookup = useCallback((nextWord: any, haptic: boolean) => {
+    cancelHoverAudio(true);
+    const request = ++lookupRequest.current;
+    if (webFrameRef.current) {
+      webFrameRef.current.measureInWindow((x, y, width, height) => {
+        if (lookupRequest.current !== request) return;
+        if (width > 0 && height > 0) setWebFrame({ x, y, width, height });
+        setWord(nextWord);
+      });
+    } else {
+      setWord(nextWord);
+    }
+    if (haptic) Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [cancelHoverAudio]);
+
+  React.useEffect(() => navigation.addListener('blur', dismissLookup), [navigation, dismissLookup]);
+
+  const setReadingMode = useCallback((next: boolean) => {
+    dismissLookup();
+    setFocused(false);
+    setImmersive(next);
+    navigation.setParams({ immersive: next });
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [navigation, dismissLookup]);
+
+  React.useEffect(() => () => {
+    navigation.setParams({ immersive: false });
+  }, [navigation]);
+
+  React.useEffect(() => {
+    const refresh = () => {
+      void loadConfig().then((cfg) => {
+        interactionRef.current = {
+          showPopupOnHover: cfg.showPopupOnHover !== false,
+          playSoundOnHover: !!cfg.playSoundOnHover,
+        };
+      });
+    };
+    refresh();
+    return navigation.addListener('focus', refresh);
+  }, [navigation]);
+
+  React.useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    void import('expo-navigation-bar')
+      .then(({ NavigationBar }) => NavigationBar.setHidden(immersive))
+      .catch((error) => console.warn('[Browser] navigation bar unavailable until native rebuild', error));
+    return () => {
+      void import('expo-navigation-bar')
+        .then(({ NavigationBar }) => NavigationBar.setHidden(false))
+        .catch(() => {});
+    };
+  }, [immersive]);
+
+  React.useEffect(() => {
+    if (!immersive || Platform.OS !== 'android') return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setReadingMode(false);
+      return true;
+    });
+    return () => subscription.remove();
+  }, [immersive, setReadingMode]);
 
   const navigate = useCallback(
     (next: string) => {
@@ -65,9 +148,10 @@ export default function BrowserScreen({ route }: any) {
       setBridgeReady(false);
       setParseCount(0);
       setParseError(null);
+      dismissLookup();
       Haptics.selectionAsync();
     },
-    []
+    [dismissLookup]
   );
 
   const retryParse = useCallback(() => {
@@ -98,6 +182,10 @@ export default function BrowserScreen({ route }: any) {
             customWordCSS = cfg.customWordCSS || '';
             customPopupCSS = cfg.customPopupCSS || '';
             disableFade = !!cfg.disableFadeAnimation;
+            interactionRef.current = {
+              showPopupOnHover: cfg.showPopupOnHover !== false,
+              playSoundOnHover: !!cfg.playSoundOnHover,
+            };
           } catch {}
         }
         const cssInject = `(function(){
@@ -147,38 +235,71 @@ export default function BrowserScreen({ route }: any) {
         }
       }
       if (msg.type === 'lookup') {
-        setWord(msg);
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        presentLookup(msg, true);
+        // A tap is a deliberate selection — pronounce it immediately, with no
+        // hover debounce. presentLookup already stopped any prior audio.
+        if (interactionRef.current.playSoundOnHover) playWordAudio(msg);
       }
+      if (msg.type === 'hover') {
+        const cfg = interactionRef.current;
+        if (cfg.showPopupOnHover) presentLookup(msg, false);
+        // Popup and pronunciation are independent in jpd-breader.
+        if (cfg.playSoundOnHover) scheduleHoverAudio(msg);
+      }
+      if (msg.type === 'viewportChanged' || msg.type === 'backgroundTap') dismissLookup();
+      if (msg.type === 'words') setQuizWords(Array.isArray(msg.words) ? msg.words : []);
     } catch (err) {
       console.warn('[BrowserScreen] onMessage', err);
     }
-  }, []);
+  }, [dismissLookup, playWordAudio, presentLookup, scheduleHoverAudio]);
 
   const goBack = useCallback(() => {
+    dismissLookup();
     webRef.current?.goBack();
     Haptics.selectionAsync();
-  }, []);
+  }, [dismissLookup]);
   const goForward = useCallback(() => {
+    dismissLookup();
     webRef.current?.goForward();
     Haptics.selectionAsync();
-  }, []);
+  }, [dismissLookup]);
   const reload = useCallback(() => {
+    dismissLookup();
     webRef.current?.reload();
     setBridgeReady(false);
     setParseCount(0);
     setParseError(null);
     Haptics.selectionAsync();
-  }, []);
+  }, [dismissLookup]);
   const navigateUnknown = (dir: number) => {
     webRef.current?.injectJavaScript(`window.__yomibakoNavigateUnknown && window.__yomibakoNavigateUnknown(${dir}); true;`);
     Haptics.selectionAsync();
   };
 
+  const updateCardState = useCallback((vid: number, sid: number, state: string[]) => {
+    webRef.current?.injectJavaScript(
+      `window.__yomibakoSetCardState && window.__yomibakoSetCardState(${Number(vid)},${Number(sid)},${JSON.stringify(state)}); true;`
+    );
+  }, []);
+
+  // The page already holds every parsed card, so the quiz just asks for them.
+  // quizWords stays null until the WebView answers, which is what opens it.
+  // A page whose bundle never ran answers with an empty set, so the button is
+  // never dead — the quiz explains why there is nothing to ask.
+  const startQuiz = useCallback(() => {
+    dismissLookup();
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    webRef.current?.injectJavaScript(
+      'window.__yomibakoCollectWords ? window.__yomibakoCollectWords()' +
+        ' : (window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({type:"words",words:[]}))); true;'
+    );
+  }, [dismissLookup]);
+
   return (
     <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
+      <StatusBar style={isDark ? 'light' : 'dark'} hidden={immersive} animated />
       {/* Safari-like top bar with blur */}
-      <BlurView intensity={isDark ? 32 : 36} tint={isDark ? 'dark' : 'light'} style={[s.topBar, { paddingTop: insets.top + 8, borderBottomColor: colors.separator, backgroundColor: colors.blurTint }]}>
+      {!immersive ? <BlurView intensity={isDark ? 32 : 36} tint={isDark ? 'dark' : 'light'} style={[s.topBar, { paddingTop: insets.top + 8, borderBottomColor: colors.separator, backgroundColor: colors.blurTint }]}>
         <View style={s.topBarRow}>
           <Pressable onPress={goBack} style={({ pressed }) => [s.iconBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]} hitSlop={8} accessibilityLabel="Back">
             <Icon name="chevronLeft" size={22} color={colors.primary} strokeWidth={2.2} />
@@ -222,8 +343,8 @@ export default function BrowserScreen({ route }: any) {
             ) : null}
           </View>
 
-          <Pressable onPress={isFocused ? () => navigate(input) : reload} style={({ pressed }) => [s.goPill, { backgroundColor: isFocused ? colors.primary : (pressed ? colors.systemFill : colors.secondarySystemFill) }]} hitSlop={6}>
-            {isFocused ? <Text style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}>Go</Text> : <Icon name="reload" size={14} color={colors.primary} strokeWidth={2.2} />}
+          <Pressable onPress={isFocused ? () => navigate(input) : () => setReadingMode(true)} style={({ pressed }) => [s.goPill, { backgroundColor: isFocused ? colors.primary : (pressed ? colors.systemFill : colors.secondarySystemFill) }]} hitSlop={6} accessibilityLabel={isFocused ? 'Go' : 'Enter full screen reading'}>
+            {isFocused ? <Text style={{ color: '#fff', fontSize: 14, fontWeight: '600' }}>Go</Text> : <Icon name="expand" size={15} color={colors.primary} strokeWidth={2.1} />}
           </Pressable>
         </View>
 
@@ -240,10 +361,10 @@ export default function BrowserScreen({ route }: any) {
             </Text>
           </View>
         </Pressable>
-      </BlurView>
+      </BlurView> : null}
 
       {/* Quick tiles — Safari start page */}
-      <View style={[s.tilesBar, { backgroundColor: colors.groupedBackground }]}>
+      {!immersive ? <View style={[s.tilesBar, { backgroundColor: colors.groupedBackground }]}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal: 16, gap: 8, alignItems: 'center' }}>
           {QUICK_TILES.map((t) => {
             const active = url === t.url;
@@ -263,10 +384,18 @@ export default function BrowserScreen({ route }: any) {
             );
           })}
         </ScrollView>
-      </View>
+      </View> : null}
 
       {/* WebView */}
-      <View style={{ flex: 1, backgroundColor: colors.background }}>
+      <View
+        ref={webFrameRef}
+        style={{ flex: 1, backgroundColor: colors.background }}
+        onLayout={() => {
+          webFrameRef.current?.measureInWindow((x, y, width, height) => {
+            setWebFrame((prev) => prev.x === x && prev.y === y && prev.width === width && prev.height === height ? prev : { x, y, width, height });
+          });
+        }}
+      >
         {isBlockedAnki(url) ? (
           <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', padding: 28, gap: 10 }}>
             <View style={[s.blockIcon, { backgroundColor: colors.secondaryGroupedBackground }]}>
@@ -290,8 +419,14 @@ export default function BrowserScreen({ route }: any) {
               allowFileAccessFromFileURLs
               allowUniversalAccessFromFileURLs
               mixedContentMode="always"
-              onLoadStart={() => setLoading(true)}
+              onLoadStart={() => { setLoading(true); dismissLookup(); }}
               onLoadEnd={() => setLoading(false)}
+              onNavigationStateChange={(state) => {
+                if (/^https?:\/\//i.test(state.url) && !isBlockedAnki(state.url)) {
+                  setUrl(state.url);
+                  if (!isFocused) setInput(state.url);
+                }
+              }}
               onMessage={onMessage}
               injectedJavaScriptBeforeContentLoaded={BROWSER_JS}
               injectedJavaScript={`(function(){ let s=document.getElementById('yomibako-browser-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-browser-css'; s.textContent=${JSON.stringify(BROWSER_CSS)}; document.head.appendChild(s);} true;})();`}
@@ -316,7 +451,7 @@ export default function BrowserScreen({ route }: any) {
       </View>
 
       {/* Bottom toolbar — Safari */}
-      <BlurView intensity={isDark ? 28 : 32} tint={isDark ? 'dark' : 'light'} style={[s.toolbar, { paddingBottom: Math.max(insets.bottom, 10), borderTopColor: colors.separator, backgroundColor: colors.blurTint }]}>
+      {!immersive ? <BlurView intensity={isDark ? 28 : 32} tint={isDark ? 'dark' : 'light'} onLayout={(e) => setToolbarH(e.nativeEvent.layout.height)} style={[s.toolbar, { paddingBottom: Math.max(insets.bottom, 10), borderTopColor: colors.separator, backgroundColor: colors.blurTint }]}>
         <Pressable onPress={() => navigateUnknown(-1)} style={({ pressed }) => [s.toolBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]} hitSlop={8}>
           <Icon name="chevronLeft" size={16} color={colors.primary} strokeWidth={2.2} />
           <Text style={[s.toolLabel, { color: colors.primary }]}>Prev</Text>
@@ -353,9 +488,57 @@ export default function BrowserScreen({ route }: any) {
         >
           <Icon name="info" size={15} color={colors.secondaryLabel} strokeWidth={2} />
         </Pressable>
-      </BlurView>
+      </BlurView> : null}
 
-      {word ? <WordSheet word={word} onClose={() => setWord(null)} /> : null}
+      {immersive ? (
+        <BlurView intensity={28} tint={isDark ? 'dark' : 'light'} style={[s.exitReading, { top: insets.top + 10, right: Math.max(insets.right, 10), backgroundColor: colors.blurTint, borderColor: colors.separator }]}>
+          <Pressable onPress={() => setReadingMode(false)} style={({ pressed }) => [s.exitReadingButton, { opacity: pressed ? 0.65 : 1 }]} accessibilityLabel="Exit full screen reading">
+            <Icon name="collapse" size={17} color={colors.primary} strokeWidth={2.1} />
+          </Pressable>
+        </BlurView>
+      ) : null}
+
+      {/* Quiz is one tap from anywhere on the page, within thumb reach, and
+          sits clear of the bottom toolbar when that is showing. */}
+      {!word && !quizWords && !isBlockedAnki(url) ? (
+        <BlurView
+          intensity={isDark ? 30 : 34}
+          tint={isDark ? 'dark' : 'light'}
+          style={[
+            s.fab,
+            {
+              backgroundColor: colors.blurTint,
+              borderColor: colors.separator,
+              right: Math.max(insets.right, 14),
+              bottom: immersive ? Math.max(insets.bottom, 14) : toolbarH + 12,
+            },
+          ]}
+        >
+          <Pressable
+            onPress={startQuiz}
+            style={({ pressed }) => [s.fabButton, { opacity: pressed ? 0.55 : 1 }]}
+            hitSlop={10}
+            accessibilityRole="button"
+            accessibilityLabel="Quiz the words on this page"
+          >
+            <Icon name="repeat" size={18} color={colors.primary} strokeWidth={2} />
+          </Pressable>
+        </BlurView>
+      ) : null}
+
+      {word ? (
+        <WordSheet
+          key={`${word.vid}/${word.sid}`}
+          word={word}
+          anchorFrame={webFrame.width > 0 ? webFrame : undefined}
+          onClose={dismissLookup}
+          onStateChange={updateCardState}
+        />
+      ) : null}
+
+      {quizWords ? (
+        <QuizModal words={quizWords} onClose={() => setQuizWords(null)} />
+      ) : null}
     </View>
   );
 }
@@ -420,4 +603,17 @@ const s = StyleSheet.create({
   toolCenterSub: { fontFamily: 'System', fontSize: 11, fontWeight: '400' as const },
   vSeparator: { width: StyleSheet.hairlineWidth, height: 22, marginHorizontal: 2, opacity: 0.8 },
   infoBtn: { width: 32, height: 32, borderRadius: 16, alignItems: 'center', justifyContent: 'center' },
+  exitReading: { position: 'absolute', zIndex: 40, width: 42, height: 42, borderRadius: 21, borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden', boxShadow: '0 5px 18px rgba(0,0,0,0.28)' },
+  exitReadingButton: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  fab: {
+    position: 'absolute',
+    zIndex: 45,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth,
+    boxShadow: '0 5px 16px rgba(0,0,0,0.22)',
+  },
+  fabButton: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 });

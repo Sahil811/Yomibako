@@ -2,8 +2,9 @@
 // Full parity minus Anki (no anki export). Supports all 25 keys of jpd-breader 13.0.
 // Web-safe via services/storage (localStorage fallback).
 import { getItemAsync, setItemAsync, deleteItemAsync } from '../storage';
+import { POPUP_THEME_IDS, type PopupThemeId } from '../../theme/popupThemes';
 
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 export type Hotkey = { key: string; code: string; modifiers: string[] } | null;
 
@@ -35,7 +36,10 @@ export type YomibakoConfig = {
   goodKey: Hotkey;
   easyKey: Hotkey;
   geminiApiKey: string | null;
+  /** App chrome theme. */
   theme: 'auto' | 'light' | 'dark';
+  /** Word-popup palette, independent of the app chrome. See popupThemes.ts. */
+  popupTheme: PopupThemeId;
   showReviewButtons: boolean;
   showAddButton: boolean;
   showBlacklistButton: boolean;
@@ -75,6 +79,7 @@ export const defaultConfig: YomibakoConfig = Object.freeze({
   easyKey: null,
   geminiApiKey: null,
   theme: 'auto',
+  popupTheme: 'auto',
   showReviewButtons: false,
   showAddButton: false,
   showBlacklistButton: false,
@@ -99,6 +104,12 @@ let configCache: YomibakoConfig | null = null;
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(Math.max(n, min), max);
+}
+
+// An id written by a newer build (or a corrupted store) must not reach the
+// palette lookup, or the popup renders with undefined colours.
+function validPopupTheme(value: any): PopupThemeId {
+  return POPUP_THEME_IDS.includes(value) ? value : 'auto';
 }
 
 export function migrateSchema(config: any): void {
@@ -137,6 +148,12 @@ export function migrateSchema(config: any): void {
     // ✦ Mnemonic like the extension card (toggle in Settings → Behavior).
     config.showRtk = true;
     config.schemaVersion = 4;
+  }
+  if ((config.schemaVersion ?? 0) < 5) {
+    // v5 briefly stored manga-reader layout settings here. Those controls belong
+    // to the reader itself, so this migration is now just a version marker;
+    // any leftover keys in stored JSON are ignored.
+    config.schemaVersion = 5;
   }
 }
 
@@ -185,6 +202,7 @@ export async function loadConfig(forceReload = false): Promise<YomibakoConfig> {
     // clamp
     cfg.popupScale = clamp(Number(cfg.popupScale) || 100, 50, 200);
     cfg.contextWidth = clamp(Number(cfg.contextWidth) || 1, 0, 10);
+    cfg.popupTheme = validPopupTheme(cfg.popupTheme);
     if (cfg.schemaVersion !== CURRENT_SCHEMA_VERSION) {
       // fallback to default but preserve token/deck ids if present
       const fallback = { ...defaultConfig } as YomibakoConfig;
@@ -209,6 +227,10 @@ export async function saveConfig(newConfig: YomibakoConfig): Promise<void> {
     // clamp before save
     newConfig.popupScale = clamp(Number(newConfig.popupScale) || 100, 50, 200);
     newConfig.contextWidth = clamp(Number(newConfig.contextWidth) || 1, 0, 10);
+    newConfig.popupTheme = validPopupTheme(newConfig.popupTheme);
+    // Publish before awaiting storage. A newer staged edit must not be rolled
+    // back when this older write eventually completes.
+    configCache = { ...newConfig };
     await setItemAsync(CONFIG_JSON_KEY, JSON.stringify(newConfig));
     // also mirror legacy keys for api token + decks so older code still works
     if (newConfig.apiToken) await setItemAsync(LEGACY_KEYS.token, String(newConfig.apiToken));
@@ -223,7 +245,6 @@ export async function saveConfig(newConfig: YomibakoConfig): Promise<void> {
       if (v == null || v === '') await deleteItemAsync(legacyKey);
       else await setItemAsync(legacyKey, String(v));
     }
-    configCache = newConfig;
   } catch (e) {
     console.warn('[config] save failed', e);
   }
@@ -231,6 +252,11 @@ export async function saveConfig(newConfig: YomibakoConfig): Promise<void> {
 
 export function getConfig(): YomibakoConfig {
   return configCache ? { ...configCache } : ({ ...defaultConfig } as YomibakoConfig);
+}
+
+/** Make an edited settings snapshot visible to focused screens immediately. */
+export function stageConfig(newConfig: YomibakoConfig): void {
+  configCache = { ...newConfig };
 }
 
 // Backwards compat helpers used by api.ts / audio.ts

@@ -47,6 +47,14 @@ export const BROWSER_JS = `
     return el;
   }
 
+  function post(type, extra){
+    try{
+      window.ReactNativeWebView && window.ReactNativeWebView.postMessage(
+        JSON.stringify(Object.assign({type:type},extra||{}))
+      );
+    }catch(_){}
+  }
+
   // displayCategory port from content/parse.js — needed for paragraphsInNode
   const displayCategoryCache = new Map();
   function displayCategory(node){
@@ -76,18 +84,73 @@ export const BROWSER_JS = `
     return 'none';
   }
 
-  function onWordTap(e){
-    try { e.preventDefault(); e.stopPropagation(); } catch(_) {}
-    const t=e.currentTarget;
+  function openWord(t,type='lookup',ev){
     if(!t.jpdbData) return;
     const d=t.jpdbData.token.card;
+    // Mirrors the reader bundle: per-fragment rects so a wrapped word anchors
+    // to the line the pointer is on, the owning block so the popup does not
+    // cover the paragraph being read, and the contact point so it clears the
+    // reader's own finger.
+    var rect=null, rects=null, boxRect=null, point=null, pointerType='touch', vertical=false;
+    try{
+      var r=t.getBoundingClientRect();
+      rect={x:r.left,y:r.top,w:r.width,h:r.height};
+      var list=t.getClientRects(), acc=[];
+      for(var i=0;i<list.length;i++){
+        var c=list[i];
+        if(c.width>0&&c.height>0) acc.push({x:c.left,y:c.top,w:c.width,h:c.height});
+      }
+      if(acc.length) rects=acc;
+      var block=t.closest? t.closest('p,li,dd,blockquote,h1,h2,h3,h4,h5,h6,td,figcaption') : null;
+      if(block){
+        var b=block.getBoundingClientRect();
+        // A block taller than the viewport leaves no slot anywhere, which would
+        // force the edge fallback on every lookup. Only avoid blocks the reader
+        // can actually take in at once.
+        if(b.width>0&&b.height>0&&b.height<=window.innerHeight*0.6) boxRect={x:b.left,y:b.top,w:b.width,h:b.height};
+      }
+      var wm=(window.getComputedStyle(t).writingMode||'');
+      vertical=wm.indexOf('vertical')===0 || wm==='tb' || wm==='tb-rl';
+    }catch(_){}
+    if(ev){
+      if(typeof ev.clientX==='number'&&typeof ev.clientY==='number') point={x:ev.clientX,y:ev.clientY};
+      if(ev.pointerType) pointerType = ev.pointerType==='mouse' ? 'mouse' : 'touch';
+    }
+    // getBoundingClientRect is layout-viewport relative. On a pinch-zoomed page
+    // the visual viewport is what the user actually sees, so report it and let
+    // the native side correct for it.
+    var vv=window.visualViewport;
     window.ReactNativeWebView.postMessage(JSON.stringify({
-      type:'lookup',
+      type:type,
       vid:d.vid, sid:d.sid, spelling:d.spelling, reading:d.reading,
       state:d.state, meanings:d.meanings, frequencyRank:d.frequencyRank, pitchAccent:d.pitchAccent, partOfSpeech:d.partOfSpeech,
-      context:t.jpdbData.context, contextOffset:t.jpdbData.contextOffset
+      context:t.jpdbData.context, contextOffset:t.jpdbData.contextOffset,
+      rect:rect, rects:rects, boxRect:boxRect, point:point, pointerType:pointerType,
+      vertical:vertical, vw:window.innerWidth, vh:window.innerHeight,
+      visual: vv ? { scale:vv.scale, offsetLeft:vv.offsetLeft, offsetTop:vv.offsetTop, width:vv.width } : null
     }));
   }
+
+  function onWordTap(e){
+    try { e.preventDefault(); e.stopPropagation(); } catch(_) {}
+    openWord(e.currentTarget,'lookup',e);
+  }
+
+  function onWordHover(e){
+    // Pointer enter also fires for touch on some WebViews; touch already has
+    // the click path and must not schedule duplicate pronunciation.
+    if(e.pointerType && e.pointerType!=='mouse') return;
+    openWord(e.currentTarget,'hover',e);
+  }
+
+  // The popup is native, while the page remains live below it. A page touch
+  // outside a word must dismiss the native popup just like Yomitan; do not
+  // prevent the website's own click, navigation, or controls.
+  document.addEventListener(window.PointerEvent ? 'pointerdown' : 'touchstart',function(e){
+    var t=e.target;
+    if(t && t.closest && t.closest('.jpdb-word:not(.unparsed)')) return;
+    post('backgroundTap');
+  },true);
 
   function splitFragment(fragments, idx, offset){
     const old=fragments[idx];
@@ -123,8 +186,10 @@ export const BROWSER_JS = `
           ? jsxCreateElement('ruby',{class:className})
           : jsxCreateElement('span',{class:className});
         wrapper.addEventListener('click', onWordTap);
+        wrapper.addEventListener('pointerenter', onWordHover);
         wrapper.jpdbData={ token, context:text, contextOffset:cur };
         const key=token.card.vid+'/'+token.card.sid;
+        wrapper.setAttribute('data-yomibako-card',key);
         const idx=reverseIndex.get(key);
         if(!idx) reverseIndex.set(key,{className, elements:[wrapper]});
         else idx.elements.push(wrapper);
@@ -146,6 +211,65 @@ export const BROWSER_JS = `
     }
   }
   window.__yomibakoApplyTokens = applyTokens;
+
+  window.__yomibakoSetCardState=function(vid,sid,stateArr){
+    try{
+      const key=vid+'/'+sid;
+      const idx=reverseIndex.get(key);
+      if(!idx) return 0;
+      const className='jpdb-word '+((stateArr&&stateArr.length)?stateArr.join(' '):'not-in-deck');
+      const live=[];
+      for(const el of idx.elements){
+        if(!el || el.isConnected===false) continue;
+        el.className=className;
+        if(el.jpdbData && el.jpdbData.token && el.jpdbData.token.card) el.jpdbData.token.card.state=stateArr;
+        live.push(el);
+      }
+      idx.className=className;
+      idx.elements=live;
+      return live.length;
+    }catch(_){ return 0; }
+  };
+
+  // Hand the parsed words currently ON SCREEN to the native quiz — the reading
+  // equivalent of the manga reader's current page. Quizzing a whole article
+  // would test text the reader has not reached yet. Cards already carry their
+  // meanings, so this costs no extra JPDB call.
+  var COLLECT_MAX=200;
+  window.__yomibakoCollectWords=function(){
+    var out=[], seen={};
+    try{
+      var vv=window.visualViewport;
+      // getBoundingClientRect is layout-viewport relative, so a pinch-zoomed
+      // page needs the visual viewport's offsets to know what is really shown.
+      var left=vv?vv.offsetLeft:0, top=vv?vv.offsetTop:0;
+      var right=left+(vv?vv.width:window.innerWidth);
+      var bottom=top+(vv?vv.height:window.innerHeight);
+      var spans=document.querySelectorAll('.jpdb-word');
+      for(var i=0;i<spans.length;i++){
+        var el=spans[i];
+        var data=el.jpdbData;
+        var card=data && data.token && data.token.card;
+        if(!card || !card.spelling) continue;
+        if(!el.getBoundingClientRect) continue;
+        var r=el.getBoundingClientRect();
+        if(r.width<=0 || r.height<=0) continue;
+        if(r.bottom<=top || r.top>=bottom || r.right<=left || r.left>=right) continue;
+        var key=card.vid+'/'+card.sid;
+        if(seen[key]) continue;
+        seen[key]=1;
+        var means=[], list=card.meanings||[];
+        for(var m=0;m<list.length && means.length<3;m++){
+          var g=list[m] && list[m].glosses;
+          if(g && g.length) means.push(g.join('; '));
+        }
+        if(!means.length) continue;
+        out.push({ vid:card.vid, sid:card.sid, spelling:card.spelling, reading:card.reading, state:card.state, meanings:means });
+        if(out.length>=COLLECT_MAX) break;
+      }
+    }catch(_){}
+    post('words', { words: out });
+  };
 
   // paragraphsInNode port from integrations/common.js
   function paragraphsInNode(node, filter=()=>true){
@@ -388,19 +512,26 @@ export const BROWSER_JS = `
     if(curIdx===-1) next= dir>0?0:words.length-1;
     window.__yomibakoNavIdx=next;
     const w=words[next];
-    w.scrollIntoView({behavior:'smooth', block:'center'});
+    window.__yomibakoKeepPopupUntil=Date.now()+400;
+    w.scrollIntoView({behavior:'auto', block:'center'});
     document.querySelectorAll('.jpdb-word.nav-highlight').forEach(el=>el.classList.remove('nav-highlight'));
     w.classList.add('nav-highlight');
-    const rect=w.getBoundingClientRect();
-    window.ReactNativeWebView.postMessage(JSON.stringify({
-      type:'lookup',
-      vid:w.jpdbData?.token.card.vid, sid:w.jpdbData?.token.card.sid,
-      spelling:w.jpdbData?.token.card.spelling, reading:w.jpdbData?.token.card.reading,
-      state:w.jpdbData?.token.card.state, meanings:w.jpdbData?.token.card.meanings,
-      frequencyRank:w.jpdbData?.token.card.frequencyRank, pitchAccent:w.jpdbData?.token.card.pitchAccent,
-      context:w.jpdbData?.context, contextOffset:w.jpdbData?.contextOffset
-    }));
+    requestAnimationFrame(function(){ openWord(w); });
   };
+
+  // A native popup cannot follow arbitrary nested webpage scrollers. Close it
+  // as soon as its anchor moves instead of leaving it floating in stale space.
+  let viewportTimer=null;
+  function reportViewportMove(){
+    if(Date.now()<(window.__yomibakoKeepPopupUntil||0)) return;
+    if(viewportTimer) return;
+    viewportTimer=setTimeout(function(){
+      viewportTimer=null;
+      window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({type:'viewportChanged'}));
+    },80);
+  }
+  document.addEventListener('scroll',reportViewportMove,true);
+  window.addEventListener('resize',reportViewportMove,{passive:true});
 
   // Inject style
   let st=document.getElementById('yomibako-browser-css');

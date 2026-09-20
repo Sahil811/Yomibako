@@ -2,5 +2,8 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true
-  }
+  },
+  // Node-only fixture tables; they are compiled separately by
+  // `npm run test:placement`, which supplies @types/node.
+  "exclude": ["**/__tests__/**", ".test-out"]
 }

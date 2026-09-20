@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, TextInput, StyleSheet, Pressable, ScrollView, useColorScheme, Switch, Alert } from 'react-native';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -6,10 +6,36 @@ import { BlurView } from 'expo-blur';
 import * as Haptics from 'expo-haptics';
 import { darkColors, lightColors } from '../../theme/colors';
 import { Icon, type IconName } from '../../components/ui/Icon';
-import { loadConfig, saveConfig, defaultConfig, type YomibakoConfig, type Hotkey, hotkeyToString, parseHotkeyInput } from '../../services/jpdb/config';
+import { loadConfig, saveConfig, stageConfig, defaultConfig, type YomibakoConfig } from '../../services/jpdb/config';
 import { getItemAsync } from '../../services/storage';
 import { getSessionStatus, pokeSession, sessionDebug, subscribeSessionStatus } from '../../services/jpdb/session';
-import { lastAudioError } from '../../services/jpdb/audio';
+import { lastAudioError, clearAudioCache } from '../../services/jpdb/audio';
+import { cacheUsage, clearPageCache, type CacheUsage } from '../../services/fs/httpServer';
+import WordSheet from '../reader/WordSheet';
+import { POPUP_THEME_IDS, POPUP_THEME_LABELS, POPUP_THEMES, type PopupThemeId } from '../../theme/popupThemes';
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return 'Empty';
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+}
+
+// Fixed sample so the preview shows every part of the card: a kanji compound
+// with a reading, a frequency rank, a deck state and more than one gloss.
+const SAMPLE_WORD = {
+  vid: 1358280,
+  sid: 1,
+  spelling: '読書',
+  reading: 'どくしょ',
+  frequencyRank: 4300,
+  state: ['learning'],
+  pitchAccent: [],
+  meanings: [
+    { partOfSpeech: ['n', 'vs'], glosses: ['reading (a book)'] },
+    { partOfSpeech: ['n', 'vs'], glosses: ['perusal'] },
+  ],
+};
 
 // ——————————————— iOS Grouped Row Components ———————————————
 function SectionHeader({ title, footnote, colors }: any) {
@@ -117,42 +143,6 @@ function SwitchRow({ icon, color, label, value, onValueChange, colors, help, det
     </View>
   );
 }
-function HotkeyField({ label, value, onChange, colors }: { label: string; value: Hotkey; onChange: (v: Hotkey) => void; colors: any }) {
-  const [text, setText] = useState(hotkeyToString(value));
-  useEffect(() => setText(hotkeyToString(value)), [value]);
-  const commit = () => {
-    const parsed = parseHotkeyInput(text);
-    onChange(parsed);
-  };
-  return (
-    <View style={{ paddingHorizontal: 16, paddingVertical: 11, gap: 8 }}>
-      <Text style={[s.fieldLabel, { color: colors.onSurface }]}>{label}</Text>
-      <View style={[s.inputBox, { backgroundColor: colors.tertiarySystemFill }]}>
-        <TextInput
-          value={text}
-          onChangeText={setText}
-          onBlur={commit}
-          onSubmitEditing={commit}
-          placeholder="ShiftLeft · KeyJ · —"
-          placeholderTextColor={colors.tertiaryLabel}
-          style={[s.input, { color: colors.onSurface }]}
-          autoCapitalize="none"
-          autoCorrect={false}
-        />
-        <Pressable
-          onPress={() => {
-            setText('');
-            onChange(null);
-          }}
-          style={({ pressed }) => [{ paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, backgroundColor: pressed ? colors.systemFill : 'transparent' }]}
-        >
-          <Text style={[s.linkSmall, { color: colors.secondaryLabel }]}>Clear</Text>
-        </Pressable>
-      </View>
-    </View>
-  );
-}
-
 export default function SettingsScreen() {
   const scheme = useColorScheme();
   const isDark = scheme === 'dark';
@@ -162,10 +152,35 @@ export default function SettingsScreen() {
   const [saved, setSaved] = useState(false);
   const [diag, setDiag] = useState<string | null>(null);
   const [jpdbLogin, setJpdbLogin] = useState('Checking…');
+  const [usage, setUsage] = useState<CacheUsage>({ pageBytes: 0, audioBytes: 0 });
   const navigation = useNavigation<any>();
+  const cfgRef = useRef<YomibakoConfig | null>(null);
+  const pendingConfig = useRef<YomibakoConfig | null>(null);
+  const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mounted = useRef(true);
 
   useEffect(() => {
-    loadConfig().then((c) => setCfg({ ...c }));
+    loadConfig().then((c) => {
+      const loaded = { ...c };
+      cfgRef.current = loaded;
+      setCfg(loaded);
+    });
+  }, []);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      const pending = pendingConfig.current;
+      pendingConfig.current = null;
+      if (pending) {
+        saveQueue.current = saveQueue.current.catch(() => {}).then(() => saveConfig({ ...pending }));
+      }
+    };
   }, []);
 
   // JPDB cookie-login status (audio / review / FORQ need it). Re-checks
@@ -183,6 +198,12 @@ export default function SettingsScreen() {
       return () => { clearTimeout(t); unsub(); };
     }, [])
   );
+
+  // Cache sizes change while reading, so re-measure whenever Settings is shown.
+  const refreshUsage = useCallback(() => {
+    setUsage(cacheUsage());
+  }, []);
+  useFocusEffect(refreshUsage);
 
   const openJpdbLogin = () => {
     Haptics.selectionAsync();
@@ -215,13 +236,45 @@ export default function SettingsScreen() {
     }
   };
 
+  const queueAutosave = (next: YomibakoConfig) => {
+    pendingConfig.current = next;
+    setSaved(false);
+    if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = setTimeout(() => {
+      autosaveTimer.current = null;
+      const pending = pendingConfig.current;
+      pendingConfig.current = null;
+      if (!pending) return;
+      saveQueue.current = saveQueue.current
+        .catch(() => {})
+        .then(() => saveConfig({ ...pending }))
+        .then(() => {
+          if (!mounted.current) return;
+          setSaved(true);
+          if (savedTimer.current) clearTimeout(savedTimer.current);
+          savedTimer.current = setTimeout(() => setSaved(false), 1400);
+        });
+    }, 300);
+  };
+
   const update = (patch: Partial<YomibakoConfig>) => {
-    if (!cfg) return;
-    setCfg({ ...cfg, ...patch } as YomibakoConfig);
+    const current = cfgRef.current;
+    if (!current) return;
+    const next = { ...current, ...patch } as YomibakoConfig;
+    cfgRef.current = next;
+    stageConfig(next);
+    setCfg(next);
+    queueAutosave(next);
   };
 
   const save = async () => {
     if (!cfg) return;
+    if (autosaveTimer.current) {
+      clearTimeout(autosaveTimer.current);
+      autosaveTimer.current = null;
+    }
+    pendingConfig.current = null;
+    await saveQueue.current.catch(() => {});
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const toSave = {
       ...cfg,
@@ -239,6 +292,7 @@ export default function SettingsScreen() {
     if (toSave.geminiApiKey === '') toSave.geminiApiKey = null;
     if (toSave.apiToken === '') toSave.apiToken = null;
     await saveConfig(toSave);
+    cfgRef.current = toSave;
     setCfg(toSave);
     setSaved(true);
     await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -256,6 +310,10 @@ export default function SettingsScreen() {
       try {
         const parsed = JSON.parse(text);
         const merged = { ...defaultConfig, ...parsed, schemaVersion: 1 } as YomibakoConfig;
+        if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+        pendingConfig.current = null;
+        await saveQueue.current.catch(() => {});
+        cfgRef.current = merged;
         setCfg(merged);
         await saveConfig(merged);
         Alert.alert('Imported', 'Review and tap Save.');
@@ -279,6 +337,10 @@ export default function SettingsScreen() {
         style: 'destructive',
         onPress: async () => {
           const d = { ...defaultConfig } as YomibakoConfig;
+          if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+          pendingConfig.current = null;
+          await saveQueue.current.catch(() => {});
+          cfgRef.current = d;
           setCfg(d);
           await saveConfig(d);
           await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
@@ -302,7 +364,7 @@ export default function SettingsScreen() {
         <View style={{ flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'space-between' }}>
           <View>
             <Text style={[s.largeTitle, { color: colors.onSurface }]}>Settings</Text>
-            <Text style={[s.headerSub, { color: colors.secondaryLabel }]}>JPDB · Decks · Appearance</Text>
+            <Text style={[s.headerSub, { color: colors.secondaryLabel }]}>JPDB · Appearance · Behavior</Text>
           </View>
           <Pressable onPress={save} style={({ pressed }) => [s.savePill, { backgroundColor: saved ? colors.success : colors.primary, opacity: pressed ? 0.84 : 1, transform: [{ scale: pressed ? 0.97 : 1 }] }]} hitSlop={6}>
             <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
@@ -345,6 +407,50 @@ export default function SettingsScreen() {
           <SwitchRow icon="list" color="#8E8E93" label="Compact mining" value={cfg.minimalMineButtons} onValueChange={(v: boolean) => update({ minimalMineButtons: v })} colors={colors} detail="Minimal Add dialog" />
         </Group>
 
+        {/* Popup */}
+        <SectionHeader title="Popup" footnote="The card shown when you tap a parsed word." colors={colors} />
+        <Group colors={colors}>
+          <View style={{ paddingHorizontal: 16, paddingVertical: 14, gap: 12 }}>
+            {/* The real WordSheet, not a mock, so it cannot drift from the
+                popup it previews. */}
+            <View style={{ alignItems: 'center' }}>
+              <WordSheet
+                word={SAMPLE_WORD}
+                onClose={() => {}}
+                preview={{ cfg, box: { width: 320, maxHeight: 340 } }}
+              />
+            </View>
+            <Text style={[s.fieldLabel, { color: colors.onSurface }]}>Popup theme</Text>
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+              {POPUP_THEME_IDS.map((id: PopupThemeId) => {
+                const active = (cfg.popupTheme ?? 'auto') === id;
+                const swatch = id === 'auto' ? null : POPUP_THEMES[id];
+                return (
+                  <Pressable
+                    key={id}
+                    onPress={() => { Haptics.selectionAsync(); update({ popupTheme: id }); }}
+                    style={[
+                      s.themeChip,
+                      {
+                        backgroundColor: swatch ? swatch.surface : colors.tertiarySystemFill,
+                        borderColor: active ? colors.primary : colors.separator,
+                        borderWidth: active ? 2 : StyleSheet.hairlineWidth,
+                      },
+                    ]}
+                  >
+                    {swatch ? <View style={[s.themeDot, { backgroundColor: swatch.primary }]} /> : null}
+                    <Text style={[s.themeChipText, { color: swatch ? swatch.onSurface : colors.onSurface }]}>
+                      {POPUP_THEME_LABELS[id]}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          </View>
+          <SwitchRow icon="bookOpen" color="#007AFF" label="Show popup on hover" value={cfg.showPopupOnHover} onValueChange={(v: boolean) => update({ showPopupOnHover: v })} colors={colors} detail="Off = word touch only" />
+          <SwitchRow icon="audio" color="#FF2D55" label="Auto-play pronunciation" value={cfg.playSoundOnHover} onValueChange={(v: boolean) => update({ playSoundOnHover: v })} colors={colors} detail="Plays the word's audio when you tap it" />
+        </Group>
+
         {/* Appearance */}
         <SectionHeader title="Appearance" colors={colors} />
         <Group colors={colors}>
@@ -365,28 +471,45 @@ export default function SettingsScreen() {
           <FieldRow label="Custom Popup CSS" value={cfg.customPopupCSS} onChangeText={(v: string) => update({ customPopupCSS: v })} placeholder="#jpdb-popup { … }" colors={colors} multiline />
         </Group>
 
-        {/* Popup & Audio */}
-        <SectionHeader title="Popup & Audio" colors={colors} />
-        <Group colors={colors}>
-          <SwitchRow icon="bookOpen" color="#007AFF" label="Show popup on hover" value={cfg.showPopupOnHover} onValueChange={(v: boolean) => update({ showPopupOnHover: v })} colors={colors} detail="Off = hold key to show" />
-          <SwitchRow icon="audio" color="#FF2D55" label="Sound on hover" value={cfg.playSoundOnHover} onValueChange={(v: boolean) => update({ playSoundOnHover: v })} colors={colors} detail="250 ms delay" />
-          <HotkeyField label="Show Popup Key" value={cfg.showPopupKey} onChange={(v) => update({ showPopupKey: v })} colors={colors} />
-        </Group>
 
-        {/* Hotkeys */}
-        <SectionHeader title="Hotkeys" footnote="For hardware keyboards. Leave empty to disable." colors={colors} />
+        {/* Storage */}
+        <SectionHeader title="Storage" footnote="Cached copies only — your manga files are never touched." colors={colors} />
         <Group colors={colors}>
-          <HotkeyField label="Add / Mine" value={cfg.addKey} onChange={(v) => update({ addKey: v })} colors={colors} />
-          <HotkeyField label="Sentence editor" value={cfg.dialogKey} onChange={(v) => update({ dialogKey: v })} colors={colors} />
-          <HotkeyField label="Blacklist" value={cfg.blacklistKey} onChange={(v) => update({ blacklistKey: v })} colors={colors} />
-          <HotkeyField label="Never Forget" value={cfg.neverForgetKey} onChange={(v) => update({ neverForgetKey: v })} colors={colors} />
-          <HotkeyField label="Review: Nothing" value={cfg.nothingKey} onChange={(v) => update({ nothingKey: v })} colors={colors} />
-          <HotkeyField label="Review: Something" value={cfg.somethingKey} onChange={(v) => update({ somethingKey: v })} colors={colors} />
-          <HotkeyField label="Review: Hard" value={cfg.hardKey} onChange={(v) => update({ hardKey: v })} colors={colors} />
-          <HotkeyField label="Review: Good" value={cfg.goodKey} onChange={(v) => update({ goodKey: v })} colors={colors} />
-          <HotkeyField label="Review: Easy" value={cfg.easyKey} onChange={(v) => update({ easyKey: v })} colors={colors} />
-          <HotkeyField label="Next unknown" value={cfg.nextUnknownWordKey} onChange={(v) => update({ nextUnknownWordKey: v })} colors={colors} />
-          <HotkeyField label="Prev unknown" value={cfg.prevUnknownWordKey} onChange={(v) => update({ prevUnknownWordKey: v })} colors={colors} />
+          <Row
+            icon="book"
+            color="#0A84FF"
+            label="Manga pages"
+            detail={formatBytes(usage.pageBytes)}
+            colors={colors}
+            onPress={() => {
+              if (!usage.pageBytes) return;
+              Alert.alert('Clear page cache?', 'Pages are copied again the next time you open a volume.', [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Clear',
+                  style: 'destructive',
+                  onPress: async () => {
+                    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    clearPageCache();
+                    refreshUsage();
+                  },
+                },
+              ]);
+            }}
+          />
+          <Row
+            icon="audio"
+            color="#FF9500"
+            label="Pronunciation audio"
+            detail={formatBytes(usage.audioBytes)}
+            colors={colors}
+            onPress={async () => {
+              if (!usage.audioBytes) return;
+              await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              clearAudioCache();
+              refreshUsage();
+            }}
+          />
         </Group>
 
         {/* Actions */}
@@ -396,7 +519,7 @@ export default function SettingsScreen() {
           <Row icon="browse" color="#34C759" label="Import settings" detail="Paste JSON" colors={colors} onPress={importJson} />
           <Row icon="reload" color="#FF3B30" label="Reset to Defaults" detail="Clears token & decks" colors={colors} onPress={resetDefaults} />
         </Group>
-        <Text style={[s.footerNote, { color: colors.secondaryLabel }]}>Changes need Save to apply.</Text>
+        <Text style={[s.footerNote, { color: colors.secondaryLabel }]}>Changes save automatically.</Text>
 
         {/* Diagnostics */}
         <SectionHeader title="Diagnostics" footnote="Reader pipeline state from the last opened volume." colors={colors} />
@@ -440,6 +563,10 @@ const s = StyleSheet.create({
   help: { fontFamily: 'System', fontSize: 12, lineHeight: 16, fontWeight: '400' as const },
   segBtn: { flex: 1, height: 34, borderRadius: 9, alignItems: 'center', justifyContent: 'center', borderCurve: 'continuous' as any },
   segText: { fontFamily: 'System', fontSize: 13, fontWeight: '600' as const, textTransform: 'capitalize' as const },
+  // Each chip wears its own palette, so the row is itself a set of swatches.
+  themeChip: { flexDirection: 'row', alignItems: 'center', gap: 6, height: 34, paddingHorizontal: 11, borderRadius: 17, borderCurve: 'continuous' as any },
+  themeDot: { width: 10, height: 10, borderRadius: 5 },
+  themeChipText: { fontFamily: 'System', fontSize: 12.5, fontWeight: '600' as const },
   footerNote: { fontFamily: 'System', fontSize: 12, lineHeight: 16, fontWeight: '400' as const, textAlign: 'center' as const, marginTop: 8, paddingHorizontal: 20 },
   aboutCard: { margin: 16, marginTop: 24, borderRadius: 14, padding: 18, gap: 6, alignItems: 'center' as const, borderCurve: 'continuous' as any },
   aboutTitle: { fontFamily: 'System', fontSize: 17, fontWeight: '700' as const, letterSpacing: -0.4 },

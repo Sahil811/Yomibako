@@ -1,0 +1,42 @@
+Starting project at D:\Projects\Yomibako
+Logs: D:\Projects\Yomibako\.expo\dev\logs\start.log
+Starting Metro Bundler
+
+Waiting on http://localhost:8081
+
+Logs for your project will appear below.
+Android Bundled 17212ms index.ts (1654 modules)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 143ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Web Bundled 1365ms index.ts (1199 modules)
+Web  INFO  %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+Web  LOG  Running application "main" with appParams:
+ {"hydrate": undefined, "rootTag": "#root"} 
+Development-level warnings: ON.
+Performance optimizations: OFF.
+Web  WARN  props.pointerEvents is deprecated. Use style.pointerEvents
+Web  WARN  Cannot record touch end without a touch start.
+ Touch End: {"identifier":0,"pageX":773,"pageY":330,"timestamp":3545.4000000001397}
+ Touch Bank: []
+Android Bundled 140ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 294ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 140ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 129ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 72ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 73ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 121ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 110ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 81ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+Android Bundled 5791ms index.ts (1 module)
+ WARN  setLayoutAnimationEnabledExperimental is currently a no-op in the New Architecture.
+^C^C

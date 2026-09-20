@@ -14,6 +14,125 @@ function cacheDir(...segments: string[]) {
   return new Directory(Paths.cache, 'yomibako', ...segments);
 }
 
+// Page-image cache accounting.
+//
+// Opening a SAF volume copies its entire page set (~50MB for 180 pages) into
+// the cache, so a few volumes per session are enough to fill the device. Every
+// prepared volume is recorded below and the least recently opened ones are
+// dropped once the total passes the budget. Recording the open time ourselves
+// keeps the ordering deterministic: Android reports no directory creation time
+// before API 26, and directory mtime does not reliably track child writes.
+const MANIFEST_NAME = 'cache-index.json';
+/** Owned by clearAudioCache() in services/jpdb/audio — never evicted here. */
+const AUDIO_DIR_NAME = 'audio';
+const DEFAULT_CACHE_BUDGET = 1.5 * 1024 * 1024 * 1024;
+/** Below this much free space the standing budget is tightened. */
+const FREE_SPACE_FLOOR = 1024 * 1024 * 1024;
+/** Below this much free space opening a volume fails rather than half-copying. */
+const MIN_FREE_BYTES = 256 * 1024 * 1024;
+
+type CacheManifest = Record<string, { lastOpened: number }>;
+
+function volumeCacheKey(safeSeries: string, safeVolume: string) {
+  return `${safeSeries}/${safeVolume}`;
+}
+
+function readManifest(): CacheManifest {
+  try {
+    const file = new File(cacheDir(), MANIFEST_NAME);
+    if (!file.exists) return {};
+    const parsed = JSON.parse(file.textSync());
+    return parsed && typeof parsed === 'object' ? (parsed as CacheManifest) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeManifest(manifest: CacheManifest) {
+  try {
+    ensureDir(cacheDir());
+    const file = new File(cacheDir(), MANIFEST_NAME);
+    if (!file.exists) file.create({ intermediates: true });
+    file.write(JSON.stringify(manifest), { encoding: 'utf8' });
+  } catch (e) {
+    console.warn('cache manifest write', e);
+  }
+}
+
+function touchVolumeCache(key: string) {
+  const manifest = readManifest();
+  manifest[key] = { lastOpened: Date.now() };
+  writeManifest(manifest);
+}
+
+function directoryBytes(dir: Directory): number {
+  try {
+    return dir.size ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+function directoryTime(dir: Directory): number {
+  try {
+    return dir.info().modificationTime ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+function listSeriesDirs(): Directory[] {
+  const root = cacheDir();
+  if (!root.exists) return [];
+  try {
+    return root
+      .list()
+      .filter((entry): entry is Directory => entry instanceof Directory)
+      .filter((entry) => entry.name !== AUDIO_DIR_NAME);
+  } catch {
+    return [];
+  }
+}
+
+type CachedVolume = { key: string; dir: Directory; bytes: number; lastOpened: number };
+
+function listCachedVolumes(manifest: CacheManifest): CachedVolume[] {
+  const out: CachedVolume[] = [];
+  for (const seriesDir of listSeriesDirs()) {
+    let entries: (File | Directory)[];
+    try {
+      entries = seriesDir.list();
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!(entry instanceof Directory)) continue;
+      const key = volumeCacheKey(seriesDir.name, entry.name);
+      out.push({
+        key,
+        dir: entry,
+        bytes: directoryBytes(entry),
+        // Volumes cached before the manifest existed fall back to mtime.
+        lastOpened: manifest[key]?.lastOpened ?? directoryTime(entry),
+      });
+    }
+  }
+  return out;
+}
+
+// A series directory also holds each volume's loose .html (and .zip for .mokuro
+// imports). Once no volume directories remain, those belong to nothing.
+function pruneEmptySeriesDirs() {
+  for (const seriesDir of listSeriesDirs()) {
+    try {
+      const hasVolume = seriesDir.list().some((entry) => entry instanceof Directory);
+      if (!hasVolume) seriesDir.delete();
+    } catch (e) {
+      console.warn('prune series dir', seriesDir.name, e);
+    }
+  }
+}
+
 function ensureDir(dir: Directory) {
   try {
     if (!dir.exists) dir.create({ intermediates: true, idempotent: true });
@@ -83,6 +202,8 @@ export async function prepareVolumeForWebView(
     const volumeDir = cacheDir(safeSeries, safeVolume);
     ensureDir(seriesDir);
     ensureDir(volumeDir);
+    touchVolumeCache(volumeCacheKey(safeSeries, safeVolume));
+    await reserveSpaceFor(volumeCacheKey(safeSeries, safeVolume));
     const zipFile = new File(seriesDir, `${safeVolume}.zip`);
     await copyFile(volume.mokuroUri, zipFile.uri);
     try {
@@ -116,6 +237,11 @@ export async function prepareVolumeForWebView(
   const cacheVolumeDir = cacheDir(safeSeries, safeVolume);
   ensureDir(cacheSeriesDir);
   ensureDir(cacheVolumeDir);
+
+  // Mark this volume as most recently used before sweeping, so the sweep can
+  // never reclaim the one being opened.
+  touchVolumeCache(volumeCacheKey(safeSeries, safeVolume));
+  await reserveSpaceFor(volumeCacheKey(safeSeries, safeVolume));
 
   const htmlFileName = new File(volume.htmlUri).name || `${safeVolume}.html`;
   const localHtmlFile = new File(cacheSeriesDir, htmlFileName);
@@ -162,13 +288,100 @@ export async function prepareVolumeForWebView(
   return { localHtmlUri: localHtmlFile.uri, baseUrl: cacheSeriesDir.uri };
 }
 
-// LRU evict old volumes if cache > 500MB
-export async function evictOldCaches(_maxBytes = 500 * 1024 * 1024) {
+/**
+ * Drop least-recently-opened volumes until the page cache fits the budget.
+ * `keepKey` is never evicted, so the volume being opened survives its own sweep.
+ */
+export async function evictOldCaches(maxBytes = DEFAULT_CACHE_BUDGET, keepKey?: string) {
+  try {
+    if (!cacheDir().exists) return;
+    const manifest = readManifest();
+    const volumes = listCachedVolumes(manifest);
+    let total = volumes.reduce((sum, volume) => sum + volume.bytes, 0);
+
+    // A nearly full device needs a tighter budget than the standing one.
+    let budget = maxBytes;
+    const free = Paths.availableDiskSpace;
+    if (typeof free === 'number' && free > 0 && free < FREE_SPACE_FLOOR) {
+      budget = Math.max(0, Math.min(budget, total - (FREE_SPACE_FLOOR - free)));
+    }
+    if (total <= budget) return;
+
+    const stale = volumes
+      .filter((volume) => volume.key !== keepKey)
+      .sort((a, b) => a.lastOpened - b.lastOpened);
+
+    let evicted = false;
+    for (const volume of stale) {
+      if (total <= budget) break;
+      try {
+        volume.dir.delete();
+        total -= volume.bytes;
+        delete manifest[volume.key];
+        evicted = true;
+      } catch (e) {
+        console.warn('evict volume', volume.key, e);
+      }
+    }
+
+    if (evicted) {
+      writeManifest(manifest);
+      pruneEmptySeriesDirs();
+    }
+  } catch (e) {
+    console.warn('evictOldCaches', e);
+  }
+}
+
+/**
+ * Make room before a copy that can add ~50MB, and fail loudly rather than
+ * leaving a half-copied volume the reader would render as broken pages.
+ */
+async function reserveSpaceFor(key: string) {
+  await evictOldCaches(DEFAULT_CACHE_BUDGET, key);
+  const free = Paths.availableDiskSpace;
+  if (typeof free === 'number' && free > 0 && free < MIN_FREE_BYTES) {
+    throw new Error('Not enough free space to open this volume. Free up space and try again.');
+  }
+}
+
+export type CacheUsage = { pageBytes: number; audioBytes: number };
+
+/** Bytes held by cached manga pages vs. cached pronunciation audio. */
+export function cacheUsage(): CacheUsage {
+  let pageBytes = 0;
+  let audioBytes = 0;
+  try {
+    const root = cacheDir();
+    if (!root.exists) return { pageBytes, audioBytes };
+    for (const entry of root.list()) {
+      if (!(entry instanceof Directory)) continue;
+      if (entry.name === AUDIO_DIR_NAME) audioBytes += directoryBytes(entry);
+      else pageBytes += directoryBytes(entry);
+    }
+  } catch (e) {
+    console.warn('cacheUsage', e);
+  }
+  return { pageBytes, audioBytes };
+}
+
+/** Drop every cached volume. Source files are untouched; pages re-copy on open. */
+export function clearPageCache() {
   try {
     const root = cacheDir();
     if (!root.exists) return;
-    // noop for now - implement size check via readDirectory recursion
-  } catch {}
+    for (const seriesDir of listSeriesDirs()) {
+      try {
+        seriesDir.delete();
+      } catch (e) {
+        console.warn('clear page cache', seriesDir.name, e);
+      }
+    }
+    const manifest = new File(root, MANIFEST_NAME);
+    if (manifest.exists) manifest.delete();
+  } catch (e) {
+    console.warn('clearPageCache', e);
+  }
 }
 
 export const httpServer = {
