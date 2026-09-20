@@ -1,8 +1,7 @@
-import React from 'react';
+import React, { useCallback, useMemo } from 'react';
 import { View, Text, Pressable, StyleSheet, FlatList, useColorScheme } from 'react-native';
 import { darkColors, lightColors } from '../../theme/colors';
 import * as Haptics from 'expo-haptics';
-import Animated, { useSharedValue, useAnimatedStyle, withSpring } from 'react-native-reanimated';
 import { Icon } from '../ui/Icon';
 
 export type BrowserEntry = { name: string; uri: string; isDir: boolean; size?: number };
@@ -31,25 +30,23 @@ function getRowMetaLabel(isFolder: boolean, isHtml: boolean, size: number | unde
   return formatSize(size ?? 0);
 }
 
-function Row({ item, colors, onOpen }: { readonly item: BrowserEntry; readonly colors: any; readonly onOpen: (e: BrowserEntry) => void }) {
-  const scale = useSharedValue(1);
-  const aStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+const ROW_HEIGHT = 58;
+
+const Row = React.memo(function Row({ item, colors, onOpen }: { readonly item: BrowserEntry; readonly colors: any; readonly onOpen: (e: BrowserEntry) => void }) {
   const isFolder = item.isDir;
   const isHtml = item.name.endsWith('.html');
 
   return (
     <Pressable
-      onPressIn={() => (scale.value = withSpring(0.985, { damping: 22, stiffness: 420 }))}
-      onPressOut={() => (scale.value = withSpring(1, { damping: 22, stiffness: 420 }))}
       onPress={() => {
         Haptics.selectionAsync();
         onOpen(item);
       }}
-      style={({ pressed }) => [{ backgroundColor: pressed ? colors.systemFill : 'transparent' }]}
+      style={({ pressed }) => [{ backgroundColor: pressed ? colors.systemFill : 'transparent', opacity: pressed ? 0.85 : 1 }]}
       accessibilityRole="button"
       accessibilityLabel={item.name}
     >
-      <Animated.View style={[s.row, aStyle]}>
+      <View style={s.row}>
         {/* Files-style icon — blue folder, neutral document */}
         <View
           style={[
@@ -81,11 +78,11 @@ function Row({ item, colors, onOpen }: { readonly item: BrowserEntry; readonly c
             <Text style={[s.badgeText, { color: colors.secondaryLabel }]}>{isHtml ? 'HTML' : 'FILE'}</Text>
           </View>
         )}
-      </Animated.View>
+      </View>
       <View style={[s.separator, { backgroundColor: colors.separator, marginLeft: 58 }]} />
     </Pressable>
   );
-}
+});
 
 export function FileBrowser({
   entries,
@@ -99,41 +96,53 @@ export function FileBrowser({
   const scheme = useColorScheme();
   const colors = scheme === 'light' ? lightColors : darkColors;
 
+  const contentStyle = useMemo(() => ({ padding: 16, paddingBottom: 110, gap: 0 }), []);
+  const emptyComponent = useMemo(() => (
+    <View style={[s.emptyCard, { backgroundColor: colors.secondaryGroupedBackground }]}>
+      <View style={[s.emptyIcon, { backgroundColor: colors.tertiarySystemFill }]}>
+        <Icon name="browse" size={22} color={colors.secondaryLabel} strokeWidth={1.6} />
+      </View>
+      <Text style={[s.emptyTitle, { color: colors.onSurface }]}>Empty folder</Text>
+      <Text style={[s.emptySub, { color: colors.secondaryLabel }]}>No manga files here</Text>
+    </View>
+  ), [colors]);
+  const total = entries.length;
+  const renderRow = useCallback(({ item, index }: { item: BrowserEntry; index: number }) => (
+    <View
+      style={[
+        s.groupCard,
+        {
+          backgroundColor: colors.secondaryGroupedBackground,
+          borderTopLeftRadius: index === 0 ? 12 : 0,
+          borderTopRightRadius: index === 0 ? 12 : 0,
+          borderBottomLeftRadius: index === total - 1 ? 12 : 0,
+          borderBottomRightRadius: index === total - 1 ? 12 : 0,
+          borderTopWidth: index === 0 ? StyleSheet.hairlineWidth : 0,
+          marginTop: index === 0 ? 0 : -StyleSheet.hairlineWidth,
+        },
+      ]}
+    >
+      <Row item={item} colors={colors} onOpen={onOpen} />
+    </View>
+  ), [colors, onOpen, total]);
+  const getLayout = useCallback((_: any, index: number) => ({ length: ROW_HEIGHT, offset: ROW_HEIGHT * index, index }), []);
+
   return (
     <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
 
       <FlatList
         data={entries}
         keyExtractor={(e) => e.uri}
-        contentContainerStyle={{ padding: 16, paddingBottom: 110, gap: 0 }}
+        contentContainerStyle={contentStyle}
         showsVerticalScrollIndicator={false}
-        ListEmptyComponent={
-          <View style={[s.emptyCard, { backgroundColor: colors.secondaryGroupedBackground }]}>
-            <View style={[s.emptyIcon, { backgroundColor: colors.tertiarySystemFill }]}>
-              <Icon name="browse" size={22} color={colors.secondaryLabel} strokeWidth={1.6} />
-            </View>
-            <Text style={[s.emptyTitle, { color: colors.onSurface }]}>Empty folder</Text>
-            <Text style={[s.emptySub, { color: colors.secondaryLabel }]}>No manga files here</Text>
-          </View>
-        }
-        renderItem={({ item, index }) => (
-          <View
-            style={[
-              s.groupCard,
-              {
-                backgroundColor: colors.secondaryGroupedBackground,
-                borderTopLeftRadius: index === 0 ? 12 : 0,
-                borderTopRightRadius: index === 0 ? 12 : 0,
-                borderBottomLeftRadius: index === entries.length - 1 ? 12 : 0,
-                borderBottomRightRadius: index === entries.length - 1 ? 12 : 0,
-                borderTopWidth: index === 0 ? StyleSheet.hairlineWidth : 0,
-                marginTop: index === 0 ? 0 : -StyleSheet.hairlineWidth,
-              },
-            ]}
-          >
-            <Row item={item} colors={colors} onOpen={onOpen} />
-          </View>
-        )}
+        ListEmptyComponent={emptyComponent}
+        renderItem={renderRow}
+        getItemLayout={getLayout}
+        removeClippedSubviews
+        maxToRenderPerBatch={12}
+        updateCellsBatchingPeriod={50}
+        windowSize={9}
+        initialNumToRender={15}
       />
 
       {/* Bottom action — full-width prominent button, no shadow */}

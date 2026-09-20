@@ -360,7 +360,7 @@ function ExampleImage({
   }
   return (
     <Pressable onPress={onTogglePlay} style={s.exampleImageWrap} accessibilityLabel={playing ? 'Stop example audio' : 'Play example audio'}>
-      <Image source={{ uri: example.imageUrl }} style={StyleSheet.absoluteFill as any} contentFit="cover" transition={180} cachePolicy="memory-disk" />
+      <Image source={{ uri: example.imageUrl }} style={StyleSheet.absoluteFill as any} contentFit="cover" transition={0} cachePolicy="memory-disk" recyclingKey={example.id} />
       {example.soundUrl ? (
         <View style={s.examplePlayOverlay}>
           <Icon name={playing ? 'pause' : 'audio'} size={17} color="#fff" strokeWidth={2.2} />

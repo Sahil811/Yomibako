@@ -24,7 +24,7 @@ const TAB_META: Record<string, { label: string; icon: IconName }> = {
   Settings: { label: 'Settings', icon: 'settings' },
 };
 
-function TabButton({ isFocused, colors, onPress, label, icon }: any) {
+const TabButton = React.memo(function TabButton({ isFocused, colors, onPress, label, icon }: any) {
   const scale = useSharedValue(1);
   const animatedStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   const tint = isFocused ? colors.primary : colors.secondaryLabel;
@@ -61,6 +61,28 @@ function TabButton({ isFocused, colors, onPress, label, icon }: any) {
       </Animated.View>
     </Pressable>
   );
+});
+
+function TabBarTab({ route, isFocused, colors, navigation }: any) {
+  const meta = TAB_META[route.name] ?? { label: route.name, icon: 'book' as IconName };
+  const onPress = React.useCallback(() => {
+    const e = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
+    if (!isFocused && !e.defaultPrevented) {
+      Haptics.selectionAsync();
+      navigation.navigate(route.name);
+    } else if (isFocused) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    }
+  }, [navigation, route.key, route.name, isFocused]);
+  return (
+    <TabButton
+      isFocused={isFocused}
+      colors={colors}
+      onPress={onPress}
+      label={meta.label}
+      icon={meta.icon}
+    />
+  );
 }
 
 function TabBar({ state, descriptors, navigation }: any) {
@@ -86,42 +108,28 @@ function TabBar({ state, descriptors, navigation }: any) {
         />
       )}
       <View style={s.barContent}>
-        {state.routes.map((route: any, index: number) => {
-          const isFocused = state.index === index;
-          const meta = TAB_META[route.name] ?? { label: route.name, icon: 'book' as IconName };
-          const onPress = () => {
-            const e = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
-            if (!isFocused && !e.defaultPrevented) {
-              Haptics.selectionAsync();
-              navigation.navigate(route.name);
-            } else if (isFocused) {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            }
-          };
-          return (
-            <TabButton
-              key={route.key}
-              isFocused={isFocused}
-              colors={colors}
-              onPress={onPress}
-              label={meta.label}
-              icon={meta.icon}
-            />
-          );
-        })}
+        {state.routes.map((route: any, index: number) => (
+          <TabBarTab
+            key={route.key}
+            route={route}
+            isFocused={state.index === index}
+            colors={colors}
+            navigation={navigation}
+          />
+        ))}
       </View>
     </View>
   );
 }
 
-function RenderTabBar(props: any) {
+function TabsWrapperRenderTabBar(props: any) {
   return <TabBar {...props} />;
 }
 
 function TabsWrapper() {
   return (
     <View style={{ flex: 1 }}>
-      <Tab.Navigator tabBar={RenderTabBar} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true }}>
+      <Tab.Navigator tabBar={TabsWrapperRenderTabBar} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true }}>
         <Tab.Screen name="Library" component={LibraryScreen} />
         <Tab.Screen name="Browser" component={BrowserScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />
@@ -145,7 +153,7 @@ export default function AppNavigator() {
   const scheme = useColorScheme();
   const colors = scheme === 'light' ? lightColors : darkColors;
   const navTheme = scheme === 'dark' ? DarkTheme : DefaultTheme;
-  const theme = {
+  const theme = React.useMemo(() => ({
     ...navTheme,
     colors: {
       ...navTheme.colors,
@@ -155,7 +163,7 @@ export default function AppNavigator() {
       text: colors.onSurface,
       border: colors.separator,
     },
-  } as any;
+  }), [navTheme, colors]) as any;
   return (
     <NavigationContainer theme={theme}>
       <Stack.Navigator

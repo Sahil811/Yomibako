@@ -3,9 +3,9 @@
 // same JSON files the extension ships (assets/kanji/*.json), so the popup
 // kanji breakdown works fully offline. kanjiapi.dev is only a fallback for
 // characters missing from the bundle.
-import meaningsJson from '../../../assets/kanji/kanji_meanings.json';
-import componentsJson from '../../../assets/kanji/kanji_components.json';
-import componentMeaningsJson from '../../../assets/kanji/component_meanings.json';
+//
+// The JSON blobs are loaded lazily on first lookup (not at import time) so
+// opening the library/reader doesn't pay the parse cost upfront.
 import { kanjiApi } from './api';
 
 export type KanjiComponent = { component: string; meaning: string };
@@ -21,6 +21,21 @@ let rtkMap: Map<string, string> | null = null;
 let componentsMap: Map<string, string[]> | null = null;
 let componentMeaningsMap: Map<string, string> | null = null;
 
+function loadKanjiJson(name: 'kanji_meanings.json' | 'kanji_components.json' | 'component_meanings.json'): any {
+  // Static require paths so Metro can bundle the JSON; called lazily from
+  // ensureMaps() so the parse cost is paid on first kanji lookup, not import.
+  if (name === 'kanji_components.json') {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require('../../../assets/kanji/kanji_components.json');
+  }
+  if (name === 'component_meanings.json') {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    return require('../../../assets/kanji/component_meanings.json');
+  }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('../../../assets/kanji/kanji_meanings.json');
+}
+
 function dedupe(arr: string[]): string[] {
   const seen = new Set<string>();
   return (arr || []).filter((c) => !seen.has(c) && (seen.add(c), true));
@@ -30,17 +45,18 @@ function ensureMaps() {
   if (!meaningMap) {
     meaningMap = new Map();
     rtkMap = new Map();
-    for (const entry of meaningsJson as { kanji: string; meaning: string; rtk?: string }[]) {
+    const meaningsJson = loadKanjiJson('kanji_meanings.json') as { kanji: string; meaning: string; rtk?: string }[];
+    for (const entry of meaningsJson) {
       if (entry.kanji && entry.meaning) meaningMap.set(entry.kanji, entry.meaning);
       if (entry.kanji && entry.rtk) rtkMap!.set(entry.kanji, entry.rtk);
     }
   }
   if (!componentsMap) {
     componentsMap = new Map();
-    const raw = componentsJson as Record<string, string[]>;
+    const raw = loadKanjiJson('kanji_components.json') as Record<string, string[]>;
     for (const k of Object.keys(raw)) componentsMap.set(k, dedupe(raw[k]));
   }
-  componentMeaningsMap ??= new Map(Object.entries(componentMeaningsJson as Record<string, string>));
+  componentMeaningsMap ??= new Map(Object.entries(loadKanjiJson('component_meanings.json') as Record<string, string>));
 }
 
 function cleanRtkText(rtk: string): string {

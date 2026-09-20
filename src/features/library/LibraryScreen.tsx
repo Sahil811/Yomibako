@@ -1057,7 +1057,7 @@ function LibraryAppBarContent(args: {
   );
 }
 
-function ShelvesSection({ library, series, colors, onSelectSeries, onMenuSeries }: {
+const ShelvesSection = React.memo(function ShelvesSection({ library, series, colors, onSelectSeries, onMenuSeries }: {
   readonly library: Series[];
   readonly series: Series;
   readonly colors: any;
@@ -1070,16 +1070,16 @@ function ShelvesSection({ library, series, colors, onSelectSeries, onMenuSeries 
   return (
     <View style={{ marginBottom: 18 }}>
       <Text style={[s.sectionTitle, { color: colors.onSurface }]}>Shelves</Text>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.shelfRail}>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.shelfRail} removeClippedSubviews>
         {library.map((item) => (
           <ShelfChip key={seriesKey(item)} item={item} active={seriesKey(item) === seriesKey(series)} colors={colors} onSelect={onSelectSeries} onMenu={onMenuSeries} />
         ))}
       </ScrollView>
     </View>
   );
-}
+});
 
-function ShelfChip({ item, active, colors, onSelect, onMenu }: {
+const ShelfChip = React.memo(function ShelfChip({ item, active, colors, onSelect, onMenu }: {
   readonly item: Series;
   readonly active: boolean;
   readonly colors: any;
@@ -1087,9 +1087,10 @@ function ShelfChip({ item, active, colors, onSelect, onMenu }: {
   readonly onMenu: (item: Series) => void;
 }) {
   const cover = item.volumes.find((volume) => volume.coverUri)?.coverUri;
+  const chipKey = seriesKey(item);
   return (
     <Pressable
-      key={seriesKey(item)}
+      key={chipKey}
       onPress={() => onSelect(item)}
       onLongPress={() => onMenu(item)}
       delayLongPress={260}
@@ -1106,7 +1107,7 @@ function ShelfChip({ item, active, colors, onSelect, onMenu }: {
     >
       <View style={[s.shelfCover, { backgroundColor: colors.tertiarySystemFill }]}>
         {cover ? (
-          <Image source={{ uri: cover }} style={StyleSheet.absoluteFill as any} contentFit="cover" cachePolicy="memory-disk" transition={0} />
+          <Image source={{ uri: cover }} style={StyleSheet.absoluteFill as any} contentFit="cover" cachePolicy="memory-disk" transition={0} recyclingKey={chipKey} />
         ) : (
           <Icon name="book" size={14} color={colors.secondaryLabel} strokeWidth={1.7} />
         )}
@@ -1117,9 +1118,9 @@ function ShelfChip({ item, active, colors, onSelect, onMenu }: {
       </View>
     </Pressable>
   );
-}
+});
 
-function ContinueReadingSection({ volumes, colors, isDark, query, selecting, onOpen, onMenu }: {
+const ContinueReadingSection = React.memo(function ContinueReadingSection({ volumes, colors, isDark, query, selecting, onOpen, onMenu }: {
   readonly volumes: Volume[];
   readonly colors: any;
   readonly isDark: boolean;
@@ -1134,16 +1135,18 @@ function ContinueReadingSection({ volumes, colors, isDark, query, selecting, onO
   return (
     <View style={{ marginBottom: 18 }}>
       <Text style={[s.sectionTitle, { color: colors.onSurface }]}>Continue reading</Text>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 14, paddingRight: 16 }} snapToInterval={134} decelerationRate="fast">
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={CONTINUE_RAIL_STYLE} snapToInterval={134} decelerationRate="fast" removeClippedSubviews>
         {volumes.map((volume) => (
           <ContinueReadingCard key={volume.id} volume={volume} colors={colors} isDark={isDark} onOpen={onOpen} onMenu={onMenu} />
         ))}
       </ScrollView>
     </View>
   );
-}
+});
 
-function ContinueReadingCard({ volume, colors, isDark, onOpen, onMenu }: {
+const CONTINUE_RAIL_STYLE = { gap: 14, paddingRight: 16 } as const;
+
+const ContinueReadingCard = React.memo(function ContinueReadingCard({ volume, colors, isDark, onOpen, onMenu }: {
   readonly volume: Volume;
   readonly colors: any;
   readonly isDark: boolean;
@@ -1168,9 +1171,9 @@ function ContinueReadingCard({ volume, colors, isDark, onOpen, onMenu }: {
       <Text numberOfLines={1} style={[s.cardSub, { color: colors.secondaryLabel }]}>{Math.round((volume.progress ?? 0) * 100)}% read</Text>
     </Pressable>
   );
-}
+});
 
-function FilterSection({ volumeCount, filter, colors, filteredLength, onFilter }: {
+const FilterSection = React.memo(function FilterSection({ volumeCount, filter, colors, filteredLength, onFilter }: {
   readonly volumeCount: number;
   readonly filter: Filter;
   readonly colors: any;
@@ -1190,9 +1193,9 @@ function FilterSection({ volumeCount, filter, colors, filteredLength, onFilter }
       <Text style={[s.countText, { color: colors.tertiaryLabel }]}>{filteredLength}</Text>
     </View>
   );
-}
+});
 
-function FilterChip({ option, active, colors, onFilter }: {
+const FilterChip = React.memo(function FilterChip({ option, active, colors, onFilter }: {
   readonly option: Filter;
   readonly active: boolean;
   readonly colors: any;
@@ -1211,7 +1214,7 @@ function FilterChip({ option, active, colors, onFilter }: {
       </Text>
     </Pressable>
   );
-}
+});
 
 function EmptyVolumesView({ query, filter, colors }: {
   readonly query: string;
@@ -1574,6 +1577,17 @@ export default function LibraryScreen() {
     />
   ), [colors, isDark, layout, selecting, selectionSet, handlePressVolume, handleLongPressVolume, handleMenuVolume]);
 
+  // Hooks must stay above the onboarding early-return: adding a hook below it
+  // changes the hook count once the library loads -> "Rendered more hooks".
+  const overflowActions: SheetAction[] = React.useMemo(() => buildOverflowActionsOrEmpty(series, sort, removedCount, {
+    onAdd: () => void pickFolder(),
+    onSelect: () => setSelecting(true),
+    onRescan: () => void rescan(),
+    onRestore: () => void restoreEverything(),
+    onSort: (next) => setSort(next),
+    onRemove: (target) => removeSeries(target),
+  }), [series, sort, removedCount, pickFolder, rescan, restoreEverything, removeSeries]);
+
   // ——— Onboarding: nothing in the library yet ———
   if (shouldShowOnboarding(series, loading)) {
     return <OnboardingView colors={colors} topPad={insets.top + 10} onPick={pickFolder} />;
@@ -1586,15 +1600,6 @@ export default function LibraryScreen() {
     libraryVolumeCount,
     volumeCount: series?.volumes.length ?? 0,
     totalPages: series?.totalPages ?? 0,
-  });
-
-  const overflowActions: SheetAction[] = buildOverflowActionsOrEmpty(series, sort, removedCount, {
-    onAdd: () => void pickFolder(),
-    onSelect: () => setSelecting(true),
-    onRescan: () => void rescan(),
-    onRestore: () => void restoreEverything(),
-    onSort: (next) => setSort(next),
-    onRemove: (target) => removeSeries(target),
   });
 
   const handleToggleSelectAll = (allSelected: boolean, list: Volume[]) => {
@@ -1901,10 +1906,12 @@ function contentGapForLayout(layout: 'grid' | 'list'): number {
 
 function columnStyleForLayout(layout: 'grid' | 'list'): { gap: number } | undefined {
   if (layout === 'grid') {
-    return { gap: 16 };
+    return GRID_COLUMN_STYLE;
   }
   return undefined;
 }
+
+const GRID_COLUMN_STYLE = { gap: 16 } as const;
 
 function LibraryMainContent({ series, filtered, layout, colors, isDark, library, continueReading, query, selecting, filter, openVolume, renderVolume, onSelectSeries, onMenuSeries, onMenuVolume, onFilter }: {
   readonly series: Series | null;
@@ -1924,6 +1931,38 @@ function LibraryMainContent({ series, filtered, layout, colors, isDark, library,
   readonly onMenuVolume: (v: Volume) => void;
   readonly onFilter: (f: Filter) => void;
 }): React.ReactElement {
+  const numColumns = numColumnsForLayout(layout);
+  const contentStyle = React.useMemo(
+    () => ({ padding: 16, paddingBottom: 110, gap: contentGapForLayout(layout) }),
+    [layout],
+  );
+  const columnStyle = React.useMemo(() => columnStyleForLayout(layout), [layout]);
+  const header = React.useMemo(
+    () => (
+      <LibraryListHeader
+        library={library}
+        series={series}
+        colors={colors}
+        continueReading={continueReading}
+        isDark={isDark}
+        query={query}
+        selecting={selecting}
+        openVolume={openVolume}
+        onSelectSeries={onSelectSeries}
+        onMenuSeries={onMenuSeries}
+        onMenuVolume={onMenuVolume}
+        filter={filter}
+        filteredLength={filtered.length}
+        volumeCount={series?.volumes.length ?? 0}
+        onFilter={onFilter}
+      />
+    ),
+    [library, series, colors, continueReading, isDark, query, selecting, openVolume, onSelectSeries, onMenuSeries, onMenuVolume, filter, filtered.length, onFilter],
+  );
+  const empty = React.useMemo(
+    () => <EmptyVolumesView query={query} filter={filter} colors={colors} />,
+    [query, filter, colors],
+  );
   if (!series) {
     return <SkeletonGrid colors={colors} />;
   }
@@ -1933,27 +1972,48 @@ function LibraryMainContent({ series, filtered, layout, colors, isDark, library,
       key={String(layout)}
       keyExtractor={(volume) => volume.id}
       renderItem={renderVolume}
-      numColumns={numColumnsForLayout(layout)}
+      numColumns={numColumns}
       keyboardShouldPersistTaps="handled"
       showsVerticalScrollIndicator={false}
-      removeClippedSubviews={Platform.OS === 'android'}
+      removeClippedSubviews
       maxToRenderPerBatch={8}
       updateCellsBatchingPeriod={80}
       windowSize={7}
       initialNumToRender={10}
-      contentContainerStyle={{ padding: 16, paddingBottom: 110, gap: contentGapForLayout(layout) }}
-      columnWrapperStyle={columnStyleForLayout(layout)}
-      ListHeaderComponent={
-        <View>
-          <ShelvesSection library={library} series={series} colors={colors} onSelectSeries={onSelectSeries} onMenuSeries={onMenuSeries} />
-          <ContinueReadingSection volumes={continueReading} colors={colors} isDark={isDark} query={query} selecting={selecting} onOpen={openVolume} onMenu={onMenuVolume} />
-          <FilterSection volumeCount={series.volumes.length} filter={filter} colors={colors} filteredLength={filtered.length} onFilter={onFilter} />
-        </View>
-      }
-      ListEmptyComponent={<EmptyVolumesView query={query} filter={filter} colors={colors} />}
+      contentContainerStyle={contentStyle}
+      columnWrapperStyle={columnStyle}
+      ListHeaderComponent={header}
+      ListEmptyComponent={empty}
     />
   );
 }
+
+const LibraryListHeader = React.memo(function LibraryListHeader({ library, series, colors, continueReading, isDark, query, selecting, openVolume, onSelectSeries, onMenuSeries, onMenuVolume, filter, filteredLength, volumeCount, onFilter }: {
+  readonly library: Series[];
+  readonly series: Series | null;
+  readonly colors: any;
+  readonly continueReading: Volume[];
+  readonly isDark: boolean;
+  readonly query: string;
+  readonly selecting: boolean;
+  readonly openVolume: (v: Volume) => void;
+  readonly onSelectSeries: (item: Series) => void;
+  readonly onMenuSeries: (item: Series) => void;
+  readonly onMenuVolume: (v: Volume) => void;
+  readonly filter: Filter;
+  readonly filteredLength: number;
+  readonly volumeCount: number;
+  readonly onFilter: (f: Filter) => void;
+}) {
+  if (!series) return null;
+  return (
+    <View>
+      <ShelvesSection library={library} series={series} colors={colors} onSelectSeries={onSelectSeries} onMenuSeries={onMenuSeries} />
+      <ContinueReadingSection volumes={continueReading} colors={colors} isDark={isDark} query={query} selecting={selecting} onOpen={openVolume} onMenu={onMenuVolume} />
+      <FilterSection volumeCount={volumeCount} filter={filter} colors={colors} filteredLength={filteredLength} onFilter={onFilter} />
+    </View>
+  );
+});
 
 const s = StyleSheet.create({
   root: { flex: 1 },

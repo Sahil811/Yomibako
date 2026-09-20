@@ -17,10 +17,12 @@ export type ImmersionExample = {
 };
 
 let metadataPromise: Promise<DeckMetadata> | null = null;
+const examplesCache = new Map<string, Promise<ImmersionExample[]>>();
 
 /** Test-only: drop cached metadata so each test refetches. */
 export function __resetImmersionForTests() {
   metadataPromise = null;
+  examplesCache.clear();
 }
 
 async function getMetadata(signal?: AbortSignal): Promise<DeckMetadata> {
@@ -81,12 +83,37 @@ async function searchWithParticleFallback(word: string, signal?: AbortSignal): P
 }
 
 export async function fetchImmersionExamples(word: string, signal?: AbortSignal): Promise<ImmersionExample[]> {
-  const metadata = await getMetadata(signal);
-  const direct = await searchCandidate(word, signal);
-  if (direct.length) return mapExamples(direct, metadata);
+  const key = String(word ?? '');
+  if (!key) return [];
+  if (signal?.aborted) return [];
+  // Promise cache: tapping the same word (or re-expanding examples) reuses
+  // the in-flight/completed fetch instead of firing sequential particle
+  // fallback searches again. Abortable requests bypass the cache.
+  const cached = examplesCache.get(key);
+  if (cached) {
+    try {
+      return await cached;
+    } catch {
+      examplesCache.delete(key);
+    }
+  }
+  const promise = (async () => {
+    const metadata = await getMetadata(signal);
+    const direct = await searchCandidate(key, signal);
+    if (direct.length) return mapExamples(direct, metadata);
 
-  const fallback = await searchWithParticleFallback(word, signal);
-  return mapExamples(fallback, metadata);
+    const fallback = await searchWithParticleFallback(key, signal);
+    return mapExamples(fallback, metadata);
+  })();
+  // Bounded cache — long browsing sessions shouldn't grow without limit.
+  if (examplesCache.size > 200) examplesCache.clear();
+  examplesCache.set(key, promise);
+  try {
+    return await promise;
+  } catch (e) {
+    if (examplesCache.get(key) === promise) examplesCache.delete(key);
+    throw e;
+  }
 }
 
 /** Convert the limited HTML found in ImmersionKit translations to native text. */

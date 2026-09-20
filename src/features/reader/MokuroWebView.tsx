@@ -265,7 +265,19 @@ function MokuroWebView(
     lookups: 0, taps: 0, guardedTextTaps: 0, deferredLookups: 0,
     applied: 0, applyErr: 0,
   });
-  const saveDiag = useCallback(async () => {
+  // Throttled diag persistence: taps/parse/progress fire many times per
+  // second and SecureStore is encrypted/slow. Coalesce to at most one write
+  // per 5s; unmount flushes the tail so diagnostics are never lost.
+  const diagTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const diagPending = useRef(false);
+  const lastDiagWrite = useRef(0);
+  const flushDiag = useCallback(async () => {
+    if (diagTimer.current) {
+      clearTimeout(diagTimer.current);
+      diagTimer.current = null;
+    }
+    diagPending.current = false;
+    lastDiagWrite.current = Date.now();
     try {
       await setItemAsync(
         'yomibako_reader_diag',
@@ -273,6 +285,29 @@ function MokuroWebView(
       );
     } catch {}
   }, [title]);
+  const saveDiag = useCallback(() => {
+    // First write (or >5s since last) goes out immediately so Diagnostics
+    // stays fresh; bursts within the window coalesce to one trailing write.
+    if (!diagPending.current && Date.now() - lastDiagWrite.current > 5000) {
+      void flushDiag();
+      return;
+    }
+    if (diagPending.current) return;
+    diagPending.current = true;
+    diagTimer.current = setTimeout(() => {
+      diagTimer.current = null;
+      diagPending.current = false;
+      void flushDiag();
+    }, 5000);
+  }, [flushDiag]);
+
+  React.useEffect(
+    () => () => {
+      if (diagTimer.current) clearTimeout(diagTimer.current);
+      void flushDiag();
+    },
+    [flushDiag]
+  );
 
   const getToken = useCallback(async (): Promise<string | null> => {
     let token: string | null = await getItemAsync('jpdb_token');
@@ -594,12 +629,33 @@ function MokuroWebView(
   }, [resolveImageUri, baseUrl]);
 
   async function handleContentImage(orig: string, id: string): Promise<void> {
-    const absolute = resolveImageUri(orig) ?? orig;
-    const b64 = await new File(absolute).base64();
-    const ext = absolute.split('.').pop()?.toLowerCase() ?? 'jpeg';
-    const mime = mimeForExtension(ext);
-    const dataUri = `data:${mime};base64,${b64}`;
-    webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(dataUri)}); true;`);
+    try {
+      const absolute = resolveImageUri(orig) ?? orig;
+      const file = new File(absolute);
+      // Safety-net path only: skip giant pages instead of building a huge
+      // data: URI that dies silently on Android and spikes the JS heap.
+      try {
+        const info = file.info();
+        const size = (info as { size?: number })?.size;
+        if (typeof size === 'number' && size > 4 * 1024 * 1024) {
+          throw new Error(`image too large (${Math.round(size / 1024 / 1024)}MB) for bridge`);
+        }
+      } catch (e: any) {
+        if (String(e?.message ?? '').includes('too large')) throw e;
+        // info() unavailable on some URIs — fall through and try.
+      }
+      const b64 = await file.base64();
+      if (b64.length > 5 * 1024 * 1024) {
+        throw new Error('image too large for bridge');
+      }
+      const ext = absolute.split('.').pop()?.toLowerCase() ?? 'jpeg';
+      const mime = mimeForExtension(ext);
+      const dataUri = `data:${mime};base64,${b64}`;
+      webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(dataUri)}); true;`);
+    } catch (e: any) {
+      console.warn('[MokuroWebView] fetchImage skipped', orig, e?.message ?? e);
+      webRef.current?.injectJavaScript(`window.__yomibakoOnImageError && window.__yomibakoOnImageError(${JSON.stringify(id)}, ${JSON.stringify(String(e?.message ?? e).slice(0, 200))}); true;`);
+    }
   }
 
   const onMessage = useCallback(async (e: WebViewMessageEvent) => {

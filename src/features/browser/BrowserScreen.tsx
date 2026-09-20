@@ -275,8 +275,7 @@ async function handleParseMessage(msg: any, ctx: BrowserMessageContext): Promise
   }
   try {
     const { tokens } = await jpdbApi.parse({ text: texts, apiToken });
-    const payload = JSON.stringify(tokens);
-    ctx.webRef.current?.injectJavaScript(`window.__yomibakoOnTokens(${JSON.stringify(id)}, ${payload}); true;`);
+    injectBrowserTokens(ctx.webRef, id, tokens);
     ctx.setParseCount((c) => c + 1);
     ctx.setParseError(null);
   } catch (err: any) {
@@ -284,6 +283,25 @@ async function handleParseMessage(msg: any, ctx: BrowserMessageContext): Promise
     ctx.webRef.current?.injectJavaScript(`window.__yomibakoOnError(${JSON.stringify(id)}, ${JSON.stringify(err.message)}); true;`);
   }
   return true;
+}
+
+// Chunked token reply: giant injectJavaScript payloads (100KB+ of JSON) die
+// silently on Android. Split into ~20KB slices like MokuroWebView; the
+// browser bundle reassembles via __yomibakoOnTokensChunk.
+function injectBrowserTokens(webRef: React.RefObject<WebView | null>, id: string, tokens: unknown): void {
+  const payload = JSON.stringify(tokens);
+  if (payload.length <= 30000) {
+    webRef.current?.injectJavaScript(`window.__yomibakoOnTokens(${JSON.stringify(id)}, ${payload}); true;`);
+    return;
+  }
+  const CHUNK = 20000;
+  const total = Math.ceil(payload.length / CHUNK);
+  for (let i = 0; i < total; i++) {
+    const part = payload.slice(i * CHUNK, (i + 1) * CHUNK);
+    webRef.current?.injectJavaScript(
+      `window.__yomibakoOnTokensChunk(${JSON.stringify(id)}, ${i}, ${total}, ${JSON.stringify(part)}); true;`
+    );
+  }
 }
 
 function handleLookupMessage(msg: any, ctx: BrowserMessageContext): boolean {

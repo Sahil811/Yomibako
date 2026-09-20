@@ -20,25 +20,25 @@ function getHeadingScale(level: number): number {
   return 1.0;
 }
 
-function spanKey(span: Span): string {
+function spanKey(span: Span, index: number): string {
   const styleFlag = `${span.bold ? 'b' : ''}${span.italic ? 'i' : ''}${span.code ? 'c' : ''}`;
-  return `span-${styleFlag}-${span.text.slice(0, 24)}-${span.text.length}`;
+  return `span-${index}-${styleFlag}-${span.text.slice(0, 24)}-${span.text.length}`;
 }
 
-function Inline({ spans, color, codeColor, codeBg, size }: { readonly spans: Span[]; readonly color: string; readonly codeColor: string; readonly codeBg: string; readonly size: number }) {
+const Inline = React.memo(function Inline({ spans, color, codeColor, codeBg, size }: { readonly spans: Span[]; readonly color: string; readonly codeColor: string; readonly codeBg: string; readonly size: number }) {
   return (
     <>
-      {spans.map((span) =>
+      {spans.map((span, index) =>
         span.code ? (
           <Text
-            key={spanKey(span)}
+            key={spanKey(span, index)}
             style={{ fontFamily: MONO, fontSize: size * 0.92, color: codeColor, backgroundColor: codeBg }}
           >
             {` ${span.text} `}
           </Text>
         ) : (
           <Text
-            key={spanKey(span)}
+            key={spanKey(span, index)}
             style={{
               color,
               fontWeight: span.bold ? '700' : '400',
@@ -51,7 +51,7 @@ function Inline({ spans, color, codeColor, codeBg, size }: { readonly spans: Spa
       )}
     </>
   );
-}
+});
 
 export function Markdown({
   content,
@@ -68,7 +68,10 @@ export function Markdown({
   readonly codeBg: string;
   readonly size?: number;
 }) {
-  const blocks = React.useMemo(() => parseBlocks(content), [content]);
+  const blocks = React.useMemo(() => {
+    const parsed = parseBlocks(content);
+    return parsed.map((block) => ({ ...block, spans: parseInline(block.text) }));
+  }, [content]);
   const lineHeight = Math.round(size * 1.45);
 
   return (
@@ -78,36 +81,36 @@ export function Markdown({
           const scale = getHeadingScale(block.level);
           return (
             <Text
-              key={`heading-${block.text.slice(0, 32)}-${block.text.length}`}
+              key={`heading-${index}-${block.text.slice(0, 32)}-${block.text.length}`}
               style={{ color, fontSize: Math.round(size * scale), fontWeight: '700', lineHeight: Math.round(size * scale * 1.3), marginTop: index === 0 ? 0 : 4 }}
             >
-              <Inline spans={parseInline(block.text)} color={color} codeColor={accentColor} codeBg={codeBg} size={Math.round(size * scale)} />
+              <Inline spans={block.spans} color={color} codeColor={accentColor} codeBg={codeBg} size={Math.round(size * scale)} />
             </Text>
           );
         }
         if (block.type === 'bullet') {
           return (
-            <View key={`bullet-${block.text.slice(0, 32)}-${block.text.length}`} style={s.row}>
+            <View key={`bullet-${index}-${block.text.slice(0, 32)}-${block.text.length}`} style={s.row}>
               <Text style={{ color: accentColor, fontSize: size, lineHeight, width: 14 }}>•</Text>
               <Text style={{ flex: 1, color, fontSize: size, lineHeight }}>
-                <Inline spans={parseInline(block.text)} color={color} codeColor={accentColor} codeBg={codeBg} size={size} />
+                <Inline spans={block.spans} color={color} codeColor={accentColor} codeBg={codeBg} size={size} />
               </Text>
             </View>
           );
         }
         if (block.type === 'number') {
           return (
-            <View key={`number-${block.label}-${block.text.slice(0, 32)}-${block.text.length}`} style={s.row}>
+            <View key={`number-${index}-${block.label}-${block.text.slice(0, 32)}-${block.text.length}`} style={s.row}>
               <Text style={{ color: mutedColor, fontSize: size, lineHeight, minWidth: 16 }}>{block.label}.</Text>
               <Text style={{ flex: 1, color, fontSize: size, lineHeight }}>
-                <Inline spans={parseInline(block.text)} color={color} codeColor={accentColor} codeBg={codeBg} size={size} />
+                <Inline spans={block.spans} color={color} codeColor={accentColor} codeBg={codeBg} size={size} />
               </Text>
             </View>
           );
         }
         return (
-          <Text key={`para-${block.text.slice(0, 32)}-${block.text.length}`} style={{ color, fontSize: size, lineHeight }}>
-            <Inline spans={parseInline(block.text)} color={color} codeColor={accentColor} codeBg={codeBg} size={size} />
+          <Text key={`para-${index}-${block.text.slice(0, 32)}-${block.text.length}`} style={{ color, fontSize: size, lineHeight }}>
+            <Inline spans={block.spans} color={color} codeColor={accentColor} codeBg={codeBg} size={size} />
           </Text>
         );
       })}

@@ -319,6 +319,25 @@ export const BROWSER_JS = `
     const p=pending.get(id); if(p){ p.resolve(tokensArray); pending.delete(id); }
   };
   window.__yomibakoOnError=function(id,err){ const p=pending.get(id); if(p){ p.reject(err); pending.delete(id);} };
+  // Chunked counterpart for large parses (mirrors yomibakoBundle): RN splits
+  // payloads >30KB into ~20KB slices; reassemble here before resolving.
+  var __tokenChunks={};
+  window.__yomibakoOnTokensChunk=function(id,i,total,part){
+    try{
+      var entry=__tokenChunks[id] || (__tokenChunks[id]={parts:[], received:0, total:total});
+      entry.parts[i]=part; entry.received++;
+      entry.total=total;
+      if(entry.received>=total){
+        var payload=entry.parts.join('');
+        delete __tokenChunks[id];
+        var tokensArray=JSON.parse(payload);
+        window.__yomibakoOnTokens(id, tokensArray);
+      }
+    }catch(e){
+      delete __tokenChunks[id];
+      window.__yomibakoOnError(id, String((e && e.message) || e));
+    }
+  };
 
   const MAX_CHUNK_CHARS = 5000;
   const MAX_CHUNK_PARAS = 20;

@@ -16,6 +16,7 @@ export const JPDB_XOR_KEY = [0x06, 0x23, 0x54, 0x0f];
 export const AUDIO_EXTS = ['ogg', 'mp3', 'm4a', 'wav', 'flac', 'bin'];
 
 const audioCache = new Map<string, string>(); // hash -> file uri
+const audioHashCache = new Map<string, string | null>(); // vid:spelling -> hash (avoids refetching vocab HTML per tap)
 let currentPlayer: AudioPlayer | null = null;
 let currentPlayerSubscription: { remove: () => void } | null = null;
 let currentRemoteFinished: ((reason: RemoteAudioFinishReason) => void) | null = null;
@@ -121,7 +122,16 @@ export function cachedFileFor(hash: string, ext: string) {
 export async function playAudioForWord(vid: number, spelling: string): Promise<boolean> {
   const generation = beginPlaybackRequest();
   try {
-    const hash = await jpdbApi.getAudioHash({ vid, spelling });
+    const cacheKey = `${vid}:${spelling}`;
+    let hash = audioHashCache.has(cacheKey) ? (audioHashCache.get(cacheKey) as string | null) : undefined;
+    if (hash === undefined) {
+      hash = await jpdbApi.getAudioHash({ vid, spelling });
+      // Cache misses too (null) so repeated taps on words without audio
+      // don't refetch the vocabulary page every time. Bounded to avoid
+      // unbounded growth over long sessions.
+      if (audioHashCache.size > 500) audioHashCache.clear();
+      audioHashCache.set(cacheKey, hash ?? null);
+    }
     if (!isCurrentRequest(generation)) return false;
     if (!hash) {
       lastError = 'No JPDB recording for this word';
@@ -290,6 +300,7 @@ export function stopAudio() {
 /** Test-only: reset in-memory playback/cache state. */
 export function __resetAudioForTests() {
   audioCache.clear();
+  audioHashCache.clear();
   currentPlayer = null;
   currentPlayerSubscription = null;
   currentRemoteFinished = null;
@@ -301,6 +312,7 @@ export function __resetAudioForTests() {
 /** Drop every cached recording — files written before the de-obfuscation fix are junk. */
 export function clearAudioCache() {
   audioCache.clear();
+  audioHashCache.clear();
   try {
     const dir = new Directory(Paths.cache, 'yomibako', 'audio');
     if (dir.exists) dir.delete();

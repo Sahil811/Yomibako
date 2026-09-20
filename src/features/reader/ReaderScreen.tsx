@@ -156,9 +156,11 @@ function useScrubController(
 
   const previewAt = useCallback((value: number) => {
     if (total > 1) {
-      setScrubTo(Math.round(clamp01(value) * (total - 1)));
+      const next = Math.round(clamp01(value) * (total - 1));
+      // Gesture fires per frame — skip React re-render when the page hasn't changed.
+      setScrubTo((prev) => (prev === next ? prev : next));
     } else {
-      setScrubTo(null);
+      setScrubTo((prev) => (prev === null ? prev : null));
     }
   }, [total]);
 
@@ -187,9 +189,12 @@ function useScrubController(
     .onFinalize(() => { scrubbing.value = 0; }), [endScrub, previewAt, scrubValue, scrubbing, trackW]);
 
   const fillStyle = useAnimatedStyle(() => ({ width: `${scrubValue.value * 100}%` }));
+  // No withSpring here: this style re-evaluates every gesture frame, and
+  // spawning a spring per frame janks the scrub. Direct interpolation is
+  // enough for a 1 -> 1.35 thumb pop.
   const thumbStyle = useAnimatedStyle(() => ({
     left: `${scrubValue.value * 100}%`,
-    transform: [{ scale: withSpring(scrubbing.value ? 1.35 : 1, { damping: 18, stiffness: 320 }) }],
+    transform: [{ scale: scrubbing.value ? 1.35 : 1 }],
   }));
 
   return { scrubTo, setScrubTo, trackW, scrubbing, scrubValue, previewAt, endScrub, scrub, fillStyle, thumbStyle };
