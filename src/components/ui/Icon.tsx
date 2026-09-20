@@ -271,7 +271,7 @@ function Glyph({ name, color, strokeWidth }: { name: IconName; color: string; st
   }
 }
 
-export function Icon({
+export const Icon = React.memo(function Icon({
   name,
   size = 22,
   color = '#007AFF',
@@ -287,4 +287,4 @@ export function Icon({
       <Glyph name={name} color={color} strokeWidth={strokeWidth} />
     </Svg>
   );
-}
+});

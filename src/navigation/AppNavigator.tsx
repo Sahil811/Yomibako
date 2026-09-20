@@ -30,8 +30,14 @@ function TabButton({ isFocused, colors, onPress, label, icon }: any) {
   const tint = isFocused ? colors.primary : colors.secondaryLabel;
   return (
     <Pressable
-      onPressIn={() => (scale.value = withSpring(0.9, { damping: 20, stiffness: 500 }))}
-      onPressOut={() => (scale.value = withSpring(1, { damping: 20, stiffness: 400 }))}
+      onPressIn={() => {
+        // Press shrink is iOS-only polish; on Android the ripple already
+        // confirms the tap and the extra animation frame costs more.
+        if (Platform.OS !== 'android') scale.value = withSpring(0.9, { damping: 20, stiffness: 500 });
+      }}
+      onPressOut={() => {
+        if (Platform.OS !== 'android') scale.value = withSpring(1, { damping: 20, stiffness: 400 });
+      }}
       onPress={onPress}
       style={s.tab}
       hitSlop={6}
@@ -70,11 +76,15 @@ function TabBar({ state, descriptors, navigation }: any) {
   return (
     <View style={[s.barContainer, { paddingBottom: Math.max(insets.bottom, Platform.OS === 'ios' ? 6 : 8) }]}>
       <View style={[s.hairline, { backgroundColor: colors.separator }]} />
-      <BlurView
-        intensity={Platform.OS === 'ios' ? 40 : 60}
-        tint={scheme === 'dark' ? 'dark' : 'light'}
-        style={[StyleSheet.absoluteFill as any, { backgroundColor: colors.blurTint }]}
-      />
+      {Platform.OS === 'android' ? (
+        <View style={[StyleSheet.absoluteFill as any, { backgroundColor: colors.secondaryGroupedBackground }]} />
+      ) : (
+        <BlurView
+          intensity={Platform.OS === 'ios' ? 40 : 60}
+          tint={scheme === 'dark' ? 'dark' : 'light'}
+          style={[StyleSheet.absoluteFill as any, { backgroundColor: colors.blurTint }]}
+        />
+      )}
       <View style={s.barContent}>
         {state.routes.map((route: any, index: number) => {
           const isFocused = state.index === index;

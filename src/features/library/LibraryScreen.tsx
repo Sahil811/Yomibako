@@ -26,7 +26,6 @@ import Animated, {
   useAnimatedStyle,
   useSharedValue,
   withRepeat,
-  withSpring,
   withTiming,
 } from 'react-native-reanimated';
 import { scanLibrary } from './scan';
@@ -60,6 +59,12 @@ const SORT_LABEL: Record<Sort, string> = {
   recent: 'recently read',
 };
 
+// Cached collator: String.localeCompare with { numeric: true } allocates a new
+// collator per comparison — brutal when re-sorting 100+ volumes on every
+// streaming scan update. One shared instance does the same ordering.
+const titleCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+const compareTitle = (a: { title: string }, b: { title: string }) => titleCollator.compare(a.title, b.title);
+
 // Deterministic muted tint so volumes without cover art still read as distinct books.
 function tintFor(seed: string, isDark: boolean): string {
   let hash = 0;
@@ -74,15 +79,17 @@ function coverInitial(title: string): string {
   return title.trim().slice(0, 2) || '本';
 }
 
-function CoverArt({ volume, isDark, radius }: { volume: Volume; isDark: boolean; radius: number }) {
+const CoverArt = React.memo(function CoverArt({ volume, isDark, radius }: { volume: Volume; isDark: boolean; radius: number }) {
   if (volume.coverUri) {
     return (
       <Image
         source={{ uri: volume.coverUri }}
         style={StyleSheet.absoluteFill as any}
         contentFit="cover"
-        transition={180}
+        // No fade-in: transition re-animates every recycled cell during scroll.
+        transition={0}
         cachePolicy="memory-disk"
+        recyclingKey={volume.id}
       />
     );
   }
@@ -98,9 +105,9 @@ function CoverArt({ volume, isDark, radius }: { volume: Volume; isDark: boolean;
       </Text>
     </View>
   );
-}
+});
 
-function IconButton({ icon, onPress, tint, label }: { icon: IconName; onPress: () => void; tint: string; label: string }) {
+const IconButton = React.memo(function IconButton({ icon, onPress, tint, label }: { icon: IconName; onPress: () => void; tint: string; label: string }) {
   return (
     <Pressable
       onPress={onPress}
@@ -113,21 +120,42 @@ function IconButton({ icon, onPress, tint, label }: { icon: IconName; onPress: (
       <Icon name={icon} size={20} color={tint} strokeWidth={1.9} />
     </Pressable>
   );
-}
+});
 
-function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPress, onLongPress, onMenu }: {
+type VolumeCardProps = {
   volume: Volume;
   colors: any;
   isDark: boolean;
   layout: 'grid' | 'list';
   selecting: boolean;
   selected: boolean;
-  onPress: () => void;
-  onLongPress: () => void;
-  onMenu: () => void;
-}) {
-  const scale = useSharedValue(1);
-  const animated = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
+  onPress: (volume: Volume) => void;
+  onLongPress: (volume: Volume) => void;
+  onMenu: (volume: Volume) => void;
+};
+
+// Custom equality: streaming scans replace every object identity on each batch,
+// so a default shallow memo would still re-render all 100+ cards. Only the
+// fields actually painted are compared — unrelated batches skip render.
+function volumeCardEqual(prev: VolumeCardProps, next: VolumeCardProps): boolean {
+  return (
+    prev.volume.id === next.volume.id &&
+    prev.volume.title === next.volume.title &&
+    prev.volume.coverUri === next.volume.coverUri &&
+    prev.volume.pageCount === next.volume.pageCount &&
+    (prev.volume.progress ?? 0) === (next.volume.progress ?? 0) &&
+    prev.selecting === next.selecting &&
+    prev.selected === next.selected &&
+    prev.layout === next.layout &&
+    prev.isDark === next.isDark &&
+    prev.colors === next.colors &&
+    prev.onPress === next.onPress &&
+    prev.onLongPress === next.onLongPress &&
+    prev.onMenu === next.onMenu
+  );
+}
+
+const VolumeCard = React.memo(function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPress, onLongPress, onMenu }: VolumeCardProps) {
   const progress = volume.progress ?? 0;
   const pct = Math.round(progress * 100);
   const meta = volume.pageCount
@@ -135,11 +163,13 @@ function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPre
     : progress > 0
       ? `${pct}%`
       : 'Not started';
+  // NOTE: no Reanimated shared values here on purpose. The old per-card scale
+  // animation kept 100+ animated nodes alive and remounted them on every scroll
+  // frame — the main source of the "large list slow to update" warning.
+  // Pressable opacity feedback is free by comparison.
   const press = {
-    onPressIn: () => (scale.value = withSpring(layout === 'grid' ? 0.97 : 0.99, { damping: 20, stiffness: 420 })),
-    onPressOut: () => (scale.value = withSpring(1, { damping: 20, stiffness: 380 })),
-    onPress,
-    onLongPress,
+    onPress: () => onPress(volume),
+    onLongPress: () => onLongPress(volume),
     delayLongPress: 260,
     accessibilityRole: 'button' as const,
     accessibilityLabel: volume.title,
@@ -148,8 +178,8 @@ function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPre
 
   if (layout === 'list') {
     return (
-      <Pressable {...press} style={{ flex: 1 }}>
-        <Animated.View style={[s.listRow, { backgroundColor: selected ? colors.primaryContainer : colors.secondaryGroupedBackground }, animated]}>
+      <Pressable {...press} style={({ pressed }) => [{ flex: 1, opacity: pressed ? 0.7 : 1 }]}>
+        <View style={[s.listRow, { backgroundColor: selected ? colors.primaryContainer : colors.secondaryGroupedBackground }]}>
           <View style={[s.listCover, { backgroundColor: colors.tertiarySystemFill }]}>
             <CoverArt volume={volume} isDark={isDark} radius={8} />
           </View>
@@ -165,16 +195,16 @@ function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPre
           {selecting ? (
             <Icon name={selected ? 'checkCircle' : 'circle'} size={24} color={selected ? colors.primary : colors.tertiaryLabel} strokeWidth={1.8} />
           ) : (
-            <IconButton icon="more" onPress={onMenu} tint={colors.secondaryLabel} label={`Options for ${volume.title}`} />
+            <IconButton icon="more" onPress={() => onMenu(volume)} tint={colors.secondaryLabel} label={`Options for ${volume.title}`} />
           )}
-        </Animated.View>
+        </View>
       </Pressable>
     );
   }
 
   return (
-    <Pressable {...press} style={{ flex: 1 }}>
-      <Animated.View style={[{ flex: 1 }, animated]}>
+    <Pressable {...press} style={({ pressed }) => [{ flex: 1, opacity: pressed ? 0.86 : 1 }]}>
+      <View style={{ flex: 1 }}>
         <View style={[s.cover, { backgroundColor: colors.surfaceContainer, borderColor: selected ? colors.primary : colors.separator, borderWidth: selected ? 2 : StyleSheet.hairlineWidth }]}>
           <CoverArt volume={volume} isDark={isDark} radius={13} />
           {volume.pageCount ? (
@@ -190,7 +220,7 @@ function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPre
             </View>
           ) : (
             <Pressable
-              onPress={onMenu}
+              onPress={() => onMenu(volume)}
               hitSlop={8}
               accessibilityRole="button"
               accessibilityLabel={`Options for ${volume.title}`}
@@ -207,12 +237,12 @@ function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPre
         </View>
         <Text numberOfLines={1} style={[s.cardTitle, { color: colors.onSurface }]}>{volume.title}</Text>
         <Text numberOfLines={1} style={[s.cardSub, { color: colors.secondaryLabel }]}>{meta}</Text>
-      </Animated.View>
+      </View>
     </Pressable>
   );
-}
+}, volumeCardEqual);
 
-function SkeletonGrid({ colors }: { colors: any }) {
+const SkeletonGrid = React.memo(function SkeletonGrid({ colors }: { colors: any }) {
   const pulse = useSharedValue(0.45);
   useEffect(() => {
     pulse.value = withRepeat(withTiming(1, { duration: 820, easing: Easing.inOut(Easing.ease) }), -1, true);
@@ -229,9 +259,9 @@ function SkeletonGrid({ colors }: { colors: any }) {
       ))}
     </View>
   );
-}
+});
 
-function ScanBar({ colors }: { colors: any }) {
+const ScanBar = React.memo(function ScanBar({ colors }: { colors: any }) {
   const { width } = useWindowDimensions();
   const offset = useSharedValue(-0.45);
   useEffect(() => {
@@ -243,9 +273,26 @@ function ScanBar({ colors }: { colors: any }) {
       <Animated.View style={[{ width: width * 0.42, height: 2.5, backgroundColor: colors.primary }, animated]} />
     </View>
   );
+});
+
+// Android: BlurView over a scrolling list forces a full-screen blur re-composite
+// every scroll frame. A solid surface is visually near-identical here and far cheaper.
+function AppBar({ colors, isDark, topPad, children }: { colors: any; isDark: boolean; topPad: number; children: React.ReactNode }) {
+  if (Platform.OS === 'android') {
+    return (
+      <View style={[s.appBar, { paddingTop: topPad, borderBottomColor: colors.separator, backgroundColor: colors.secondaryGroupedBackground }]}>
+        {children}
+      </View>
+    );
+  }
+  return (
+    <BlurView intensity={isDark ? 28 : 36} tint={isDark ? 'dark' : 'light'} style={[s.appBar, { paddingTop: topPad, borderBottomColor: colors.separator, backgroundColor: colors.blurTint }]}>
+      {children}
+    </BlurView>
+  );
 }
 
-function ActionSheet({ title, subtitle, actions, onClose, colors, insetBottom }: {
+const ActionSheet = React.memo(function ActionSheet({ title, subtitle, actions, onClose, colors, insetBottom }: {
   title?: string;
   subtitle?: string;
   actions: SheetAction[];
@@ -292,16 +339,18 @@ function ActionSheet({ title, subtitle, actions, onClose, colors, insetBottom }:
       </View>
     </Modal>
   );
-}
+});
 
 function seriesKey(series: Series): string {
   return series.rootUri;
 }
 
+const seriesCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
 function mergeSeries(current: Series[], incoming: Series[]): Series[] {
   const byRoot = new Map(current.map((item) => [seriesKey(item), item]));
   for (const item of incoming) byRoot.set(seriesKey(item), item);
-  return [...byRoot.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  return [...byRoot.values()].sort((a, b) => seriesCollator.compare(a.name, b.name));
 }
 
 function recount(series: Series, volumes: Volume[]): Series {
@@ -363,6 +412,11 @@ export default function LibraryScreen() {
     () => library.find((item) => seriesKey(item) === activeSeriesUri) ?? library[0] ?? null,
     [library, activeSeriesUri]
   );
+
+  // Typing must not re-sort + re-render 100+ cards per keystroke. The input
+  // stays immediate; filtering follows a deferred value instead.
+  const deferredQuery = React.useDeferredValue(query);
+  const selectionSet = useMemo(() => new Set(selection), [selection]);
 
   const setRemoved = useCallback((next: Set<string>) => {
     removedRef.current = next;
@@ -556,6 +610,27 @@ export default function LibraryScreen() {
     setSelection((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
   }, []);
 
+  // Stable volume-keyed handlers so memoised VolumeCards keep their props
+  // identity across list re-renders. Inline closures here would defeat memo.
+  const handlePressVolume = useCallback((volume: Volume) => {
+    if (selecting) toggleSelected(volume.id);
+    else openVolume(volume);
+  }, [selecting, toggleSelected, openVolume]);
+
+  const handleLongPressVolume = useCallback((volume: Volume) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    if (selecting) toggleSelected(volume.id);
+    else {
+      setSelecting(true);
+      setSelection([volume.id]);
+    }
+  }, [selecting, toggleSelected]);
+
+  const handleMenuVolume = useCallback((volume: Volume) => {
+    Haptics.selectionAsync();
+    setMenuVolume(volume);
+  }, []);
+
   // Removing never touches the files on disk — it only hides them, and the
   // choice is persisted so the next scan does not bring them back.
   const removeVolumes = useCallback(async (volumes: Volume[]) => {
@@ -626,15 +701,15 @@ export default function LibraryScreen() {
     let list = [...series.volumes];
     if (filter === 'reading') list = list.filter((v) => (v.progress ?? 0) > 0 && (v.progress ?? 0) < 1);
     if (filter === 'unread') list = list.filter((v) => !(v.progress ?? 0));
-    if (query.trim()) {
-      const q = query.trim().toLowerCase();
+    const q = deferredQuery.trim().toLowerCase();
+    if (q) {
       list = list.filter((v) => v.title.toLowerCase().includes(q));
     }
     if (sort === 'progress') list.sort((a, b) => (b.progress ?? 0) - (a.progress ?? 0));
     else if (sort === 'recent') list.sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0));
-    else list.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
+    else list.sort(compareTitle);
     return list;
-  }, [series, query, filter, sort]);
+  }, [series, deferredQuery, filter, sort]);
 
   const continueReading = useMemo(() => {
     if (!series) return [];
@@ -650,19 +725,33 @@ export default function LibraryScreen() {
   );
 
   const selectedVolumes = useMemo(
-    () => (series ? series.volumes.filter((volume) => selection.includes(volume.id)) : []),
-    [series, selection]
+    () => (series ? series.volumes.filter((volume) => selectionSet.has(volume.id)) : []),
+    [series, selectionSet]
   );
+
+  const renderVolume = useCallback(({ item }: { item: Volume }) => (
+    <VolumeCard
+      volume={item}
+      colors={colors}
+      isDark={isDark}
+      layout={layout}
+      selecting={selecting}
+      selected={selectionSet.has(item.id)}
+      onPress={handlePressVolume}
+      onLongPress={handleLongPressVolume}
+      onMenu={handleMenuVolume}
+    />
+  ), [colors, isDark, layout, selecting, selectionSet, handlePressVolume, handleLongPressVolume, handleMenuVolume]);
 
   // ——— Onboarding: nothing in the library yet ———
   if (!series && !loading) {
     return (
       <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
-        <BlurView intensity={isDark ? 32 : 36} tint={isDark ? 'dark' : 'light'} style={[s.appBar, { paddingTop: insets.top + 10, borderBottomColor: colors.separator, backgroundColor: colors.blurTint }]}>
+        <AppBar colors={colors} isDark={isDark} topPad={insets.top + 10}>
           <View style={s.barRow}>
             <Text style={[s.title, { color: colors.onSurface }]}>Library</Text>
           </View>
-        </BlurView>
+        </AppBar>
         <ScrollView contentContainerStyle={s.empty} showsVerticalScrollIndicator={false}>
           <View style={s.heroIcon}>
             <Logo size={96} />
@@ -707,11 +796,7 @@ export default function LibraryScreen() {
 
   return (
     <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
-      <BlurView
-        intensity={isDark ? 28 : 36}
-        tint={isDark ? 'dark' : 'light'}
-        style={[s.appBar, { paddingTop: insets.top + 8, borderBottomColor: colors.separator, backgroundColor: colors.blurTint }]}
-      >
+      <AppBar colors={colors} isDark={isDark} topPad={insets.top + 8}>
         {selecting ? (
           <View style={s.barRow}>
             <IconButton icon="close" onPress={exitSelection} tint={colors.onSurface} label="Leave selection mode" />
@@ -771,7 +856,7 @@ export default function LibraryScreen() {
             <IconButton icon="more" onPress={() => setOverflowOpen(true)} tint={colors.onSurface} label="Library options" />
           </View>
         )}
-      </BlurView>
+      </AppBar>
 
       {loading ? <ScanBar colors={colors} /> : null}
       {loading && scanProgress ? (
@@ -788,9 +873,18 @@ export default function LibraryScreen() {
           data={filtered}
           key={String(layout)}
           keyExtractor={(volume) => volume.id}
+          renderItem={renderVolume}
           numColumns={layout === 'grid' ? 2 : 1}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
+          // Fewer simultaneous mounts + longer batch window = no dropped frames
+          // on mid-range Android. removeClippedSubviews recycles off-screen
+          // cells (Android-only; it can blank on iOS).
+          removeClippedSubviews={Platform.OS === 'android'}
+          maxToRenderPerBatch={8}
+          updateCellsBatchingPeriod={80}
+          windowSize={7}
+          initialNumToRender={10}
           contentContainerStyle={{ padding: 16, paddingBottom: 110, gap: layout === 'grid' ? 20 : 8 }}
           columnWrapperStyle={layout === 'grid' ? { gap: 16 } : undefined}
           ListHeaderComponent={
@@ -821,7 +915,7 @@ export default function LibraryScreen() {
                         >
                           <View style={[s.shelfCover, { backgroundColor: colors.tertiarySystemFill }]}>
                             {cover ? (
-                              <Image source={{ uri: cover }} style={StyleSheet.absoluteFill as any} contentFit="cover" cachePolicy="memory-disk" />
+                              <Image source={{ uri: cover }} style={StyleSheet.absoluteFill as any} contentFit="cover" cachePolicy="memory-disk" transition={0} />
                             ) : (
                               <Icon name="book" size={14} color={colors.secondaryLabel} strokeWidth={1.7} />
                             )}
@@ -872,7 +966,7 @@ export default function LibraryScreen() {
                         <Pressable
                           key={option}
                           onPress={() => { Haptics.selectionAsync(); setFilter(option); }}
-                          style={[s.segItem, active && { backgroundColor: colors.secondaryGroupedBackground, boxShadow: '0 1px 4px rgba(0,0,0,0.10)' }]}
+                          style={[s.segItem, active && { backgroundColor: colors.secondaryGroupedBackground }]}
                           accessibilityRole="button"
                           accessibilityState={{ selected: active }}
                         >
@@ -902,26 +996,6 @@ export default function LibraryScreen() {
               </Text>
             </View>
           }
-          renderItem={({ item }) => (
-            <VolumeCard
-              volume={item}
-              colors={colors}
-              isDark={isDark}
-              layout={layout}
-              selecting={selecting}
-              selected={selection.includes(item.id)}
-              onPress={() => (selecting ? toggleSelected(item.id) : openVolume(item))}
-              onLongPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-                if (selecting) toggleSelected(item.id);
-                else {
-                  setSelecting(true);
-                  setSelection([item.id]);
-                }
-              }}
-              onMenu={() => { Haptics.selectionAsync(); setMenuVolume(item); }}
-            />
-          )}
         />
       )}
 
@@ -1029,8 +1103,9 @@ const s = StyleSheet.create({
   segText: { fontFamily: 'System', fontSize: 13, fontWeight: '600', letterSpacing: -0.08 },
   countText: { fontFamily: 'System', fontSize: 13, fontWeight: '600', fontVariant: ['tabular-nums'] as any, minWidth: 22, textAlign: 'right' },
 
-  // Grid card
-  cover: { aspectRatio: 0.72, borderRadius: 13, overflow: 'hidden', borderCurve: 'continuous' as any, boxShadow: '0 4px 14px rgba(0,0,0,0.10)' },
+  // Grid card — no boxShadow on purpose: software shadows on 100+ scrolling
+  // cards are a major Android frame-drop source. Depth comes from the border.
+  cover: { aspectRatio: 0.72, borderRadius: 13, overflow: 'hidden', borderCurve: 'continuous' as any },
   coverInitial: { fontFamily: 'System', fontSize: 30, fontWeight: '800', letterSpacing: -0.5 },
   coverProgress: { position: 'absolute', bottom: 0, left: 0, right: 0, height: 3, backgroundColor: 'rgba(120,120,128,0.32)' },
   pageBadge: { position: 'absolute', bottom: 10, left: 8, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: 'rgba(0,0,0,0.55)' },
