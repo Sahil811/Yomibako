@@ -273,25 +273,23 @@ function isCountableChildDir(name: string): boolean {
 
 function countFolderContents(dir: Directory): FolderCounts {
   const counts: FolderCounts = { images: 0, readable: 0, childDirs: 0 };
-  let items: (File | Directory)[];
   try {
-    items = dir.list();
-  } catch {
-    return counts;
-  }
-  for (const item of items) {
-    if (item instanceof Directory) {
-      if (isCountableChildDir(item.name)) {
-        counts.childDirs++;
+    for (const item of dir.list()) {
+      if (item instanceof Directory) {
+        if (isCountableChildDir(item.name)) {
+          counts.childDirs++;
+        }
+        continue;
       }
-      continue;
+      const lower = item.name.toLowerCase();
+      if (isImageName(lower)) {
+        counts.images++;
+      } else if (lower.endsWith('.html') || lower.endsWith('.mokuro')) {
+        counts.readable++;
+      }
     }
-    const lower = item.name.toLowerCase();
-    if (isImageName(lower)) {
-      counts.images++;
-    } else if (lower.endsWith('.html') || lower.endsWith('.mokuro')) {
-      counts.readable++;
-    }
+  } catch {
+    // Unreadable dir keeps zero counts, classified as 'empty' downstream.
   }
   return counts;
 }
