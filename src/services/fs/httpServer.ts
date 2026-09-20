@@ -33,7 +33,7 @@ const MIN_FREE_BYTES = 256 * 1024 * 1024;
 
 type CacheManifest = Record<string, { lastOpened: number }>;
 
-function volumeCacheKey(safeSeries: string, safeVolume: string) {
+export function volumeCacheKey(safeSeries: string, safeVolume: string) {
   return `${safeSeries}/${safeVolume}`;
 }
 

@@ -5,5 +5,6 @@
   },
   // Node-only fixture tables; they are compiled separately by
   // `npm run test:placement`, which supplies @types/node.
-  "exclude": ["**/__tests__/**", ".test-out"]
+  // `test/` holds Node-only mocks/shims for `npm test` (tsconfig.test.json).
+  "exclude": ["**/__tests__/**", ".test-out", "test"]
 }

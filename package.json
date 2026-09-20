@@ -33,7 +33,9 @@
     "react-native-zip-archive": "^9.5.1"
   },
   "devDependencies": {
+    "@types/node": "^26.6.2",
     "@types/react": "~19.2.2",
+    "c8": "^12.0.0",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -41,7 +43,8 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "test": "tsc --ignoreConfig src/features/reader/popupPlacement.ts src/theme/popupThemes.ts src/features/quiz/quiz.ts src/services/jpdb/word.ts src/features/reader/__tests__/popupPlacement.test.ts src/features/reader/__tests__/popupThemes.test.ts src/features/quiz/__tests__/quiz.test.ts src/services/jpdb/__tests__/word.test.ts --target es2022 --module commonjs --strict --skipLibCheck --esModuleInterop --types node --outDir .test-out && node --test .test-out/"
+    "test": "npx tsc -p tsconfig.test.json && node test/make-shims.cjs && node --test \".test-out/src/**/__tests__/*.test.js\"",
+    "test:coverage": "npx tsc -p tsconfig.test.json && node test/make-shims.cjs && npx c8 --reporter=text --reporter=lcov --include=\".test-out/src/**/*.js\" --exclude=\".test-out/src/**/*.test.js\" --exclude=\".test-out/src/**/yomibakoBundle.js\" --exclude=\".test-out/src/**/browserBundle.js\" --exclude=\".test-out/src/features/shared/useWordAudio.js\" --check-coverage --lines 85 --branches 85 --functions 85 node --test \".test-out/src/**/__tests__/*.test.js\""
   },
   "private": true
 }

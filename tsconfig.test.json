@@ -1,0 +1,30 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "bundler",
+    "customConditions": [],
+    "ignoreDeprecations": "6.0",
+    "types": ["node"],
+    "noEmit": false,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "react-native": ["./test/mocks/react-native"],
+      "expo-secure-store": ["./test/mocks/expo-secure-store"],
+      "expo-file-system": ["./test/mocks/expo-file-system"],
+      "expo-audio": ["./test/mocks/expo-audio"],
+      "react-native-zip-archive": ["./test/mocks/react-native-zip-archive"]
+    },
+    "outDir": ".test-out",
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "test/mocks/**/*.ts", "assets/kanji/*.json"],
+  "exclude": [".test-out", "node_modules"]
+}

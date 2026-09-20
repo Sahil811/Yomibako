@@ -75,3 +75,13 @@ export async function flushReaderPreferences(): Promise<void> {
     await setItemAsync(KEY, JSON.stringify(cache));
   } catch {}
 }
+
+/** Test-only: reset in-memory cache. */
+export function __resetPreferencesForTests() {
+  cache = { ...defaultReaderPreferences };
+  loaded = false;
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+}

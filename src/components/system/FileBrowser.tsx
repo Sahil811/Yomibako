@@ -7,12 +7,9 @@ import { Icon } from '../ui/Icon';
 
 export type BrowserEntry = { name: string; uri: string; isDir: boolean; size?: number };
 
-function formatSize(bytes: number) {
-  if (!bytes) return '—';
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+import { formatSize } from './formatSize';
+
+export { formatSize };
 
 function Row({ item, colors, onOpen }: { item: BrowserEntry; colors: any; onOpen: (e: BrowserEntry) => void }) {
   const scale = useSharedValue(1);

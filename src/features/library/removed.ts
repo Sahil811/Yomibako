@@ -53,6 +53,11 @@ export async function clearRemoved(): Promise<Set<string>> {
   return new Set();
 }
 
+/** Test-only: drop the in-memory cache. */
+export function __resetRemovedForTests() {
+  cache = null;
+}
+
 // Drops removed series and removed volumes from freshly scanned results.
 export function withoutRemoved(series: Series[], removed: Set<string>): Series[] {
   if (!removed.size) return series;

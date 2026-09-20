@@ -116,6 +116,29 @@ export function getSessionStatusTime(): string {
   return statusTime;
 }
 
+/** Test-only: number of in-flight jobs. */
+export function __pendingSessionJobsForTests(): number {
+  return pending.size;
+}
+
+/** Test-only: reset bridge state (executor, readiness, jobs). */
+export function __resetSessionForTests() {
+  executor = null;
+  ready = false;
+  status = 'unknown';
+  statusTime = '';
+  jobsRun = 0;
+  jobsOk = 0;
+  lastJobError = '';
+  for (const [, job] of pending) {
+    try { clearTimeout(job.timer); } catch {}
+  }
+  pending.clear();
+  readyWaiters = [];
+  wakers.clear();
+  statusListeners.clear();
+}
+
 function waitReady(): Promise<void> {
   if (ready && executor) return Promise.resolve();
   for (const w of wakers) {

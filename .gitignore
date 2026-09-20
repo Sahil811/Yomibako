@@ -36,6 +36,11 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
+# test artifacts (node:test + c8 output, not shipped)
+.test-out/
+coverage/
+.nyc_output/
+
 # generated native folders
 /ios
 /android

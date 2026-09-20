@@ -92,3 +92,14 @@ export async function flush(): Promise<void> {
     } catch {}
   }
 }
+
+/** Test-only: clear in-memory caches and timers. */
+export function __resetProgressForTests() {
+  legacyCache = null;
+  entryCache.clear();
+  dirty.clear();
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+}

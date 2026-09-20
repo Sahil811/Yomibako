@@ -5,7 +5,7 @@
 import { Directory, File } from 'expo-file-system';
 import type { Volume, Series } from './types';
 
-function isVolumeName(name: string) {
+export function isVolumeName(name: string) {
   if (/^\d{1,4}(?:$|[\s._-])/.test(name)) return true;
   if (/(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*0*\d+\b/i.test(name)) return true;
   const trailing = name.match(/[\s._-](\d{1,4})$/);
@@ -14,7 +14,7 @@ function isVolumeName(name: string) {
   return value < 1900 || value > 2099;
 }
 
-function volumeStem(name: string): string {
+export function volumeStem(name: string): string {
   return name
     .toLowerCase()
     .replace(/(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*0*\d+\s*$/i, '')
@@ -24,7 +24,7 @@ function volumeStem(name: string): string {
     .trim();
 }
 
-function isImageName(n: string) {
+export function isImageName(n: string) {
   const l = n.toLowerCase();
   return l.endsWith('.jpeg') || l.endsWith('.jpg') || l.endsWith('.png') || l.endsWith('.webp');
 }

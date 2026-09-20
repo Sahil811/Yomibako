@@ -71,8 +71,13 @@ export class JpdbError extends Error {
   }
 }
 
-function isRetryableStatus(s: number) {
+export function isRetryableStatus(s: number) {
   return s === 500 || s === 502 || s === 503 || s === 504;
+}
+
+/** Test-only: reset the rate-limit clock so tests don't wait 200ms/1100ms. */
+export function __resetApiForTests() {
+  lastCall = 0;
 }
 
 export const LOGIN_HINT = 'Not logged in to JPDB — open Settings → JPDB Login and sign in';

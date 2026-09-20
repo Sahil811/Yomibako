@@ -12,8 +12,8 @@ import { Paths, File, Directory } from 'expo-file-system';
 import { createAudioPlayer, setAudioModeAsync, AudioPlayer } from 'expo-audio';
 import { jpdbApi } from './api';
 
-const JPDB_XOR_KEY = [0x06, 0x23, 0x54, 0x0f];
-const AUDIO_EXTS = ['ogg', 'mp3', 'm4a', 'wav', 'flac', 'bin'];
+export const JPDB_XOR_KEY = [0x06, 0x23, 0x54, 0x0f];
+export const AUDIO_EXTS = ['ogg', 'mp3', 'm4a', 'wav', 'flac', 'bin'];
 
 const audioCache = new Map<string, string>(); // hash -> file uri
 let currentPlayer: AudioPlayer | null = null;
@@ -82,7 +82,7 @@ async function ensureAudioMode() {
 }
 
 /** Undo JPDB's 4-byte header mask, in place. */
-function deobfuscate(bytes: Uint8Array): Uint8Array {
+export function deobfuscate(bytes: Uint8Array): Uint8Array {
   for (let i = 0; i < Math.min(JPDB_XOR_KEY.length, bytes.length); i++) {
     bytes[i] ^= JPDB_XOR_KEY[i];
   }
@@ -91,7 +91,7 @@ function deobfuscate(bytes: Uint8Array): Uint8Array {
 
 // The extension decides which extractor ExoPlayer/AVFoundation picks, so it has
 // to match the real container rather than a hardcoded ".mp3".
-function sniffExtension(b: Uint8Array): string {
+export function sniffExtension(b: Uint8Array): string {
   const at = (i: number) => (i < b.length ? b[i] : -1);
   const ascii = (start: number, text: string) =>
     text.split('').every((c, i) => at(start + i) === c.charCodeAt(0));
@@ -106,7 +106,7 @@ function sniffExtension(b: Uint8Array): string {
 
 // JPDB serves Ogg/Opus. ExoPlayer decodes it; AVFoundation has no Ogg demuxer
 // at all, so say so rather than failing silently.
-function unsupportedOnThisPlatform(ext: string): string | null {
+export function unsupportedOnThisPlatform(ext: string): string | null {
   if (Platform.OS === 'ios' && (ext === 'ogg' || ext === 'flac')) {
     return 'JPDB serves Ogg/Opus recordings, which iOS cannot decode';
   }
@@ -114,7 +114,7 @@ function unsupportedOnThisPlatform(ext: string): string | null {
 }
 
 // Hashes look like "m1/c2faa602210f" — the slash would create a subdirectory.
-function cachedFileFor(hash: string, ext: string) {
+export function cachedFileFor(hash: string, ext: string) {
   return new File(Paths.cache, 'yomibako', 'audio', `${hash.replace(/[^a-zA-Z0-9._-]/g, '_')}.${ext}`);
 }
 
@@ -265,6 +265,17 @@ export async function playRemoteAudio(
 export function stopAudio() {
   playbackGeneration++;
   releaseCurrentPlayer();
+}
+
+/** Test-only: reset in-memory playback/cache state. */
+export function __resetAudioForTests() {
+  audioCache.clear();
+  currentPlayer = null;
+  currentPlayerSubscription = null;
+  currentRemoteFinished = null;
+  lastError = '';
+  audioModeReady = false;
+  playbackGeneration = 0;
 }
 
 /** Drop every cached recording — files written before the de-obfuscation fix are junk. */

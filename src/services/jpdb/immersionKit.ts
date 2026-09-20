@@ -18,6 +18,11 @@ export type ImmersionExample = {
 
 let metadataPromise: Promise<DeckMetadata> | null = null;
 
+/** Test-only: drop cached metadata so each test refetches. */
+export function __resetImmersionForTests() {
+  metadataPromise = null;
+}
+
 async function getMetadata(signal?: AbortSignal): Promise<DeckMetadata> {
   if (!metadataPromise) {
     metadataPromise = immersionKitApi

@@ -13,7 +13,7 @@ import type { Series, Volume } from './types';
 
 const FILE_NAME = 'library-index.json';
 /** Bump when the shape below changes so stale entries are dropped, not misread. */
-const INDEX_VERSION = 1;
+export const INDEX_VERSION = 1;
 
 type Stored = { version: number; roots: string[]; series: Series[] };
 
@@ -28,7 +28,7 @@ function indexFile(): File {
 
 // Written by an older build, hand-edited, or truncated mid-write: accept only
 // fields we can use and let the live scan supply the rest.
-function normalizeVolume(raw: any): Volume | null {
+export function normalizeVolume(raw: any): Volume | null {
   if (!raw || typeof raw !== 'object') return null;
   if (typeof raw.id !== 'string' || typeof raw.uri !== 'string') return null;
   if (typeof raw.title !== 'string' || typeof raw.series !== 'string') return null;
@@ -47,7 +47,7 @@ function normalizeVolume(raw: any): Volume | null {
   return volume;
 }
 
-function normalizeSeries(raw: any): Series | null {
+export function normalizeSeries(raw: any): Series | null {
   if (!raw || typeof raw !== 'object') return null;
   if (typeof raw.name !== 'string' || typeof raw.rootUri !== 'string') return null;
   const volumes: Volume[] = Array.isArray(raw.volumes)
@@ -111,4 +111,22 @@ export function saveLibraryIndex(series: Series[], roots: string[]) {
     writeTimer = null;
     flushIndex();
   }, 800);
+}
+
+/** Test-only: flush synchronously + clear timers. */
+export function __flushLibraryIndexForTests() {
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  flushIndex();
+}
+
+/** Test-only: clear pending/timers. */
+export function __resetLibraryCacheForTests() {
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  pending = null;
 }

@@ -259,6 +259,11 @@ export function stageConfig(newConfig: YomibakoConfig): void {
   configCache = { ...newConfig };
 }
 
+/** Test-only: drop the cached config so loadConfig re-reads storage. */
+export function __resetConfigForTests() {
+  configCache = null;
+}
+
 // Backwards compat helpers used by api.ts / audio.ts
 export async function getApiToken(): Promise<string | null> {
   const cfg = await loadConfig();
