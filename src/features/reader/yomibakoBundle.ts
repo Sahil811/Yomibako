@@ -10,7 +10,7 @@
 // injectedJavaScriptBeforeContentLoaded only runs on document load, so editing
 // the strings below does nothing to an already-mounted WebView. Bump this when
 // changing them and the reader remounts instead of running the previous build.
-export const YOMIBAKO_BUNDLE_VERSION = '2026-09-20.quiz-current-page';
+export const YOMIBAKO_BUNDLE_VERSION = '2026-09-20.swipe-fitwidth-fix';
 
 export const YOMIBAKO_CSS = `
 /* Mobile reading baseline — kill the blue tap flash, the 300ms click delay and
@@ -847,7 +847,7 @@ export const YOMIBAKO_JS = `
     var st=mokuroState();
     if(st && typeof st.r2l === 'boolean') return st.r2l;
     if(fallbackControls) return fallbackControls.rtl;
-    return true; // manga default
+    return false; // LTR base default
   }
   function navTotal(){
     var n = globalRef('num_pages');
@@ -970,7 +970,7 @@ export const YOMIBAKO_JS = `
   window.__yomibakoReport = function(){ navReport(true); };
 
   // --- single-page mobile reader ------------------------------------------
-  var fallbackControls = { rtl:true, active:false, index:0, tapToTurn:true, preloadNextPage:true, reduceMotion:false, twoPage:false, zoomMode:'screen' };
+  var fallbackControls = { rtl:false, active:false, index:0, tapToTurn:true, swipeToTurn:true, preloadNextPage:true, reduceMotion:false, twoPage:false, zoomMode:'screen' };
   var ownedPageMetrics = new WeakMap();
   var ownedTouch=null;
   var lastTap={at:0,x:0,y:0};
@@ -1078,7 +1078,57 @@ export const YOMIBAKO_JS = `
 
   // One gesture owner, in viewport coordinates. This avoids mokuro bounds,
   // browser scrolling and a second transform fighting over the same page.
+  // Finger swipe also turns pages: a horizontal drag past threshold (or a fast
+  // horizontal flick) calls navStep. It only fires at base zoom so panning a
+  // zoomed page never turns, and horizontal must dominate vertical so
+  // fit-width vertical panning is unaffected. Direction mirrors tap zones:
+  // LTR swipe-left = next, RTL swipe-right = next.
+  var swipeStart=null;
+  function swipeThreshold(){
+    try{ return Math.max(64, viewportSize().w*0.12); }catch(_){ return 64; }
+  }
+  function trySwipeTurn(endX,endY){
+    var s=swipeStart; swipeStart=null;
+    if(!s) return false;
+    if(!fallbackControls.swipeToTurn) return false;
+    try{
+      var dx=endX-s.x, dy=endY-s.y;
+      var adx=Math.abs(dx), ady=Math.abs(dy);
+      var dt=Math.max(1, Date.now()-s.at);
+      if(adx<40) return false;
+      if(adx<ady*1.3) return false;
+      var thresh=swipeThreshold();
+      var fastFlick=dt<350 && adx>40 && adx>ady*2 && (adx/dt)>0.4;
+      if(adx<thresh && !fastFlick) return false;
+      if(navTotal()<=1) return false;
+      if(fallbackControls.active && viewState.spread){
+        try{
+          // Compare against this mode's own base scale, not fit-screen: in
+          // fit-width the resting scale is already above fitScale, and in 1:1
+          // it can be either side. Only a pinch past the mode's scale counts
+          // as zoomed (where drags must pan, never turn).
+          var base=scaleForMode(fallbackControls.zoomMode||'screen')||0, sc=viewState.scale||0;
+          if(sc>base+Math.max(0.02,base*0.02)) return false;
+        }catch(_){}
+      }
+      var rtl=navRtl();
+      var delta=(dx<0?1:-1)*(rtl?-1:1);
+      clearPendingTextTap();
+      clearActiveWord();
+      navStep(delta);
+      suppressTapUntil=Date.now()+350;
+      return true;
+    }catch(_){ return false; }
+  }
   document.addEventListener('touchstart',function(e){
+    try{
+      if(e.touches && e.touches.length===1 && !blockedGestureTarget(e.target)){
+        var st=e.touches[0];
+        swipeStart={x:st.clientX,y:st.clientY,at:Date.now(),id:st.identifier};
+      } else {
+        swipeStart=null;
+      }
+    }catch(_){ swipeStart=null; }
     if(!fallbackControls.active || blockedGestureTarget(e.target)){
       ownedTouch=null;
       return;
@@ -1110,6 +1160,9 @@ export const YOMIBAKO_JS = `
   },{capture:true,passive:false});
 
   document.addEventListener('touchmove',function(e){
+    try{
+      if(e.touches && e.touches.length!==1) swipeStart=null;
+    }catch(_){}
     var g=ownedTouch;
     if(!g) return;
     if(g.mode==='pinch'){
@@ -1142,6 +1195,11 @@ export const YOMIBAKO_JS = `
   },{capture:true,passive:false});
 
   var finishOwnedTouch=function(e){
+    try{
+      var changed=e.changedTouches&&e.changedTouches.length?e.changedTouches[0]:null;
+      if(changed) trySwipeTurn(changed.clientX,changed.clientY);
+      else swipeStart=null;
+    }catch(_){ swipeStart=null; }
     var g=ownedTouch;
     if(!g) return;
     var stillActive=g.mode==='pinch'
@@ -1158,7 +1216,7 @@ export const YOMIBAKO_JS = `
     ownedTouch=null;
   };
   document.addEventListener('touchend',finishOwnedTouch,{capture:true,passive:false});
-  document.addEventListener('touchcancel',function(){ ownedTouch=null; },{capture:true,passive:true});
+  document.addEventListener('touchcancel',function(){ ownedTouch=null; swipeStart=null; },{capture:true,passive:true});
   window.__yomibakoGestureDebug=function(){
     return {active:!!fallbackControls.active,tracking:!!ownedTouch,suppressFor:Math.max(0,suppressTapUntil-Date.now()),scale:viewState.scale,fit:viewState.fitScale,x:viewState.x,y:viewState.y};
   };

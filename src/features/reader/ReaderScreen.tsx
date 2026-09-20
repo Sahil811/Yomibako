@@ -93,7 +93,7 @@ export default function ReaderScreen() {
   const [chromeVisible, setChromeVisible] = useState(false);
   const [progress, setProgress] = useState(0);
   const [scrubTo, setScrubTo] = useState<number | null>(null);
-  const [page, setPage] = useState({ index: -1, total: volume.pageCount ?? 0, paged: false, rtl: true, twoPage: false });
+  const [page, setPage] = useState({ index: -1, total: volume.pageCount ?? 0, paged: false, rtl: false, twoPage: false });
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [mokuroMenu, setMokuroMenu] = useState(false);
   const [zoomMode, setZoomMode] = useState<ZoomMode>(defaultReaderPreferences.zoomMode);
@@ -207,6 +207,12 @@ export default function ReaderScreen() {
   }, []);
 
   const { cancel: cancelHoverAudio, scheduleHover: scheduleHoverAudio, playNow: playWordAudio } = useWordAudio();
+
+  // The page reports progress on every scroll frame. Re-rendering the whole
+  // reader chrome at 60fps drops frames — only commit visible changes.
+  const handleProgress = useCallback((p: number) => {
+    setProgress((prev) => (Math.abs(prev - p) < 0.003 ? prev : p));
+  }, []);
 
   const dismissWord = useCallback(() => {
     cancelHoverAudio(true);
@@ -458,7 +464,7 @@ export default function ReaderScreen() {
             onWordHover={onWordHover}
             onWordAnchor={onWordAnchor}
             onWordAnchorLost={dismissWord}
-            onProgress={setProgress}
+            onProgress={handleProgress}
             onPage={onPage}
             onControl={onControl}
             onWords={onWords}

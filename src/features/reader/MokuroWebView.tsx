@@ -436,7 +436,7 @@ function MokuroWebView(
           total: Number(msg.total ?? 0),
           value,
           paged: !!msg.paged,
-          rtl: msg.rtl !== false,
+          rtl: msg.rtl === true,
           twoPage: !!msg.twoPage,
           zoomMode: msg.zoomMode,
           menuOpen: !!msg.menuOpen,

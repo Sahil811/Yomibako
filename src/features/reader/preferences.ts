@@ -8,7 +8,7 @@ export type ZoomMode = 'screen' | 'width' | 'original';
 export type ReaderPreferences = {
   zoomMode: ZoomMode;
   twoPage: boolean;
-  /** Right-to-left page order — the manga default. */
+  /** Left-to-right page order — the base default. Toggle to RTL for manga. */
   rtl: boolean;
 };
 
@@ -17,7 +17,7 @@ const KEY = 'yomibako_reader_prefs_v1';
 export const defaultReaderPreferences: ReaderPreferences = {
   zoomMode: 'screen',
   twoPage: false,
-  rtl: true,
+  rtl: false,
 };
 
 let cache: ReaderPreferences = { ...defaultReaderPreferences };
@@ -29,7 +29,7 @@ function normalize(raw: any): ReaderPreferences {
   return {
     zoomMode: zoom === 'width' || zoom === 'original' ? zoom : 'screen',
     twoPage: raw?.twoPage === true,
-    rtl: raw?.rtl !== false,
+    rtl: raw?.rtl === true,
   };
 }
 
