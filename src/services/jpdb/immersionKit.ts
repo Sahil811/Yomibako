@@ -24,12 +24,10 @@ export function __resetImmersionForTests() {
 }
 
 async function getMetadata(signal?: AbortSignal): Promise<DeckMetadata> {
-  if (!metadataPromise) {
-    metadataPromise = immersionKitApi
-      .fetchMetadata(signal)
-      .then((json: any) => json?.data ?? {})
-      .catch(() => ({}));
-  }
+  metadataPromise ??= immersionKitApi
+    .fetchMetadata(signal)
+    .then((json: any) => json?.data ?? {})
+    .catch(() => ({}));
   return metadataPromise;
 }
 
@@ -45,7 +43,7 @@ function mapExamples(raw: any[], metadata: DeckMetadata): ImmersionExample[] {
   return raw.map((example) => {
     const sourceSlug = String(example?.title ?? '');
     const mediaTitle = String(metadata[sourceSlug]?.title ?? '');
-    const sourceTitle = mediaTitle || sourceSlug.replace(/_/g, ' ').trim() || 'ImmersionKit';
+    const sourceTitle = mediaTitle || sourceSlug.replaceAll('_', ' ').trim() || 'ImmersionKit';
     const category = String(example?.id ?? '').split('_')[0] || String(metadata[sourceSlug]?.category ?? '');
     return {
       id: String(example?.id ?? `${sourceSlug}-${example?.sentence ?? ''}`),
@@ -70,23 +68,25 @@ async function searchCandidate(word: string, signal?: AbortSignal): Promise<any[
  * Fetch and normalize ImmersionKit examples using the same metadata/media
  * mapping and particle fallback as JPDB Breader.
  */
-export async function fetchImmersionExamples(word: string, signal?: AbortSignal): Promise<ImmersionExample[]> {
-  const metadata = await getMetadata(signal);
-  let examples = await searchCandidate(word, signal);
-
-  if (!examples.length) {
-    for (const particle of FALLBACK_PARTICLES) {
-      if (!word.includes(particle)) continue;
-      const candidates = word.split(particle).filter(Boolean);
-      for (const candidate of candidates) {
-        examples = await searchCandidate(candidate, signal);
-        if (examples.length) break;
-      }
-      if (examples.length) break;
+async function searchWithParticleFallback(word: string, signal?: AbortSignal): Promise<any[]> {
+  for (const particle of FALLBACK_PARTICLES) {
+    if (!word.includes(particle)) continue;
+    const candidates = word.split(particle).filter(Boolean);
+    for (const candidate of candidates) {
+      const found = await searchCandidate(candidate, signal);
+      if (found.length) return found;
     }
   }
+  return [];
+}
 
-  return mapExamples(examples, metadata);
+export async function fetchImmersionExamples(word: string, signal?: AbortSignal): Promise<ImmersionExample[]> {
+  const metadata = await getMetadata(signal);
+  const direct = await searchCandidate(word, signal);
+  if (direct.length) return mapExamples(direct, metadata);
+
+  const fallback = await searchWithParticleFallback(word, signal);
+  return mapExamples(fallback, metadata);
 }
 
 /** Convert the limited HTML found in ImmersionKit translations to native text. */

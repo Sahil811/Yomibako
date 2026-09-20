@@ -12,6 +12,7 @@ import {
   getSessionStatusTime,
   sessionFetch,
   handleSessionMessage,
+  newId,
   __resetSessionForTests,
   __pendingSessionJobsForTests,
 } from '../session';
@@ -192,4 +193,23 @@ test('stray chunk/meta/error messages for unknown jobs are ignored safely', () =
   assert.equal(handleSessionMessage({ type: 'sessionError', id: 'ghost', error: 'x' }), true);
   assert.equal(handleSessionMessage({ type: 'sessionStatus', value: 'bogus' }), true);
   assert.equal(getSessionStatus(), 'unknown');
+});
+
+test('newId is unique and url-safe', () => {
+  const ids = new Set(Array.from({ length: 200 }, () => newId()));
+  assert.equal(ids.size, 200);
+  for (const id of ids) {
+    assert.match(id, /^[0-9a-z]+$/);
+  }
+});
+
+test('newId works without WebCrypto', () => {
+  const desc = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  try {
+    Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+    const ids = new Set(Array.from({ length: 50 }, () => newId()));
+    assert.equal(ids.size, 50);
+  } finally {
+    if (desc) Object.defineProperty(globalThis, 'crypto', desc);
+  }
 });

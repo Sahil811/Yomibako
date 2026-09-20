@@ -11,7 +11,27 @@ import { formatSize } from './formatSize';
 
 export { formatSize };
 
-function Row({ item, colors, onOpen }: { item: BrowserEntry; colors: any; onOpen: (e: BrowserEntry) => void }) {
+function getRowIconBackground(isFolder: boolean, isHtml: boolean, colors: any): string {
+  if (isFolder) {
+    return '#007AFF';
+  }
+  if (isHtml) {
+    return '#FF9500';
+  }
+  return colors.tertiarySystemFill;
+}
+
+function getRowMetaLabel(isFolder: boolean, isHtml: boolean, size: number | undefined): string {
+  if (isFolder) {
+    return 'Folder';
+  }
+  if (isHtml) {
+    return `HTML · ${formatSize(size ?? 0)}`;
+  }
+  return formatSize(size ?? 0);
+}
+
+function Row({ item, colors, onOpen }: { readonly item: BrowserEntry; readonly colors: any; readonly onOpen: (e: BrowserEntry) => void }) {
   const scale = useSharedValue(1);
   const aStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
   const isFolder = item.isDir;
@@ -35,7 +55,7 @@ function Row({ item, colors, onOpen }: { item: BrowserEntry; colors: any; onOpen
           style={[
             s.icon,
             {
-              backgroundColor: isFolder ? '#007AFF' : isHtml ? '#FF9500' : colors.tertiarySystemFill,
+              backgroundColor: getRowIconBackground(isFolder, isHtml, colors),
             },
           ]}
         >
@@ -51,7 +71,7 @@ function Row({ item, colors, onOpen }: { item: BrowserEntry; colors: any; onOpen
           <Text numberOfLines={1} style={[s.name, { color: colors.onSurface }]}>
             {item.name}
           </Text>
-          <Text style={[s.meta, { color: colors.secondaryLabel }]}>{isFolder ? 'Folder' : isHtml ? `HTML · ${formatSize(item.size ?? 0)}` : formatSize(item.size ?? 0)}</Text>
+          <Text style={[s.meta, { color: colors.secondaryLabel }]}>{getRowMetaLabel(isFolder, isHtml, item.size)}</Text>
         </View>
 
         {isFolder ? (
@@ -72,9 +92,9 @@ export function FileBrowser({
   onOpen,
   onPickThisFolder,
 }: {
-  entries: BrowserEntry[];
-  onOpen: (e: BrowserEntry) => void;
-  onPickThisFolder: () => void;
+  readonly entries: BrowserEntry[];
+  readonly onOpen: (e: BrowserEntry) => void;
+  readonly onPickThisFolder: () => void;
 }) {
   const scheme = useColorScheme();
   const colors = scheme === 'light' ? lightColors : darkColors;

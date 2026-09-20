@@ -104,7 +104,7 @@ export function groupMeanings(card: { meanings: { glosses: string[]; partOfSpeec
       meaning.partOfSpeech.length === lastPOS.length &&
       meaning.partOfSpeech.every((p, i) => p === lastPOS[i]);
     if (same) {
-      grouped[grouped.length - 1].glosses.push(meaning.glosses);
+      grouped.at(-1)!.glosses.push(meaning.glosses);
       continue;
     }
     grouped.push({ partOfSpeech: meaning.partOfSpeech, glosses: [meaning.glosses], startIndex: index });
@@ -120,7 +120,7 @@ export function parsePitch(reading: string, pitch: string): { text: string; isHi
     const parts: { text: string; isHigh: boolean; isFinal: boolean }[] = [];
     const borders = Array.from(pitch.matchAll(/L(?=H)|H(?=L)/g), (x) => (x.index ?? 0) + 1);
     let lastBorder = 0;
-    let low = pitch[0] === 'L';
+    let low = pitch.startsWith('L');
     for (const border of borders) {
       parts.push({ text: reading.slice(lastBorder, border), isHigh: !low, isFinal: false });
       lastBorder = border;

@@ -27,11 +27,627 @@ import {
 
 type Props = {
   /** Raw word payloads collected from the WebView, scoped to what is on screen. */
-  words: any[];
-  onClose: () => void;
+  readonly words: any[];
+  readonly onClose: () => void;
   /** Reader chrome stays dark regardless of the system theme. */
-  forceDark?: boolean;
+  readonly forceDark?: boolean;
 };
+
+function getProgressPercent(total: number, finished: boolean, index: number): number {
+  if (total <= 0) {
+    return 0;
+  }
+  if (finished) {
+    return 100;
+  }
+  return (index / total) * 100;
+}
+
+function getEmptyIconName(parsedLength: number, poolLength: number): 'checkCircle' | 'book' {
+  if (parsedLength > 0 && poolLength === 0) {
+    return 'checkCircle';
+  }
+  return 'book';
+}
+
+function getEmptyTitle(parsedLength: number, poolLength: number): string {
+  if (parsedLength === 0) {
+    return 'Nothing parsed here yet';
+  }
+  if (poolLength === 0) {
+    return 'All caught up';
+  }
+  return 'Too few words here';
+}
+
+function getEmptyBody(parsedLength: number, poolLength: number): string {
+  if (parsedLength === 0) {
+    return 'No words on the current page have been parsed. Wait for parsing to finish, then try again.';
+  }
+  if (poolLength === 0) {
+    return `All ${parsedLength} words on this page are already known or not due for review.`;
+  }
+  return 'This page needs at least two different meanings to make a real choice.';
+}
+
+function getOptionBackground(showRight: boolean, showWrong: boolean, isDark: boolean, colors: any): string {
+  if (showRight) {
+    if (isDark) {
+      return 'rgba(52,199,89,0.16)';
+    }
+    return 'rgba(52,199,89,0.12)';
+  }
+  if (showWrong) {
+    if (isDark) {
+      return 'rgba(255,59,48,0.16)';
+    }
+    return 'rgba(255,59,48,0.10)';
+  }
+  return colors.surfaceContainer;
+}
+
+function getOptionBorderColor(showRight: boolean, showWrong: boolean, colors: any): string {
+  if (showRight) {
+    return colors.success;
+  }
+  if (showWrong) {
+    return colors.error;
+  }
+  return 'transparent';
+}
+
+function getOptionOpacity(pressed: boolean, revealed: boolean, showRight: boolean, showWrong: boolean): number {
+  if (pressed && !revealed) {
+    return 0.76;
+  }
+  if (revealed && !showRight && !showWrong) {
+    return 0.55;
+  }
+  return 1;
+}
+
+function getOptionMarkBackground(showRight: boolean, showWrong: boolean, colors: any): string {
+  if (showRight) {
+    return colors.success;
+  }
+  if (showWrong) {
+    return colors.error;
+  }
+  return colors.tertiarySystemFill;
+}
+
+function getVerdictBackground(wasRight: boolean, isDark: boolean, colors: any): string {
+  if (wasRight) {
+    if (isDark) {
+      return 'rgba(52,199,89,0.14)';
+    }
+    return 'rgba(52,199,89,0.10)';
+  }
+  return colors.surfaceContainer;
+}
+
+function getNextLabel(revealed: boolean, index: number, total: number): string {
+  if (!revealed) {
+    return 'Pick an answer';
+  }
+  if (index >= total - 1) {
+    return 'See results';
+  }
+  return 'Next word';
+}
+
+function getHintText(word: QuizWord): string {
+  if (word.meanings.length > 1) {
+    return `Also means: ${word.meanings.slice(1, 4).join(' · ')}`;
+  }
+  return `Read as ${word.reading}`;
+}
+
+function canShowHintButton(revealed: boolean, word: QuizWord): boolean {
+  if (revealed) {
+    return false;
+  }
+  return word.meanings.length > 1 || Boolean(word.reading);
+}
+
+function getVerdictIcon(wasRight: boolean): 'checkCircle' | 'info' {
+  if (wasRight) {
+    return 'checkCircle';
+  }
+  return 'info';
+}
+
+function QuizHeader({
+  ready,
+  total,
+  finished,
+  index,
+  colors,
+  onDismiss,
+}: {
+  readonly ready: boolean;
+  readonly total: number;
+  readonly finished: boolean;
+  readonly index: number;
+  readonly colors: any;
+  readonly onDismiss: () => void;
+}) {
+  const showCounter = ready && total > 0 && !finished;
+  return (
+    <View style={s.header}>
+      <View style={{ flex: 1 }}>
+        <Text style={[s.title, { color: colors.onSurface }]}>Word quiz</Text>
+        <Text numberOfLines={1} style={[s.subtitle, { color: colors.secondaryLabel }]}>
+          New and due words on this page
+        </Text>
+      </View>
+      {showCounter ? (
+        <View style={[s.counterChip, { backgroundColor: colors.secondarySystemFill }]}>
+          <Text style={[s.counterText, { color: colors.secondaryLabel }]}>
+            {index + 1}/{total}
+          </Text>
+        </View>
+      ) : null}
+      <Pressable
+        onPress={onDismiss}
+        hitSlop={12}
+        accessibilityLabel="Close quiz"
+        style={({ pressed }) => [s.closeButton, { backgroundColor: colors.secondarySystemFill, opacity: pressed ? 0.6 : 1 }]}
+      >
+        <Icon name="close" size={15} color={colors.secondaryLabel} strokeWidth={2.4} />
+      </Pressable>
+    </View>
+  );
+}
+
+function QuizEmptyBody({
+  parsedLength,
+  poolLength,
+  colors,
+  onDismiss,
+}: {
+  readonly parsedLength: number;
+  readonly poolLength: number;
+  readonly colors: any;
+  readonly onDismiss: () => void;
+}) {
+  return (
+    <>
+      <View style={s.center}>
+        <View style={[s.emptyIcon, { backgroundColor: colors.secondarySystemFill }]}>
+          <Icon
+            name={getEmptyIconName(parsedLength, poolLength)}
+            size={24}
+            color={colors.secondaryLabel}
+            strokeWidth={1.7}
+          />
+        </View>
+        <Text style={[s.emptyTitle, { color: colors.onSurface }]}>{getEmptyTitle(parsedLength, poolLength)}</Text>
+        <Text style={[s.emptyBody, { color: colors.secondaryLabel }]}>{getEmptyBody(parsedLength, poolLength)}</Text>
+      </View>
+      <View style={[s.footer, { borderTopColor: colors.separator }]}>
+        <Pressable
+          onPress={onDismiss}
+          style={({ pressed }) => [s.primaryButton, { backgroundColor: colors.primary, opacity: pressed ? 0.85 : 1 }]}
+        >
+          <Text style={s.primaryButtonText}>Back to reading</Text>
+        </Pressable>
+      </View>
+    </>
+  );
+}
+
+function QuizResultsBody({
+  percent,
+  correct,
+  total,
+  missed,
+  colors,
+  onRetry,
+  onDismiss,
+}: {
+  readonly percent: number;
+  readonly correct: number;
+  readonly total: number;
+  readonly missed: QuizWord[];
+  readonly colors: any;
+  readonly onRetry: () => void;
+  readonly onDismiss: () => void;
+}) {
+  const hasMissed = missed.length > 0;
+  const retryLabel = hasMissed ? `Retry ${missed.length} missed` : 'Again';
+  return (
+    <>
+      <ScrollView contentContainerStyle={s.body} showsVerticalScrollIndicator={false}>
+        <View style={s.resultsHead}>
+          <Text style={[s.resultsScore, { color: colors.primary }]}>{percent}%</Text>
+          <Text style={[s.resultsFraction, { color: colors.secondaryLabel }]}>
+            {correct} of {total} correct
+          </Text>
+        </View>
+        <Text style={[s.resultsMessage, { color: colors.onSurface }]}>{scoreMessage(percent)}</Text>
+
+        {hasMissed ? (
+          <View style={s.missedSection}>
+            <Text style={[s.sectionLabel, { color: colors.secondaryLabel }]}>
+              Worth another look ({missed.length})
+            </Text>
+            <View style={[s.missedList, { backgroundColor: colors.surfaceContainer }]}>
+              {missed.map((word, i) => (
+                <View
+                  key={wordKey(word)}
+                  style={[s.missedItem, i > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.separator }]}
+                >
+                  <View style={{ flexShrink: 0 }}>
+                    <Text style={[s.missedWord, { color: colors.onSurface }]}>{word.spelling}</Text>
+                    {word.reading && word.reading !== word.spelling ? (
+                      <Text style={[s.missedReading, { color: colors.tertiaryLabel }]}>{word.reading}</Text>
+                    ) : null}
+                  </View>
+                  <Text numberOfLines={2} style={[s.missedMeaning, { color: colors.secondaryLabel }]}>
+                    {word.meanings[0]}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          </View>
+        ) : null}
+      </ScrollView>
+      <View style={[s.footer, { borderTopColor: colors.separator }]}>
+        <Pressable
+          onPress={onRetry}
+          style={({ pressed }) => [s.primaryButton, { backgroundColor: colors.primary, opacity: pressed ? 0.85 : 1 }]}
+        >
+          <Icon name="repeat" size={16} color="#fff" strokeWidth={2.2} />
+          <Text style={s.primaryButtonText}>{retryLabel}</Text>
+        </Pressable>
+        <Pressable
+          onPress={onDismiss}
+          style={({ pressed }) => [s.ghostButton, { backgroundColor: colors.secondarySystemFill, opacity: pressed ? 0.8 : 1 }]}
+        >
+          <Text style={[s.ghostButtonText, { color: colors.onSurface }]}>Done</Text>
+        </Pressable>
+      </View>
+    </>
+  );
+}
+
+function OptionMarkContent({
+  showRight,
+  showWrong,
+  optionIndex,
+  colors,
+}: {
+  readonly showRight: boolean;
+  readonly showWrong: boolean;
+  readonly optionIndex: number;
+  readonly colors: any;
+}) {
+  if (showRight) {
+    return <Icon name="check" size={13} color="#fff" strokeWidth={3} />;
+  }
+  if (showWrong) {
+    return <Icon name="close" size={11} color="#fff" strokeWidth={3} />;
+  }
+  return <Text style={[s.optionIndex, { color: colors.secondaryLabel }]}>{optionIndex + 1}</Text>;
+}
+
+function QuizOptionItem({
+  option,
+  optionIndex,
+  answer,
+  picked,
+  revealed,
+  isDark,
+  colors,
+  onAnswer,
+}: {
+  readonly option: string;
+  readonly optionIndex: number;
+  readonly answer: string;
+  readonly picked: string | null;
+  readonly revealed: boolean;
+  readonly isDark: boolean;
+  readonly colors: any;
+  readonly onAnswer: (option: string) => void;
+}) {
+  const isAnswer = option === answer;
+  const isPicked = option === picked;
+  const showRight = revealed && isAnswer;
+  const showWrong = revealed && isPicked && !isAnswer;
+  return (
+    <Pressable
+      key={`${option}/${optionIndex}`}
+      onPress={() => onAnswer(option)}
+      disabled={revealed}
+      accessibilityRole="button"
+      style={({ pressed }) => [
+        s.option,
+        {
+          backgroundColor: getOptionBackground(showRight, showWrong, isDark, colors),
+          borderColor: getOptionBorderColor(showRight, showWrong, colors),
+          opacity: getOptionOpacity(pressed, revealed, showRight, showWrong),
+        },
+      ]}
+    >
+      <View
+        style={[
+          s.optionMark,
+          { backgroundColor: getOptionMarkBackground(showRight, showWrong, colors) },
+        ]}
+      >
+        <OptionMarkContent showRight={showRight} showWrong={showWrong} optionIndex={optionIndex} colors={colors} />
+      </View>
+      <Text style={[s.optionText, { color: colors.onSurface }]}>{option}</Text>
+    </Pressable>
+  );
+}
+
+function QuizWordCard({
+  word,
+  revealed,
+  showHint,
+  colors,
+  onSpeak,
+  onToggleHint,
+}: {
+  readonly word: QuizWord;
+  readonly revealed: boolean;
+  readonly showHint: boolean;
+  readonly colors: any;
+  readonly onSpeak: () => void;
+  readonly onToggleHint: () => void;
+}) {
+  const showReading = Boolean(word.reading) && word.reading !== word.spelling;
+  const showHintButton = canShowHintButton(revealed, word);
+  const hintLabel = showHint ? 'Hide hint' : 'Hint';
+  return (
+    <View style={[s.wordCard, { backgroundColor: colors.surfaceContainer }]}>
+      <Text style={[s.word, { color: colors.onSurface }]}>{word.spelling}</Text>
+      {showReading ? (
+        <Text style={[s.reading, { color: colors.secondaryLabel }]}>{word.reading}</Text>
+      ) : null}
+      <View style={s.wordActions}>
+        <Pressable
+          onPress={onSpeak}
+          style={({ pressed }) => [s.wordAction, { backgroundColor: colors.surface, opacity: pressed ? 0.7 : 1 }]}
+          accessibilityLabel="Play pronunciation"
+        >
+          <Icon name="audio" size={15} color={colors.secondaryLabel} strokeWidth={2} />
+          <Text style={[s.wordActionText, { color: colors.secondaryLabel }]}>Listen</Text>
+        </Pressable>
+        {showHintButton ? (
+          <Pressable
+            onPress={onToggleHint}
+            style={({ pressed }) => [s.wordAction, { backgroundColor: colors.surface, opacity: pressed ? 0.7 : 1 }]}
+          >
+            <Icon name="info" size={15} color={colors.secondaryLabel} strokeWidth={2} />
+            <Text style={[s.wordActionText, { color: colors.secondaryLabel }]}>{hintLabel}</Text>
+          </Pressable>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function QuizVerdict({
+  wasRight,
+  question,
+  isDark,
+  colors,
+}: {
+  readonly wasRight: boolean;
+  readonly question: QuizQuestion;
+  readonly isDark: boolean;
+  readonly colors: any;
+}) {
+  const verdictText = wasRight ? 'Correct' : `${question.word.spelling} means ${question.answer}`;
+  const verdictColor = wasRight ? colors.success : colors.onSurface;
+  return (
+    <View
+      style={[
+        s.verdict,
+        {
+          backgroundColor: getVerdictBackground(wasRight, isDark, colors),
+        },
+      ]}
+    >
+      <Icon
+        name={getVerdictIcon(wasRight)}
+        size={17}
+        color={wasRight ? colors.success : colors.secondaryLabel}
+        strokeWidth={2}
+      />
+      <Text style={[s.verdictText, { color: verdictColor }]}>{verdictText}</Text>
+    </View>
+  );
+}
+
+function QuizKanjiBreakdown({
+  kanji,
+  openKanji,
+  selectedKanji,
+  showMnemonic,
+  colors,
+  onSelectKanji,
+  onToggleMnemonic,
+}: {
+  readonly kanji: KanjiDetail[];
+  readonly openKanji: string | null;
+  readonly selectedKanji: KanjiDetail | null;
+  readonly showMnemonic: boolean;
+  readonly colors: any;
+  readonly onSelectKanji: (kanji: string | null) => void;
+  readonly onToggleMnemonic: () => void;
+}) {
+  const showPanel = selectedKanji !== null;
+  const hasComponents = showPanel && selectedKanji.components.length > 0;
+  const hasRtk = showPanel && Boolean(selectedKanji.rtk);
+  return (
+    <View style={s.kanjiWrap}>
+      <Text style={[s.sectionLabel, { color: colors.secondaryLabel }]}>Kanji breakdown</Text>
+      <View style={s.kanjiRow}>
+        {kanji.map((detail) => {
+          const active = openKanji === detail.kanji;
+          return (
+            <Pressable
+              key={detail.kanji}
+              onPress={() => onSelectKanji(active ? null : detail.kanji)}
+              style={({ pressed }) => [
+                s.kanjiChip,
+                {
+                  backgroundColor: active ? colors.surfaceContainerHigh : colors.surfaceContainer,
+                  borderColor: active ? colors.primary : 'transparent',
+                  opacity: pressed ? 0.8 : 1,
+                },
+              ]}
+            >
+              <Text style={[s.kanjiChar, { color: colors.primary }]}>{detail.kanji}</Text>
+              <Text numberOfLines={1} style={[s.kanjiMeaning, { color: colors.onSurface }]}>
+                {detail.meanings || '—'}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {showPanel ? (
+        <View style={[s.kanjiPanel, { backgroundColor: colors.surfaceContainer }]}>
+          <View style={s.kanjiPanelHead}>
+            <Text style={[s.kanjiPanelChar, { color: colors.primary }]}>{selectedKanji.kanji}</Text>
+            <Text numberOfLines={2} style={[s.kanjiPanelMeaning, { color: colors.onSurface }]}>
+              {selectedKanji.meanings || '—'}
+            </Text>
+          </View>
+          {hasComponents ? (
+            <View style={s.componentGrid}>
+              {selectedKanji.components.map((component) => (
+                <View
+                  key={component.component}
+                  style={[s.componentCard, { backgroundColor: colors.surface, borderColor: colors.separator }]}
+                >
+                  <Text style={[s.componentChar, { color: colors.primary }]}>{component.component}</Text>
+                  <Text numberOfLines={2} style={[s.componentMeaning, { color: colors.secondaryLabel }]}>
+                    {component.meaning || '—'}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
+          {hasRtk ? (
+            <>
+              <Pressable onPress={onToggleMnemonic} hitSlop={8} style={s.mnemonicToggle}>
+                <Text style={[s.mnemonicLabel, { color: colors.secondaryLabel }]}>Mnemonic</Text>
+                <Icon
+                  name={showMnemonic ? 'chevronDown' : 'chevronRight'}
+                  size={13}
+                  color={colors.tertiaryLabel}
+                  strokeWidth={2.2}
+                />
+              </Pressable>
+              {showMnemonic ? (
+                <Text style={[s.mnemonicText, { color: colors.onSurface }]}>{selectedKanji.rtk}</Text>
+              ) : null}
+            </>
+          ) : null}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function QuizQuestionBody({
+  question,
+  revealed,
+  picked,
+  showHint,
+  kanji,
+  openKanji,
+  selectedKanji,
+  showMnemonic,
+  isDark,
+  colors,
+  stepStyle,
+  onSpeak,
+  onToggleHint,
+  onAnswer,
+  onSelectKanji,
+  onToggleMnemonic,
+}: {
+  readonly question: QuizQuestion;
+  readonly revealed: boolean;
+  readonly picked: string | null;
+  readonly showHint: boolean;
+  readonly kanji: KanjiDetail[];
+  readonly openKanji: string | null;
+  readonly selectedKanji: KanjiDetail | null;
+  readonly showMnemonic: boolean;
+  readonly isDark: boolean;
+  readonly colors: any;
+  readonly stepStyle: any;
+  readonly onSpeak: () => void;
+  readonly onToggleHint: () => void;
+  readonly onAnswer: (option: string) => void;
+  readonly onSelectKanji: (kanji: string | null) => void;
+  readonly onToggleMnemonic: () => void;
+}) {
+  const wasRight = revealed && picked === question.answer;
+  const showHintText = showHint && !revealed;
+  const showVerdict = revealed;
+  const showKanji = revealed && kanji.length > 0;
+  return (
+    <Animated.View style={[{ gap: 14 }, stepStyle]}>
+      <QuizWordCard
+        word={question.word}
+        revealed={revealed}
+        showHint={showHint}
+        colors={colors}
+        onSpeak={onSpeak}
+        onToggleHint={onToggleHint}
+      />
+
+      {showHintText ? (
+        <Text style={[s.hint, { color: colors.secondaryLabel, borderColor: colors.separator }]}>
+          {getHintText(question.word)}
+        </Text>
+      ) : null}
+
+      <View style={s.options}>
+        {question.options.map((option, i) => (
+          <QuizOptionItem
+            key={`${option}/${i}`}
+            option={option}
+            optionIndex={i}
+            answer={question.answer}
+            picked={picked}
+            revealed={revealed}
+            isDark={isDark}
+            colors={colors}
+            onAnswer={onAnswer}
+          />
+        ))}
+      </View>
+
+      {showVerdict ? (
+        <QuizVerdict wasRight={wasRight} question={question} isDark={isDark} colors={colors} />
+      ) : null}
+
+      {/* Kanji breakdown only after the answer — the component
+          meanings would otherwise give the question away. */}
+      {showKanji ? (
+        <QuizKanjiBreakdown
+          kanji={kanji}
+          openKanji={openKanji}
+          selectedKanji={selectedKanji}
+          showMnemonic={showMnemonic}
+          colors={colors}
+          onSelectKanji={onSelectKanji}
+          onToggleMnemonic={onToggleMnemonic}
+        />
+      ) : null}
+    </Animated.View>
+  );
+}
 
 export default function QuizModal({ words, onClose, forceDark }: Props) {
   const scheme = useColorScheme();
@@ -61,7 +677,7 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
     (subset?: QuizWord[]) => {
       // A retry re-asks only what was missed; distractors still come from the
       // whole page, so a one-word retry is still a real multiple choice.
-      const ask = subset && subset.length ? subset : pool;
+      const ask = subset?.length ? subset : pool;
       setQuestions(buildQuestions(ask, parsed));
       setIndex(0);
       setPicked(null);
@@ -76,7 +692,9 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
   useEffect(() => {
     let cancelled = false;
     void loadConfig().then((config) => {
-      if (cancelled) return;
+      if (cancelled) {
+        return;
+      }
       kanjiCfg.current = { showKanji: config.showKanji !== false, showRtk: !!config.showRtk };
       start();
       setReady(true);
@@ -119,7 +737,7 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
     transform: [{ translateY: (1 - step.value) * 8 }],
   }));
 
-  const progressPercent = total ? ((finished ? total : index) / total) * 100 : 0;
+  const progressPercent = getProgressPercent(total, finished, index);
   const progress = useSharedValue(0);
   useEffect(() => {
     progress.value = withTiming(progressPercent, { duration: 280 });
@@ -135,7 +753,9 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
   // Prompt audio plays automatically, and the kanji breakdown is fetched up
   // front (bundled data) so it is already there the moment the answer lands.
   useEffect(() => {
-    if (!question) return;
+    if (!question) {
+      return;
+    }
     let cancelled = false;
     setKanji([]);
     setOpenKanji(null);
@@ -144,10 +764,14 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
     if (kanjiCfg.current.showKanji) {
       void loadKanjiDetails(question.word.spelling, { showRtk: kanjiCfg.current.showRtk })
         .then((details) => {
-          if (cancelled) return;
+          if (cancelled) {
+            return;
+          }
           setKanji(details);
           // A single kanji needs no picking; open its breakdown straight away.
-          if (details.length === 1) setOpenKanji(details[0].kanji);
+          if (details.length === 1 && details[0]) {
+            setOpenKanji(details[0].kanji);
+          }
         })
         .catch(() => {});
     }
@@ -159,11 +783,16 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
 
   const answer = useCallback(
     (option: string) => {
-      if (!question || answeredRef.current) return;
+      if (!question || answeredRef.current) {
+        return;
+      }
       const ok = option === question.answer;
       setPicked(option);
-      if (ok) setCorrect((n) => n + 1);
-      else setMissed((list) => [...list, question.word]);
+      if (ok) {
+        setCorrect((n) => n + 1);
+      } else {
+        setMissed((list) => [...list, question.word]);
+      }
       void Haptics.notificationAsync(
         ok ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Warning
       );
@@ -186,7 +815,100 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
   const percent = total ? Math.round((correct / total) * 100) : 0;
 
   const selectedKanji = kanji.find((d) => d.kanji === openKanji) ?? null;
-  const wasRight = revealed && picked === question?.answer;
+
+  const handleSpeakCurrent = useCallback(() => {
+    if (question) {
+      speak(question.word);
+    }
+  }, [question, speak]);
+
+  const handleToggleHint = useCallback(() => {
+    void Haptics.selectionAsync();
+    setShowHint((v) => !v);
+  }, []);
+
+  const handleRetry = useCallback(() => {
+    void Haptics.selectionAsync();
+    start(missed.length > 0 ? missed : undefined);
+  }, [missed, start]);
+
+  const handleSelectKanji = useCallback((value: string | null) => {
+    void Haptics.selectionAsync();
+    setOpenKanji(value);
+    setShowMnemonic(false);
+  }, []);
+
+  const handleToggleMnemonic = useCallback(() => {
+    void Haptics.selectionAsync();
+    setShowMnemonic((v) => !v);
+  }, []);
+
+  const nextLabel = getNextLabel(revealed, index, total);
+  const nextDisabled = !revealed;
+  const nextBg = revealed ? c.primary : c.secondarySystemFill;
+
+  let body: React.ReactNode = null;
+  if (!ready) {
+    body = (
+      <View style={s.center}>
+        <ActivityIndicator color={c.primary} />
+      </View>
+    );
+  } else if (total === 0) {
+    body = (
+      <QuizEmptyBody parsedLength={parsed.length} poolLength={pool.length} colors={c} onDismiss={dismiss} />
+    );
+  } else if (finished) {
+    body = (
+      <QuizResultsBody
+        percent={percent}
+        correct={correct}
+        total={total}
+        missed={missed}
+        colors={c}
+        onRetry={handleRetry}
+        onDismiss={dismiss}
+      />
+    );
+  } else if (question) {
+    body = (
+      <>
+        <ScrollView contentContainerStyle={s.body} showsVerticalScrollIndicator={false}>
+          <QuizQuestionBody
+            question={question}
+            revealed={revealed}
+            picked={picked}
+            showHint={showHint}
+            kanji={kanji}
+            openKanji={openKanji}
+            selectedKanji={selectedKanji}
+            showMnemonic={showMnemonic}
+            isDark={isDark}
+            colors={c}
+            stepStyle={stepStyle}
+            onSpeak={handleSpeakCurrent}
+            onToggleHint={handleToggleHint}
+            onAnswer={answer}
+            onSelectKanji={handleSelectKanji}
+            onToggleMnemonic={handleToggleMnemonic}
+          />
+        </ScrollView>
+
+        <View style={[s.footer, { borderTopColor: c.separator }]}>
+          <Pressable
+            onPress={next}
+            disabled={nextDisabled}
+            style={({ pressed }) => [
+              s.primaryButton,
+              { backgroundColor: nextBg, opacity: pressed ? 0.85 : 1 },
+            ]}
+          >
+            <Text style={[s.primaryButtonText, !revealed && { color: c.tertiaryLabel }]}>{nextLabel}</Text>
+          </Pressable>
+        </View>
+      </>
+    );
+  }
 
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={dismiss}>
@@ -204,343 +926,13 @@ export default function QuizModal({ words, onClose, forceDark }: Props) {
             },
           ]}
         >
-          <View style={s.header}>
-            <View style={{ flex: 1 }}>
-              <Text style={[s.title, { color: c.onSurface }]}>Word quiz</Text>
-              <Text numberOfLines={1} style={[s.subtitle, { color: c.secondaryLabel }]}>
-                New and due words on this page
-              </Text>
-            </View>
-            {ready && total > 0 && !finished ? (
-              <View style={[s.counterChip, { backgroundColor: c.secondarySystemFill }]}>
-                <Text style={[s.counterText, { color: c.secondaryLabel }]}>
-                  {index + 1}/{total}
-                </Text>
-              </View>
-            ) : null}
-            <Pressable
-              onPress={dismiss}
-              hitSlop={12}
-              accessibilityLabel="Close quiz"
-              style={({ pressed }) => [s.closeButton, { backgroundColor: c.secondarySystemFill, opacity: pressed ? 0.6 : 1 }]}
-            >
-              <Icon name="close" size={15} color={c.secondaryLabel} strokeWidth={2.4} />
-            </Pressable>
-          </View>
+          <QuizHeader ready={ready} total={total} finished={finished} index={index} colors={c} onDismiss={dismiss} />
 
           <View style={[s.track, { backgroundColor: c.tertiarySystemFill }]}>
             <Animated.View style={[s.trackFill, { backgroundColor: c.primary }, progressStyle]} />
           </View>
 
-          {!ready ? (
-            <View style={s.center}>
-              <ActivityIndicator color={c.primary} />
-            </View>
-          ) : total === 0 ? (
-            <>
-              <View style={s.center}>
-                <View style={[s.emptyIcon, { backgroundColor: c.secondarySystemFill }]}>
-                  <Icon
-                    name={parsed.length > 0 && pool.length === 0 ? 'checkCircle' : 'book'}
-                    size={24}
-                    color={c.secondaryLabel}
-                    strokeWidth={1.7}
-                  />
-                </View>
-                <Text style={[s.emptyTitle, { color: c.onSurface }]}>
-                  {parsed.length === 0
-                    ? 'Nothing parsed here yet'
-                    : pool.length === 0
-                      ? 'All caught up'
-                      : 'Too few words here'}
-                </Text>
-                <Text style={[s.emptyBody, { color: c.secondaryLabel }]}>
-                  {parsed.length === 0
-                    ? 'No words on the current page have been parsed. Wait for parsing to finish, then try again.'
-                    : pool.length === 0
-                      ? `All ${parsed.length} words on this page are already known or not due for review.`
-                      : 'This page needs at least two different meanings to make a real choice.'}
-                </Text>
-              </View>
-              <View style={[s.footer, { borderTopColor: c.separator }]}>
-                <Pressable
-                  onPress={dismiss}
-                  style={({ pressed }) => [s.primaryButton, { backgroundColor: c.primary, opacity: pressed ? 0.85 : 1 }]}
-                >
-                  <Text style={s.primaryButtonText}>Back to reading</Text>
-                </Pressable>
-              </View>
-            </>
-          ) : finished ? (
-            <>
-              <ScrollView contentContainerStyle={s.body} showsVerticalScrollIndicator={false}>
-                <View style={s.resultsHead}>
-                  <Text style={[s.resultsScore, { color: c.primary }]}>{percent}%</Text>
-                  <Text style={[s.resultsFraction, { color: c.secondaryLabel }]}>
-                    {correct} of {total} correct
-                  </Text>
-                </View>
-                <Text style={[s.resultsMessage, { color: c.onSurface }]}>{scoreMessage(percent)}</Text>
-
-                {missed.length > 0 ? (
-                  <View style={s.missedSection}>
-                    <Text style={[s.sectionLabel, { color: c.secondaryLabel }]}>
-                      Worth another look ({missed.length})
-                    </Text>
-                    <View style={[s.missedList, { backgroundColor: c.surfaceContainer }]}>
-                      {missed.map((word, i) => (
-                        <View
-                          key={wordKey(word)}
-                          style={[s.missedItem, i > 0 && { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: c.separator }]}
-                        >
-                          <View style={{ flexShrink: 0 }}>
-                            <Text style={[s.missedWord, { color: c.onSurface }]}>{word.spelling}</Text>
-                            {word.reading && word.reading !== word.spelling ? (
-                              <Text style={[s.missedReading, { color: c.tertiaryLabel }]}>{word.reading}</Text>
-                            ) : null}
-                          </View>
-                          <Text numberOfLines={2} style={[s.missedMeaning, { color: c.secondaryLabel }]}>
-                            {word.meanings[0]}
-                          </Text>
-                        </View>
-                      ))}
-                    </View>
-                  </View>
-                ) : null}
-              </ScrollView>
-              <View style={[s.footer, { borderTopColor: c.separator }]}>
-                <Pressable
-                  onPress={() => {
-                    void Haptics.selectionAsync();
-                    start(missed.length > 0 ? missed : undefined);
-                  }}
-                  style={({ pressed }) => [s.primaryButton, { backgroundColor: c.primary, opacity: pressed ? 0.85 : 1 }]}
-                >
-                  <Icon name="repeat" size={16} color="#fff" strokeWidth={2.2} />
-                  <Text style={s.primaryButtonText}>
-                    {missed.length > 0 ? `Retry ${missed.length} missed` : 'Again'}
-                  </Text>
-                </Pressable>
-                <Pressable
-                  onPress={dismiss}
-                  style={({ pressed }) => [s.ghostButton, { backgroundColor: c.secondarySystemFill, opacity: pressed ? 0.8 : 1 }]}
-                >
-                  <Text style={[s.ghostButtonText, { color: c.onSurface }]}>Done</Text>
-                </Pressable>
-              </View>
-            </>
-          ) : question ? (
-            <>
-              <ScrollView contentContainerStyle={s.body} showsVerticalScrollIndicator={false}>
-                <Animated.View style={[{ gap: 14 }, stepStyle]}>
-                  <View style={[s.wordCard, { backgroundColor: c.surfaceContainer }]}>
-                    <Text style={[s.word, { color: c.onSurface }]}>{question.word.spelling}</Text>
-                    {question.word.reading && question.word.reading !== question.word.spelling ? (
-                      <Text style={[s.reading, { color: c.secondaryLabel }]}>{question.word.reading}</Text>
-                    ) : null}
-                    <View style={s.wordActions}>
-                      <Pressable
-                        onPress={() => speak(question.word)}
-                        style={({ pressed }) => [s.wordAction, { backgroundColor: c.surface, opacity: pressed ? 0.7 : 1 }]}
-                        accessibilityLabel="Play pronunciation"
-                      >
-                        <Icon name="audio" size={15} color={c.secondaryLabel} strokeWidth={2} />
-                        <Text style={[s.wordActionText, { color: c.secondaryLabel }]}>Listen</Text>
-                      </Pressable>
-                      {!revealed && (question.word.meanings.length > 1 || question.word.reading) ? (
-                        <Pressable
-                          onPress={() => {
-                            void Haptics.selectionAsync();
-                            setShowHint((v) => !v);
-                          }}
-                          style={({ pressed }) => [s.wordAction, { backgroundColor: c.surface, opacity: pressed ? 0.7 : 1 }]}
-                        >
-                          <Icon name="info" size={15} color={c.secondaryLabel} strokeWidth={2} />
-                          <Text style={[s.wordActionText, { color: c.secondaryLabel }]}>{showHint ? 'Hide hint' : 'Hint'}</Text>
-                        </Pressable>
-                      ) : null}
-                    </View>
-                  </View>
-
-                  {showHint && !revealed ? (
-                    <Text style={[s.hint, { color: c.secondaryLabel, borderColor: c.separator }]}>
-                      {question.word.meanings.length > 1
-                        ? `Also means: ${question.word.meanings.slice(1, 4).join(' · ')}`
-                        : `Read as ${question.word.reading}`}
-                    </Text>
-                  ) : null}
-
-                  <View style={s.options}>
-                    {question.options.map((option, i) => {
-                      const isAnswer = option === question.answer;
-                      const isPicked = option === picked;
-                      const showRight = revealed && isAnswer;
-                      const showWrong = revealed && isPicked && !isAnswer;
-                      return (
-                        <Pressable
-                          key={`${option}/${i}`}
-                          onPress={() => answer(option)}
-                          disabled={revealed}
-                          accessibilityRole="button"
-                          style={({ pressed }) => [
-                            s.option,
-                            {
-                              backgroundColor: showRight
-                                ? (isDark ? 'rgba(52,199,89,0.16)' : 'rgba(52,199,89,0.12)')
-                                : showWrong
-                                  ? (isDark ? 'rgba(255,59,48,0.16)' : 'rgba(255,59,48,0.10)')
-                                  : c.surfaceContainer,
-                              borderColor: showRight ? c.success : showWrong ? c.error : 'transparent',
-                              opacity: pressed && !revealed ? 0.76 : revealed && !showRight && !showWrong ? 0.55 : 1,
-                            },
-                          ]}
-                        >
-                          <View
-                            style={[
-                              s.optionMark,
-                              { backgroundColor: showRight ? c.success : showWrong ? c.error : c.tertiarySystemFill },
-                            ]}
-                          >
-                            {showRight ? (
-                              <Icon name="check" size={13} color="#fff" strokeWidth={3} />
-                            ) : showWrong ? (
-                              <Icon name="close" size={11} color="#fff" strokeWidth={3} />
-                            ) : (
-                              <Text style={[s.optionIndex, { color: c.secondaryLabel }]}>{i + 1}</Text>
-                            )}
-                          </View>
-                          <Text style={[s.optionText, { color: c.onSurface }]}>{option}</Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-
-                  {revealed ? (
-                    <View
-                      style={[
-                        s.verdict,
-                        {
-                          backgroundColor: wasRight
-                            ? (isDark ? 'rgba(52,199,89,0.14)' : 'rgba(52,199,89,0.10)')
-                            : c.surfaceContainer,
-                        },
-                      ]}
-                    >
-                      <Icon
-                        name={wasRight ? 'checkCircle' : 'info'}
-                        size={17}
-                        color={wasRight ? c.success : c.secondaryLabel}
-                        strokeWidth={2}
-                      />
-                      <Text style={[s.verdictText, { color: wasRight ? c.success : c.onSurface }]}>
-                        {wasRight ? 'Correct' : `${question.word.spelling} means ${question.answer}`}
-                      </Text>
-                    </View>
-                  ) : null}
-
-                  {/* Kanji breakdown only after the answer — the component
-                      meanings would otherwise give the question away. */}
-                  {revealed && kanji.length > 0 ? (
-                    <View style={s.kanjiWrap}>
-                      <Text style={[s.sectionLabel, { color: c.secondaryLabel }]}>Kanji breakdown</Text>
-                      <View style={s.kanjiRow}>
-                        {kanji.map((detail) => {
-                          const active = openKanji === detail.kanji;
-                          return (
-                            <Pressable
-                              key={detail.kanji}
-                              onPress={() => {
-                                void Haptics.selectionAsync();
-                                setOpenKanji(active ? null : detail.kanji);
-                                setShowMnemonic(false);
-                              }}
-                              style={({ pressed }) => [
-                                s.kanjiChip,
-                                {
-                                  backgroundColor: active ? c.surfaceContainerHigh : c.surfaceContainer,
-                                  borderColor: active ? c.primary : 'transparent',
-                                  opacity: pressed ? 0.8 : 1,
-                                },
-                              ]}
-                            >
-                              <Text style={[s.kanjiChar, { color: c.primary }]}>{detail.kanji}</Text>
-                              <Text numberOfLines={1} style={[s.kanjiMeaning, { color: c.onSurface }]}>
-                                {detail.meanings || '—'}
-                              </Text>
-                            </Pressable>
-                          );
-                        })}
-                      </View>
-
-                      {selectedKanji ? (
-                        <View style={[s.kanjiPanel, { backgroundColor: c.surfaceContainer }]}>
-                          <View style={s.kanjiPanelHead}>
-                            <Text style={[s.kanjiPanelChar, { color: c.primary }]}>{selectedKanji.kanji}</Text>
-                            <Text numberOfLines={2} style={[s.kanjiPanelMeaning, { color: c.onSurface }]}>
-                              {selectedKanji.meanings || '—'}
-                            </Text>
-                          </View>
-                          {selectedKanji.components.length > 0 ? (
-                            <View style={s.componentGrid}>
-                              {selectedKanji.components.map((component) => (
-                                <View
-                                  key={component.component}
-                                  style={[s.componentCard, { backgroundColor: c.surface, borderColor: c.separator }]}
-                                >
-                                  <Text style={[s.componentChar, { color: c.primary }]}>{component.component}</Text>
-                                  <Text numberOfLines={2} style={[s.componentMeaning, { color: c.secondaryLabel }]}>
-                                    {component.meaning || '—'}
-                                  </Text>
-                                </View>
-                              ))}
-                            </View>
-                          ) : null}
-                          {selectedKanji.rtk ? (
-                            <>
-                              <Pressable
-                                onPress={() => {
-                                  void Haptics.selectionAsync();
-                                  setShowMnemonic((v) => !v);
-                                }}
-                                hitSlop={8}
-                                style={s.mnemonicToggle}
-                              >
-                                <Text style={[s.mnemonicLabel, { color: c.secondaryLabel }]}>Mnemonic</Text>
-                                <Icon
-                                  name={showMnemonic ? 'chevronDown' : 'chevronRight'}
-                                  size={13}
-                                  color={c.tertiaryLabel}
-                                  strokeWidth={2.2}
-                                />
-                              </Pressable>
-                              {showMnemonic ? (
-                                <Text style={[s.mnemonicText, { color: c.onSurface }]}>{selectedKanji.rtk}</Text>
-                              ) : null}
-                            </>
-                          ) : null}
-                        </View>
-                      ) : null}
-                    </View>
-                  ) : null}
-                </Animated.View>
-              </ScrollView>
-
-              <View style={[s.footer, { borderTopColor: c.separator }]}>
-                <Pressable
-                  onPress={next}
-                  disabled={!revealed}
-                  style={({ pressed }) => [
-                    s.primaryButton,
-                    { backgroundColor: revealed ? c.primary : c.secondarySystemFill, opacity: pressed ? 0.85 : 1 },
-                  ]}
-                >
-                  <Text style={[s.primaryButtonText, !revealed && { color: c.tertiaryLabel }]}>
-                    {revealed ? (index >= total - 1 ? 'See results' : 'Next word') : 'Pick an answer'}
-                  </Text>
-                </Pressable>
-              </View>
-            </>
-          ) : null}
+          {body}
         </Animated.View>
       </View>
     </Modal>

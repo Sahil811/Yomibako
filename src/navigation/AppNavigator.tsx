@@ -114,10 +114,14 @@ function TabBar({ state, descriptors, navigation }: any) {
   );
 }
 
+function RenderTabBar(props: any) {
+  return <TabBar {...props} />;
+}
+
 function TabsWrapper() {
   return (
     <View style={{ flex: 1 }}>
-      <Tab.Navigator tabBar={(p) => <TabBar {...p} />} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true }}>
+      <Tab.Navigator tabBar={RenderTabBar} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true }}>
         <Tab.Screen name="Library" component={LibraryScreen} />
         <Tab.Screen name="Browser" component={BrowserScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />

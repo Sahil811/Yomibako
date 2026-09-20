@@ -5,8 +5,18 @@ import { darkColors, lightColors } from '../../theme/colors';
 import * as Haptics from 'expo-haptics';
 import { Icon } from './Icon';
 
+function getAppleButtonBackground(variant: 'primary' | 'secondary' | 'ghost', colors: any): string {
+  if (variant === 'primary') {
+    return colors.primary;
+  }
+  if (variant === 'secondary') {
+    return colors.secondarySystemFill;
+  }
+  return 'transparent';
+}
+
 // Header with large title + subtitle, blur background — iOS 17 style
-export function AppleHeader({ title, subtitle, right, insetsTop }: { title: string; subtitle?: string; right?: React.ReactNode; tint?: string; insetsTop?: number }) {
+export function AppleHeader({ title, subtitle, right, insetsTop }: { readonly title: string; readonly subtitle?: string; readonly right?: React.ReactNode; readonly insetsTop?: number }) {
   const scheme = useColorScheme();
   const isDark = scheme === 'dark';
   const colors = isDark ? darkColors : lightColors;
@@ -26,14 +36,14 @@ export function AppleHeader({ title, subtitle, right, insetsTop }: { title: stri
 }
 
 // Inset grouped section — iOS Settings
-export function AppleSection({ title, footnote, children, colors }: { title?: string; footnote?: string; children: React.ReactNode; colors: any }) {
+export function AppleSection({ title, footnote, children, colors }: { readonly title?: string; readonly footnote?: string; readonly children: React.ReactNode; readonly colors: any }) {
   const kids = React.Children.toArray(children).filter(Boolean);
   return (
     <View style={{ gap: 6 }}>
       {title ? <Text style={[s.sectionHeader, { color: colors.secondaryLabel }]}>{title}</Text> : null}
       <View style={[s.group, { backgroundColor: colors.secondaryGroupedBackground, borderColor: colors.separator }]}>
         {kids.map((child: any, idx) => (
-          <View key={idx}>
+          <View key={`section-row-${String((child as React.ReactElement)?.key)}`}>
             {child}
             {idx !== kids.length - 1 ? <View style={[s.separator, { backgroundColor: colors.separator, marginLeft: 52 }]} /> : null}
           </View>
@@ -72,8 +82,8 @@ export function AppleRow({ icon, iconBg, title, subtitle, value, onPress, right,
 }
 
 // Capsule button — iOS prominent. Flat, no drop shadow (Apple Buttons have none).
-export function AppleButton({ title, onPress, variant = 'primary', colors, small }: { title: string; onPress?: () => void; variant?: 'primary' | 'secondary' | 'ghost'; colors: any; small?: boolean }) {
-  const bg = variant === 'primary' ? colors.primary : variant === 'secondary' ? colors.secondarySystemFill : 'transparent';
+export function AppleButton({ title, onPress, variant = 'primary', colors, small }: { readonly title: string; readonly onPress?: () => void; readonly variant?: 'primary' | 'secondary' | 'ghost'; readonly colors: any; readonly small?: boolean }) {
+  const bg = getAppleButtonBackground(variant, colors);
   const fg = variant === 'primary' ? '#fff' : colors.primary;
   return (
     <Pressable onPress={() => { Haptics.impactAsync(variant === 'primary' ? Haptics.ImpactFeedbackStyle.Medium : Haptics.ImpactFeedbackStyle.Light); onPress?.(); }} style={({ pressed }) => [{ height: small ? 34 : 50, borderRadius: small ? 17 : 14, backgroundColor: bg, opacity: pressed ? 0.82 : 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: small ? 16 : 22, borderWidth: variant === 'ghost' ? StyleSheet.hairlineWidth : 0, borderColor: colors.separator, transform: [{ scale: pressed ? 0.98 : 1 }] }]}>

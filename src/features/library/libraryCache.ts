@@ -77,7 +77,7 @@ export async function loadLibraryIndex(roots: string[]): Promise<Series[]> {
     const file = indexFile();
     if (!file.exists) return [];
     const raw = JSON.parse(await file.text());
-    if (!raw || raw.version !== INDEX_VERSION || !Array.isArray(raw.series)) return [];
+    if (raw?.version !== INDEX_VERSION || !Array.isArray(raw?.series)) return [];
     const granted = new Set(roots);
     return raw.series
       .map(normalizeSeries)

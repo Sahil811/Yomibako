@@ -40,6 +40,7 @@ test('clearPageCache removes series dirs but keeps audio', () => {
 test('evictOldCaches is a safe no-op on empty cache', async () => {
   __resetFS();
   await evictOldCaches(10);
+  assert.deepEqual(cacheUsage(), { pageBytes: 0, audioBytes: 0 });
 });
 
 test('prepareVolumeForWebView returns file uris directly (no copy)', async () => {

@@ -9,13 +9,128 @@ export type Block =
   | { type: 'number'; label: string; text: string }
   | { type: 'para'; text: string };
 
+type InlineStyle = Omit<Span, 'text'>;
+type PushFn = (text: string, style: InlineStyle) => void;
+type WrapFn = (inner: string, style: InlineStyle) => void;
+
+// Manual line-classifiers (no RegExp): linear scans with no backtracking.
+function skipIndent(line: string): number {
+  let i = 0;
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) i++;
+  return i;
+}
+
+function parseHeadingLine(line: string): { level: number; text: string } | null {
+  const start = skipIndent(line);
+  let hashes = 0;
+  while (hashes < 6 && line[start + hashes] === '#') hashes++;
+  if (hashes === 0) return null;
+  if (line[start + hashes] === '#') return null;
+  const after = line[start + hashes];
+  if (after !== ' ' && after !== '\t') return null;
+  let t = start + hashes + 1;
+  while (t < line.length && (line[t] === ' ' || line[t] === '\t')) t++;
+  const text = line.slice(t).trim();
+  if (!text) return null;
+  return { level: hashes, text };
+}
+
+function parseBulletLine(line: string): { text: string } | null {
+  const start = skipIndent(line);
+  const marker = line[start];
+  if (marker !== '-' && marker !== '*' && marker !== '+') return null;
+  const after = line[start + 1];
+  if (after !== ' ' && after !== '\t') return null;
+  let t = start + 2;
+  while (t < line.length && (line[t] === ' ' || line[t] === '\t')) t++;
+  const text = line.slice(t).trim();
+  if (!text) return null;
+  return { text };
+}
+
+function parseNumberedLine(line: string): { label: string; text: string } | null {
+  const start = skipIndent(line);
+  let d = 0;
+  while (d < 9 && line[start + d] >= '0' && line[start + d] <= '9') d++;
+  if (d === 0) return null;
+  if (line[start + d] !== '.') return null;
+  const after = line[start + d + 1];
+  if (after !== ' ' && after !== '\t') return null;
+  let t = start + d + 2;
+  while (t < line.length && (line[t] === ' ' || line[t] === '\t')) t++;
+  const text = line.slice(t).trim();
+  if (!text) return null;
+  return { label: line.slice(start, start + d), text };
+}
+
+function tryConsumeCode(input: string, i: number, push: PushFn): number | null {
+  if (input[i] !== '`') {
+    return null;
+  }
+  const end = input.indexOf('`', i + 1);
+  if (end <= i) {
+    return null;
+  }
+  push(input.slice(i + 1, end), { code: true });
+  return end + 1;
+}
+
+function tryConsumeTriple(input: string, i: number, wrap: WrapFn): number | null {
+  if (!input.startsWith('***', i)) {
+    return null;
+  }
+  const end = input.indexOf('***', i + 3);
+  if (end <= i) {
+    return null;
+  }
+  wrap(input.slice(i + 3, end), { bold: true, italic: true });
+  return end + 3;
+}
+
+function tryConsumeBold(input: string, i: number, wrap: WrapFn): number | null {
+  if (!input.startsWith('**', i)) {
+    return null;
+  }
+  const end = input.indexOf('**', i + 2);
+  if (end <= i) {
+    return null;
+  }
+  wrap(input.slice(i + 2, end), { bold: true });
+  return end + 2;
+}
+
+function tryConsumeItalic(input: string, i: number, wrap: WrapFn): number | null {
+  const ch = input[i];
+  if (ch !== '*' && ch !== '_') {
+    return null;
+  }
+  const end = input.indexOf(ch, i + 1);
+  if (end <= i + 1) {
+    return null;
+  }
+  wrap(input.slice(i + 1, end), { italic: true });
+  return end + 1;
+}
+
+function consumePlainRun(input: string, i: number, push: PushFn): number {
+  let next = i + 1;
+  while (next < input.length && input[next] !== '`' && input[next] !== '*' && input[next] !== '_') {
+    next++;
+  }
+  // If we started on a lone marker with no partner, keep it as literal text.
+  push(input.slice(i, next), {});
+  return next;
+}
+
 // Split one line of text into styled spans. Recurses so bold can contain italic.
 export function parseInline(input: string): Span[] {
   const out: Span[] = [];
-  const push = (text: string, style: Omit<Span, 'text'>) => {
-    if (text) out.push({ text, ...style });
+  const push: PushFn = (text, style) => {
+    if (text) {
+      out.push({ text, ...style });
+    }
   };
-  const wrap = (inner: string, style: Omit<Span, 'text'>) => {
+  const wrap: WrapFn = (inner, style) => {
     for (const seg of parseInline(inner)) {
       push(seg.text, { bold: seg.bold || style.bold, italic: seg.italic || style.italic, code: seg.code || style.code });
     }
@@ -23,54 +138,58 @@ export function parseInline(input: string): Span[] {
 
   let i = 0;
   while (i < input.length) {
-    const ch = input[i];
-
-    if (ch === '`') {
-      const end = input.indexOf('`', i + 1);
-      if (end > i) { push(input.slice(i + 1, end), { code: true }); i = end + 1; continue; }
+    const codeNext = tryConsumeCode(input, i, push);
+    if (codeNext !== null) {
+      i = codeNext;
+      continue;
     }
-    // ***bold italic***
-    if (input.startsWith('***', i)) {
-      const end = input.indexOf('***', i + 3);
-      if (end > i) { wrap(input.slice(i + 3, end), { bold: true, italic: true }); i = end + 3; continue; }
+    const tripleNext = tryConsumeTriple(input, i, wrap);
+    if (tripleNext !== null) {
+      i = tripleNext;
+      continue;
     }
-    // **bold**
-    if (input.startsWith('**', i)) {
-      const end = input.indexOf('**', i + 2);
-      if (end > i) { wrap(input.slice(i + 2, end), { bold: true }); i = end + 2; continue; }
+    const boldNext = tryConsumeBold(input, i, wrap);
+    if (boldNext !== null) {
+      i = boldNext;
+      continue;
     }
-    // *italic* or _italic_
-    if (ch === '*' || ch === '_') {
-      const end = input.indexOf(ch, i + 1);
-      if (end > i + 1) { wrap(input.slice(i + 1, end), { italic: true }); i = end + 1; continue; }
+    const italicNext = tryConsumeItalic(input, i, wrap);
+    if (italicNext !== null) {
+      i = italicNext;
+      continue;
     }
-
-    // Plain run up to the next possible marker.
-    let next = i + 1;
-    while (next < input.length && input[next] !== '`' && input[next] !== '*' && input[next] !== '_') next++;
-    // If we started on a lone marker with no partner, keep it as literal text.
-    push(input.slice(i, next), {});
-    i = next;
+    i = consumePlainRun(input, i, push);
   }
   return out;
+}
+
+function parseLine(line: string, blocks: Block[]): void {
+  const heading = parseHeadingLine(line);
+  if (heading) {
+    blocks.push({ type: 'heading', level: heading.level, text: heading.text });
+    return;
+  }
+  const bullet = parseBulletLine(line);
+  if (bullet) {
+    blocks.push({ type: 'bullet', text: bullet.text });
+    return;
+  }
+  const numbered = parseNumberedLine(line);
+  if (numbered) {
+    blocks.push({ type: 'number', label: numbered.label, text: numbered.text });
+    return;
+  }
+  blocks.push({ type: 'para', text: line.trim() });
 }
 
 export function parseBlocks(content: string): Block[] {
   const blocks: Block[] = [];
   for (const rawLine of content.replace(/\r\n?/g, '\n').split('\n')) {
     const line = rawLine.trimEnd();
-    if (!line.trim()) continue;
-
-    const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
-    if (heading) { blocks.push({ type: 'heading', level: heading[1].length, text: heading[2].trim() }); continue; }
-
-    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
-    if (bullet) { blocks.push({ type: 'bullet', text: bullet[1].trim() }); continue; }
-
-    const numbered = line.match(/^\s*(\d+)\.\s+(.*)$/);
-    if (numbered) { blocks.push({ type: 'number', label: numbered[1], text: numbered[2].trim() }); continue; }
-
-    blocks.push({ type: 'para', text: line.trim() });
+    if (!line.trim()) {
+      continue;
+    }
+    parseLine(line, blocks);
   }
   return blocks;
 }

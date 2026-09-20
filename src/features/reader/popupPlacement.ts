@@ -102,7 +102,7 @@ const union = (a: Edges, b: Edges): Edges => ({
  * the popup to empty space between them. Pick the fragment nearest the pointer.
  */
 export function pickClosestRect(rects: Rect[] | null | undefined, point?: Point | null): Rect | null {
-  if (!rects || !rects.length) return null;
+  if (!rects?.length) return null;
   if (!point || rects.length === 1) return rects[0];
   let best = rects[0];
   let bestDistance = Infinity;
@@ -130,6 +130,221 @@ type Candidate = {
   distance: number;
 };
 
+function computeUsable(viewport: Size, safe: Insets, frame: Frame): Edges {
+  return {
+    left: Math.max(safe.left, frame.x) + OUTER_MARGIN,
+    top: Math.max(safe.top, frame.y) + OUTER_MARGIN,
+    right: Math.min(viewport.width - safe.right, frame.x + frame.width) - OUTER_MARGIN,
+    bottom: Math.min(viewport.height - safe.bottom, frame.y + frame.height) - OUTER_MARGIN,
+  };
+}
+
+function scaleForFrame(frame: Frame, vw: number): number {
+  return vw > 0 ? frame.width / vw : 1;
+}
+
+function buildAvoid(
+  bubble: Edges,
+  pointerType: 'touch' | 'mouse',
+  point: Point | null,
+): Edges {
+  let avoid = inflate(bubble, GAP);
+  if (pointerType === 'touch' && point) {
+    avoid = union(avoid, {
+      left: point.x - FINGER_HALF_W,
+      top: point.y - FINGER_UP,
+      right: point.x + FINGER_HALF_W,
+      bottom: point.y + FINGER_DOWN,
+    });
+  }
+  return avoid;
+}
+
+function buildSlots(usable: Edges, avoid: Edges): { side: Side; slot: Edges }[] {
+  return [
+    { side: 'below', slot: { left: usable.left, top: Math.max(usable.top, avoid.bottom), right: usable.right, bottom: usable.bottom } },
+    { side: 'above', slot: { left: usable.left, top: usable.top, right: usable.right, bottom: Math.min(usable.bottom, avoid.top) } },
+    { side: 'right', slot: { left: Math.max(usable.left, avoid.right), top: usable.top, right: usable.right, bottom: usable.bottom } },
+    { side: 'left', slot: { left: usable.left, top: usable.top, right: Math.min(usable.right, avoid.left), bottom: usable.bottom } },
+  ];
+}
+
+function distanceForSide(side: Side, slot: Edges, word: Edges): number {
+  if (side === 'below') {
+    return slot.top - word.bottom;
+  }
+  if (side === 'above') {
+    return word.top - slot.bottom;
+  }
+  if (side === 'right') {
+    return slot.left - word.right;
+  }
+  return word.left - slot.right;
+}
+
+function isPreferredSide(vertical: boolean, side: Side): boolean {
+  if (vertical) {
+    return side === 'right' || side === 'left';
+  }
+  return side === 'below' || side === 'above';
+}
+
+function buildCandidates(
+  slots: { side: Side; slot: Edges }[],
+  word: Edges,
+  desired: Size,
+  min: Size,
+  cap: number,
+  vertical: boolean,
+): Candidate[] {
+  const candidates: Candidate[] = [];
+  for (const { side, slot } of slots) {
+    const slotW = slot.right - slot.left;
+    const slotH = Math.min(slot.bottom - slot.top, cap);
+    if (slotW < min.width || slotH < min.height) {
+      continue;
+    }
+    const width = Math.min(desired.width, slotW);
+    const height = Math.min(desired.height, slotH);
+    const distance = distanceForSide(side, slot, word);
+    candidates.push({
+      side,
+      slot,
+      slotW,
+      slotH,
+      width,
+      height,
+      fits: slotW >= desired.width && slotH >= desired.height,
+      // Vertical manga text reads down a column, so a popup beside it keeps the
+      // most of the page readable. Horizontal text prefers above/below.
+      preferred: isPreferredSide(vertical, side),
+      distance: Math.max(0, distance),
+    });
+  }
+  return candidates;
+}
+
+function compareCandidates(a: Candidate, b: Candidate): number {
+  if (a.fits !== b.fits) {
+    return a.fits ? -1 : 1;
+  }
+  if (!a.fits) {
+    // Neither shows the card whole, so show as much of it as possible.
+    const areaA = a.width * a.height;
+    const areaB = b.width * b.height;
+    if (Math.abs(areaA - areaB) > 1) {
+      return areaB - areaA;
+    }
+  }
+  if (a.preferred !== b.preferred) {
+    return a.preferred ? -1 : 1;
+  }
+  return a.distance - b.distance;
+}
+
+function chooseBestCandidate(candidates: Candidate[], prefer: Side | undefined, desired: Size): Candidate | undefined {
+  // Staying put beats showing a little more card. Expanding details should feel
+  // like the card grew, not like it jumped to the other side of the page, and
+  // the content scrolls anyway. Only abandon the current side once it has lost
+  // most of the room.
+  const sticky = candidates.find((c) => c.side === prefer);
+  const keepSticky = !!sticky && (sticky.fits || sticky.height >= desired.height * STICKY_KEEP);
+  if (keepSticky) {
+    return sticky;
+  }
+  const sorted = [...candidates].sort(compareCandidates);
+  return sorted[0];
+}
+
+function centeredPlacement(
+  desired: Size,
+  min: Size,
+  usable: Edges,
+  usableW: number,
+  cap: number,
+): Placement {
+  const width = clamp(desired.width, Math.min(min.width, usableW), usableW);
+  const top = usable.top + 24;
+  return {
+    width,
+    maxHeight: Math.min(cap, usable.bottom - top),
+    left: usable.left + (usableW - width) / 2,
+    top,
+    side: 'center',
+    originX: 0.5,
+    originY: 0,
+  };
+}
+
+function layoutBelowAbove(
+  best: Candidate,
+  word: Edges,
+  wordCenterX: number,
+  viewport: Size,
+): Placement {
+  const { side, slot, width } = best;
+  const box: Placement = { width, maxHeight: best.slotH, side, originX: 0.5, originY: 0.5 };
+  // Align along the word, biased toward whichever side has more room.
+  const leftSpace = word.left - slot.left;
+  const rightSpace = slot.right - word.right;
+  let anchorLeft = word.right - width;
+  if (rightSpace >= leftSpace) {
+    anchorLeft = word.left;
+  }
+  const left = clamp(anchorLeft, slot.left, slot.right - width);
+  box.left = left;
+  box.originX = clamp((wordCenterX - left) / width, 0, 1);
+  if (side === 'below') {
+    box.top = slot.top;
+    box.originY = 0;
+  } else {
+    box.bottom = viewport.height - slot.bottom;
+    box.originY = 1;
+  }
+  return box;
+}
+
+function layoutSide(
+  best: Candidate,
+  word: Edges,
+  wordCenterY: number,
+  viewport: Size,
+): Placement {
+  const { side, slot, width } = best;
+  const height = Math.min(best.height, best.slotH);
+  const box: Placement = { width, maxHeight: best.slotH, side, originX: 0.5, originY: 0.5 };
+  const topSpace = word.top - slot.top;
+  const bottomSpace = slot.bottom - word.bottom;
+  let anchorTop = word.bottom - height;
+  if (bottomSpace >= topSpace) {
+    anchorTop = word.top;
+  }
+  const top = clamp(anchorTop, slot.top, slot.bottom - height);
+  box.top = top;
+  box.originY = clamp((wordCenterY - top) / height, 0, 1);
+  // Unlike below/above, `top` floats, so the slot height is not the room left
+  // underneath it. The card can still grow after placement (a late AI answer,
+  // say) and would otherwise run off the bottom of the slot.
+  box.maxHeight = Math.min(box.maxHeight, slot.bottom - top);
+  if (side === 'right') {
+    box.left = slot.left;
+    box.originX = 0;
+  } else {
+    box.right = viewport.width - slot.right;
+    box.originX = 1;
+  }
+  return box;
+}
+
+function layoutBest(best: Candidate, word: Edges, viewport: Size): Placement {
+  const wordCenterX = (word.left + word.right) / 2;
+  const wordCenterY = (word.top + word.bottom) / 2;
+  if (best.side === 'below' || best.side === 'above') {
+    return layoutBelowAbove(best, word, wordCenterX, viewport);
+  }
+  return layoutSide(best, word, wordCenterY, viewport);
+}
+
 export function placePopup(input: PlacementInput): Placement {
   const {
     viewport,
@@ -142,12 +357,7 @@ export function placePopup(input: PlacementInput): Placement {
   const min = input.min ?? DEFAULT_MIN;
   const frame: Frame = anchorFrame ?? { x: 0, y: 0, width: viewport.width, height: viewport.height };
 
-  const usable: Edges = {
-    left: Math.max(safe.left, frame.x) + OUTER_MARGIN,
-    top: Math.max(safe.top, frame.y) + OUTER_MARGIN,
-    right: Math.min(viewport.width - safe.right, frame.x + frame.width) - OUTER_MARGIN,
-    bottom: Math.min(viewport.height - safe.bottom, frame.y + frame.height) - OUTER_MARGIN,
-  };
+  const usable = computeUsable(viewport, safe, frame);
   const usableW = Math.max(0, usable.right - usable.left);
   const usableH = Math.max(0, usable.bottom - usable.top);
   const cap = Math.min(input.cap ?? Infinity, usableH);
@@ -156,7 +366,7 @@ export function placePopup(input: PlacementInput): Placement {
   // sits below its chrome and may be pinch-zoomed, so both offset and scale
   // matter there.
   const vw = Number(input.vw) || 0;
-  const k = vw > 0 ? frame.width / vw : 1;
+  const k = scaleForFrame(frame, vw);
   const toDp = (r: Rect): Rect => ({
     x: frame.x + r.x * k,
     y: frame.y + r.y * k,
@@ -168,17 +378,7 @@ export function placePopup(input: PlacementInput): Placement {
 
   // No coordinates at all: centre it near the top, as before.
   if (!rawWord) {
-    const width = clamp(desired.width, Math.min(min.width, usableW), usableW);
-    const top = usable.top + 24;
-    return {
-      width,
-      maxHeight: Math.min(cap, usable.bottom - top),
-      left: usable.left + (usableW - width) / 2,
-      top,
-      side: 'center',
-      originX: 0.5,
-      originY: 0,
-    };
+    return centeredPlacement(desired, min, usable, usableW, cap);
   }
 
   const word = edges(toDp(rawWord));
@@ -187,120 +387,14 @@ export function placePopup(input: PlacementInput): Placement {
 
   // What the popup must not overlap: the bubble being read, plus the patch of
   // screen the reader's own fingertip is already hiding.
-  let avoid = inflate(bubble, GAP);
-  if (pointerType === 'touch' && point) {
-    avoid = union(avoid, {
-      left: point.x - FINGER_HALF_W,
-      top: point.y - FINGER_UP,
-      right: point.x + FINGER_HALF_W,
-      bottom: point.y + FINGER_DOWN,
-    });
+  const avoid = buildAvoid(bubble, pointerType, point);
+  const slots = buildSlots(usable, avoid);
+  const candidates = buildCandidates(slots, word, desired, min, cap, vertical);
+  const best = chooseBestCandidate(candidates, input.prefer, desired);
+  if (!best) {
+    return edgeFallback(input, usable, word, cap, min);
   }
-
-  const slots: { side: Side; slot: Edges }[] = [
-    { side: 'below', slot: { left: usable.left, top: Math.max(usable.top, avoid.bottom), right: usable.right, bottom: usable.bottom } },
-    { side: 'above', slot: { left: usable.left, top: usable.top, right: usable.right, bottom: Math.min(usable.bottom, avoid.top) } },
-    { side: 'right', slot: { left: Math.max(usable.left, avoid.right), top: usable.top, right: usable.right, bottom: usable.bottom } },
-    { side: 'left', slot: { left: usable.left, top: usable.top, right: Math.min(usable.right, avoid.left), bottom: usable.bottom } },
-  ];
-
-  const wordCenterX = (word.left + word.right) / 2;
-  const wordCenterY = (word.top + word.bottom) / 2;
-
-  const candidates: Candidate[] = [];
-  for (const { side, slot } of slots) {
-    const slotW = slot.right - slot.left;
-    const slotH = Math.min(slot.bottom - slot.top, cap);
-    if (slotW < min.width || slotH < min.height) continue;
-    const width = Math.min(desired.width, slotW);
-    const height = Math.min(desired.height, slotH);
-    const distance =
-      side === 'below' ? slot.top - word.bottom
-      : side === 'above' ? word.top - slot.bottom
-      : side === 'right' ? slot.left - word.right
-      : word.left - slot.right;
-    candidates.push({
-      side,
-      slot,
-      slotW,
-      slotH,
-      width,
-      height,
-      fits: slotW >= desired.width && slotH >= desired.height,
-      // Vertical manga text reads down a column, so a popup beside it keeps the
-      // most of the page readable. Horizontal text prefers above/below.
-      preferred: vertical ? side === 'right' || side === 'left' : side === 'below' || side === 'above',
-      distance: Math.max(0, distance),
-    });
-  }
-
-  // Staying put beats showing a little more card. Expanding details should feel
-  // like the card grew, not like it jumped to the other side of the page, and
-  // the content scrolls anyway. Only abandon the current side once it has lost
-  // most of the room.
-  const sticky = candidates.find((c) => c.side === input.prefer);
-  const keepSticky = !!sticky && (sticky.fits || sticky.height >= desired.height * STICKY_KEEP);
-
-  candidates.sort((a, b) => {
-    if (a.fits !== b.fits) return a.fits ? -1 : 1;
-    if (!a.fits) {
-      // Neither shows the card whole, so show as much of it as possible.
-      const areaA = a.width * a.height;
-      const areaB = b.width * b.height;
-      if (Math.abs(areaA - areaB) > 1) return areaB - areaA;
-    }
-    if (a.preferred !== b.preferred) return a.preferred ? -1 : 1;
-    return a.distance - b.distance;
-  });
-
-  const best = keepSticky ? sticky : candidates[0];
-  if (!best) return edgeFallback(input, usable, word, cap, min);
-
-  const { side, slot, width } = best;
-  const height = Math.min(best.height, best.slotH);
-  const box: Placement = { width, maxHeight: best.slotH, side, originX: 0.5, originY: 0.5 };
-
-  if (side === 'below' || side === 'above') {
-    // Align along the word, biased toward whichever side has more room.
-    const leftSpace = word.left - slot.left;
-    const rightSpace = slot.right - word.right;
-    const left = clamp(
-      rightSpace >= leftSpace ? word.left : word.right - width,
-      slot.left,
-      slot.right - width
-    );
-    box.left = left;
-    box.originX = clamp((wordCenterX - left) / width, 0, 1);
-    if (side === 'below') {
-      box.top = slot.top;
-      box.originY = 0;
-    } else {
-      box.bottom = viewport.height - slot.bottom;
-      box.originY = 1;
-    }
-  } else {
-    const topSpace = word.top - slot.top;
-    const bottomSpace = slot.bottom - word.bottom;
-    const top = clamp(
-      bottomSpace >= topSpace ? word.top : word.bottom - height,
-      slot.top,
-      slot.bottom - height
-    );
-    box.top = top;
-    box.originY = clamp((wordCenterY - top) / height, 0, 1);
-    // Unlike below/above, `top` floats, so the slot height is not the room left
-    // underneath it. The card can still grow after placement (a late AI answer,
-    // say) and would otherwise run off the bottom of the slot.
-    box.maxHeight = Math.min(box.maxHeight, slot.bottom - top);
-    if (side === 'right') {
-      box.left = slot.left;
-      box.originX = 0;
-    } else {
-      box.right = viewport.width - slot.right;
-      box.originX = 1;
-    }
-  }
-  return box;
+  return layoutBest(best, word, viewport);
 }
 
 /**

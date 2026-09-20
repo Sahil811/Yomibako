@@ -20,7 +20,7 @@ let writeTimer: ReturnType<typeof setTimeout> | null = null;
 // Stable, short id for a volume URI (content:// URIs are long and unstable to slice).
 export function volumeKey(uri: string): string {
   let h = 5381;
-  for (let i = 0; i < uri.length; i++) h = ((h << 5) + h + uri.charCodeAt(i)) | 0;
+  for (let i = 0; i < uri.length; i++) h = Math.trunc((h << 5) + h + (uri.codePointAt(i) ?? 0));
   return (h >>> 0).toString(36);
 }
 
@@ -43,7 +43,7 @@ async function readEntry(uri: string): Promise<Entry | null> {
     const raw = await getItemAsync(ENTRY_PREFIX + key);
     if (raw) entry = JSON.parse(raw) as Entry;
   } catch {}
-  if (!entry) entry = (await readLegacy())[key] ?? null;
+  entry ??= (await readLegacy())[key] ?? null;
   if (!entry || typeof entry.p !== 'number') entry = null;
   entryCache.set(key, entry);
   return entry;

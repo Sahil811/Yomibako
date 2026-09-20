@@ -11,6 +11,16 @@ import { typography } from '../../theme/typography';
 import { Icon } from '../../components/ui/Icon';
 import * as Haptics from 'expo-haptics';
 
+function compareBrowserEntries(a: BrowserEntry, b: BrowserEntry): number {
+  if (a.isDir !== b.isDir) {
+    if (a.isDir) {
+      return -1;
+    }
+    return 1;
+  }
+  return a.name.localeCompare(b.name, undefined, { numeric: true });
+}
+
 export default function BrowseScreen() {
   const scheme = useColorScheme();
   const colors = scheme === 'light' ? lightColors : darkColors;
@@ -51,7 +61,7 @@ export default function BrowseScreen() {
           out.push({ name, uri: full, isDir, size: undefined });
         }
       }
-      out.sort((a, b) => (a.isDir === b.isDir ? a.name.localeCompare(b.name, undefined, { numeric: true }) : a.isDir ? -1 : 1));
+      out.sort(compareBrowserEntries);
       setEntries(out);
     } catch (e) {
       if (loadId.current !== id) return;
@@ -98,7 +108,7 @@ export default function BrowseScreen() {
     setLoading(true);
     setStack(nextStack);
     setPath((p) => p.slice(0, -1));
-    setCurrentUri(nextStack[nextStack.length - 1]);
+    setCurrentUri(nextStack.at(-1)!);
     Haptics.selectionAsync();
   }, [stack]);
 
@@ -128,7 +138,7 @@ export default function BrowseScreen() {
     // list() is sync native and blocks — let any spinner paint first.
     await new Promise((r) => setTimeout(r, 60));
     try {
-      const name = path[path.length - 1] ?? 'Library';
+      const name = path.at(-1) ?? 'Library';
       const s = await scanSeries(currentUri, decodeURIComponent(name));
       if (s.volumes.length === 0) {
         // Don't offer OPEN on empty — tell user to go one level deeper.
@@ -200,7 +210,7 @@ export default function BrowseScreen() {
         </Pressable>
         <View style={{ flex: 1, gap: 2 }}>
           <Text style={[s.title3, { color: colors.onSurface }]} numberOfLines={1}>
-            {path[path.length - 1]}
+            {path.at(-1)}
           </Text>
           <Text style={[s.captionLeft, { color: colors.secondaryLabel }]} numberOfLines={1}>
             {path.join('  ›  ')}  ·  {entries.length}

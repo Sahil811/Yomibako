@@ -1,8 +1,7 @@
-import 'react-native-gesture-handler';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useColorScheme } from 'react-native';
 import AppNavigator from './src/navigation/AppNavigator';
 import JpdbSessionWebView from './src/components/system/JpdbSessionWebView';

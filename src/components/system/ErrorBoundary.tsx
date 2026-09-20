@@ -6,19 +6,19 @@ import React from 'react';
 import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native';
 
 type Props = {
-  children: React.ReactNode;
+  readonly children: React.ReactNode;
   /** Shown above the message, e.g. "Reader". */
-  label?: string;
+  readonly label?: string;
   /** Action label for the recovery button. */
-  resetLabel?: string;
+  readonly resetLabel?: string;
   /** Called after the user asks to retry, to reset any owning state. */
-  onReset?: () => void;
+  readonly onReset?: () => void;
 };
 
-type State = { error: Error | null };
+type State = { readonly error: Error | null };
 
 export default class ErrorBoundary extends React.Component<Props, State> {
-  state: State = { error: null };
+  readonly state: State = { error: null };
 
   static getDerivedStateFromError(error: Error): State {
     return { error };
@@ -28,7 +28,7 @@ export default class ErrorBoundary extends React.Component<Props, State> {
     console.error('[yomibako] uncaught', this.props.label ?? 'app', error, info.componentStack);
   }
 
-  private retry = () => {
+  private readonly retry = () => {
     this.setState({ error: null });
     this.props.onReset?.();
   };

@@ -94,7 +94,7 @@ export function deobfuscate(bytes: Uint8Array): Uint8Array {
 export function sniffExtension(b: Uint8Array): string {
   const at = (i: number) => (i < b.length ? b[i] : -1);
   const ascii = (start: number, text: string) =>
-    text.split('').every((c, i) => at(start + i) === c.charCodeAt(0));
+    text.split('').every((c, i) => at(start + i) === c.codePointAt(0));
   if (ascii(0, 'OggS')) return 'ogg';
   if (ascii(0, 'fLaC')) return 'flac';
   if (ascii(0, 'RIFF')) return 'wav';
@@ -142,6 +142,76 @@ export async function playAudioForHash(hash: string): Promise<boolean> {
   return playAudioForHashRequest(hash, generation);
 }
 
+function writeDecodedAudio(hash: string, ext: string, bytes: Uint8Array): string {
+  const file = cachedFileFor(hash, ext);
+  if (!file.exists) {
+    try {
+      file.create({ intermediates: true, overwrite: true });
+    } catch {}
+  }
+  // Write the raw bytes. The old base64 path relied on a global btoa(),
+  // which React Native does not provide — it silently fell back to writing
+  // the latin-1 binary string *tagged as base64*, producing a junk file.
+  file.write(bytes);
+  const uri = file.uri;
+  audioCache.set(hash, uri);
+  return uri;
+}
+
+async function fetchFreshAudioUri(hash: string, generation: number): Promise<string | null> {
+  const buf = await jpdbApi.fetchAudioBytes({ hash });
+  if (!isCurrentRequest(generation)) return null;
+  if (!buf || buf.byteLength === 0) throw new Error('Empty audio response from JPDB');
+  const bytes = deobfuscate(new Uint8Array(buf));
+  const ext = sniffExtension(bytes);
+  const blocked = unsupportedOnThisPlatform(ext);
+  if (blocked) {
+    lastError = blocked;
+    return null;
+  }
+  return writeDecodedAudio(hash, ext, bytes);
+}
+
+function purgeCachedAudio(hash: string) {
+  audioCache.delete(hash);
+  for (const ext of AUDIO_EXTS) {
+    try { cachedFileFor(hash, ext).delete(); } catch {}
+  }
+}
+
+function monitorPlaybackLoad(player: AudioPlayer, generation: number) {
+  const sub = player.addListener('playbackStatusUpdate', (status) => {
+    if (!isCurrentRequest(generation) || currentPlayer !== player) return;
+    if (status.isLoaded) {
+      lastError = '';
+    }
+    if (status.error) {
+      lastError = status.error;
+      releaseCurrentPlayer('error');
+    } else if (status.didJustFinish) releaseCurrentPlayer('ended');
+  });
+  currentPlayerSubscription = sub;
+  setTimeout(() => {
+    try {
+      if (isCurrentRequest(generation) && currentPlayer === player && !player.isLoaded) {
+        lastError = 'Decoder could not load the recording';
+      }
+    } catch {}
+  }, 4000);
+}
+
+function startCachedPlayback(uri: string, generation: number): boolean {
+  const player = createAudioPlayer(uri);
+  currentPlayer = player;
+  // A source the decoder rejects never reports isLoaded — surface that
+  // instead of leaving the user with silence and a blank diagnostics line.
+  try {
+    monitorPlaybackLoad(player, generation);
+  } catch {}
+  player.play();
+  return true;
+}
+
 async function playAudioForHashRequest(hash: string, generation: number): Promise<boolean> {
   try {
     await ensureAudioDir();
@@ -150,60 +220,13 @@ async function playAudioForHashRequest(hash: string, generation: number): Promis
 
     let uri = audioCache.get(hash);
     if (!uri) {
-      const buf = await jpdbApi.fetchAudioBytes({ hash });
-      if (!isCurrentRequest(generation)) return false;
-      if (!buf || buf.byteLength === 0) throw new Error('Empty audio response from JPDB');
-      const bytes = deobfuscate(new Uint8Array(buf));
-      const ext = sniffExtension(bytes);
-
-      const blocked = unsupportedOnThisPlatform(ext);
-      if (blocked) {
-        lastError = blocked;
-        return false;
-      }
-
-      const file = cachedFileFor(hash, ext);
-      if (!file.exists) {
-        try {
-          file.create({ intermediates: true, overwrite: true });
-        } catch {}
-      }
-      // Write the raw bytes. The old base64 path relied on a global btoa(),
-      // which React Native does not provide — it silently fell back to writing
-      // the latin-1 binary string *tagged as base64*, producing a junk file.
-      file.write(bytes);
-      uri = file.uri;
-      audioCache.set(hash, uri);
+      const fresh = await fetchFreshAudioUri(hash, generation);
+      if (!fresh) return false;
+      uri = fresh;
     }
 
     if (!isCurrentRequest(generation)) return false;
-
-    const player = createAudioPlayer(uri);
-    currentPlayer = player;
-    // A source the decoder rejects never reports isLoaded — surface that
-    // instead of leaving the user with silence and a blank diagnostics line.
-    try {
-      const sub = player.addListener('playbackStatusUpdate', (status) => {
-        if (!isCurrentRequest(generation) || currentPlayer !== player) return;
-        if (status.isLoaded) {
-          lastError = '';
-        }
-        if (status.error) {
-          lastError = status.error;
-          releaseCurrentPlayer('error');
-        } else if (status.didJustFinish) releaseCurrentPlayer('ended');
-      });
-      currentPlayerSubscription = sub;
-      setTimeout(() => {
-        try {
-          if (isCurrentRequest(generation) && currentPlayer === player && !player.isLoaded) {
-            lastError = 'Decoder could not load the recording';
-          }
-        } catch {}
-      }, 4000);
-    } catch {}
-    player.play();
-    return true;
+    return startCachedPlayback(uri, generation);
   } catch (e: any) {
     if (!isCurrentRequest(generation)) return false;
     lastError = String(e?.message ?? e);
@@ -211,10 +234,7 @@ async function playAudioForHashRequest(hash: string, generation: number): Promis
     releaseCurrentPlayer('error');
     // Self-heal: a corrupt cached file would otherwise be reused forever
     // (file.exists short-circuit) → permanent silence with no error.
-    audioCache.delete(hash);
-    for (const ext of AUDIO_EXTS) {
-      try { cachedFileFor(hash, ext).delete(); } catch {}
-    }
+    purgeCachedAudio(hash);
     return false;
   }
 }

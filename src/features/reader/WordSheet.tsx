@@ -15,7 +15,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Animated, { useSharedValue, useAnimatedStyle, withSpring } from 'react-native-reanimated';
 import { Image } from 'expo-image';
 import { darkColors, lightColors } from '../../theme/colors';
-import { typography } from '../../theme/typography';
 import { Icon } from '../../components/ui/Icon';
 import { Markdown } from '../../components/ui/Markdown';
 import { jpdbApi, geminiApi } from '../../services/jpdb/api';
@@ -23,27 +22,54 @@ import { loadKanjiDetails, type KanjiDetail } from '../../services/jpdb/kanjiDat
 import { loadConfig } from '../../services/jpdb/config';
 import { lastAudioError, playAudioForWord, playRemoteAudio, stopAudio } from '../../services/jpdb/audio';
 import { fetchImmersionExamples, immersionText, type ImmersionExample } from '../../services/jpdb/immersionKit';
-import { getSentences, PARTS_OF_SPEECH, groupMeanings, parsePitch } from '../../services/jpdb/word';
+import { getSentences, PARTS_OF_SPEECH } from '../../services/jpdb/word';
 import { placePopup, type Rect, type Side } from './popupPlacement';
 import { resolvePopupPalette, type PopupPalette } from '../../theme/popupThemes';
 import * as Haptics from 'expo-haptics';
+import {
+  applyFetchedExamples,
+  buildGeminiPrompt,
+  canStartPlayAll,
+  isAnyExamplePlaying,
+  isPlayAllCancelled,
+  meaningsToggleLabel,
+  mineButtonBg,
+  mineButtonContent,
+  mineButtonFg,
+  nextExampleIndex,
+  playPauseA11y,
+  playPauseLabel,
+  quickActionBg,
+  reviewColor,
+  reviewLabel,
+  safeGroupMeanings,
+  safeParsePitch,
+  shiftPoint,
+  shouldAutoFetchExamples,
+  stateColors,
+  trimGlossGroups,
+  type GroupedMeanings,
+  type SheetColors,
+} from './wordSheetHelpers';
 
 type Props = {
-  word: any;
-  onClose: () => void;
+  readonly word: any;
+  readonly onClose: () => void;
   /** Reader chrome is always dark; the browser follows the system theme. */
-  forceDark?: boolean;
+  readonly forceDark?: boolean;
   /** Push a new card state back into the page so the word repaints in place. */
-  onStateChange?: (vid: number, sid: number, state: string[]) => void;
+  readonly onStateChange?: (vid: number, sid: number, state: string[]) => void;
   /** Native frame containing the WebView; browser word rects are local to it. */
-  anchorFrame?: { x: number; y: number; width: number; height: number };
+  readonly anchorFrame?: { x: number; y: number; width: number; height: number };
   /**
    * Settings preview. Renders the real card with the supplied config inside a
    * fixed box, with every effect and gesture disabled. Using the real component
    * is the point -- a hand-built mock would drift from what it previews.
    */
-  preview?: { cfg: any; box: { width: number; maxHeight: number } };
+  readonly preview?: { cfg: any; box: { width: number; maxHeight: number } };
 };
+
+type FlagName = 'blacklist' | 'never-forget';
 
 // Proportions ported from jpd-breader content/popup.css, which sizes everything
 // in em off a 13px base (`font-size: clamp(13px, 0.85vw, 16px)`), card
@@ -57,91 +83,98 @@ const POPUP_W = 380;
 const ESTIMATED_H = { collapsed: 380, expanded: 520 };
 const em = (n: number) => Math.round(BASE * n * 10) / 10;
 
-// State badge fills mirror jpd-breader content/popup.css `.state span`.
-function stateColors(st: string, isDark: boolean): { bg: string; fg: string } {
-  switch (st) {
-    case 'new':
-    case 'not-in-deck':
-      return isDark ? { bg: '#1c2f6b', fg: '#8ab4f8' } : { bg: '#e8f0fe', fg: '#1967d2' };
-    case 'learning':
-      return isDark ? { bg: '#0e3724', fg: '#81c995' } : { bg: '#e6f4ea', fg: '#137333' };
-    case 'known':
-      return isDark ? { bg: '#0d3b1e', fg: '#5bb974' } : { bg: '#ceead6', fg: '#0d652d' };
-    case 'due':
-    case 'failed':
-      return isDark ? { bg: '#4a0c0a', fg: '#f28b82' } : { bg: '#fce8e6', fg: '#c5221f' };
-    case 'never-forget':
-      return isDark ? { bg: '#370d4f', fg: '#d7aefb' } : { bg: '#f3e8fd', fg: '#7b1fa2' };
-    default:
-      return isDark ? { bg: '#3c4043', fg: '#9aa0a6' } : { bg: '#f1f3f4', fg: '#5f6368' };
+function MeaningsSection(props: {
+  readonly grouped: GroupedMeanings;
+  readonly visibleGroups: GroupedMeanings;
+  readonly hiddenGlossCount: number;
+  readonly showAllMeanings: boolean;
+  readonly onShowDetails: () => void;
+  readonly onToggleMeanings: () => void;
+  readonly colors: SheetColors;
+}): React.ReactElement | null {
+  const { grouped, visibleGroups, hiddenGlossCount, showAllMeanings, colors, onShowDetails, onToggleMeanings } = props;
+  if (!grouped.length) {
+    return (
+      <View style={{ alignItems: 'center', paddingVertical: 12 }}>
+        <Text style={[s.footnote, { color: colors.secondaryLabel }]}>No glosses yet</Text>
+      </View>
+    );
   }
-}
-
-// Review pills mirror popup.css solid traffic-light fills.
-function reviewColor(r: string, primary: string, isDark: boolean): string {
-  switch (r) {
-    case 'nothing': return isDark ? '#a50e0e' : '#c62828';
-    case 'something': return isDark ? '#b23c00' : '#d84315';
-    case 'hard': return isDark ? '#c85f00' : '#e65100';
-    case 'good': return isDark ? '#1a6b2d' : '#2e7d32';
-    case 'easy': return isDark ? '#1a4e9e' : primary;
-    default: return primary;
-  }
-}
-
-export default function WordSheet({ word, onClose, forceDark, onStateChange, anchorFrame, preview }: Props) {
-  const scheme = useColorScheme();
-  const [loadedCfg, setLoadedCfg] = useState<any>(null);
-  // In preview mode the config is driven from outside, so read it straight off
-  // the prop -- state would lag a frame behind every Settings change.
-  const cfg = preview ? preview.cfg : loadedCfg;
-  // `auto` keeps the pre-theme behaviour: reader forces dark, browser follows
-  // the system. Any named theme is an explicit opt-in.
-  const palette: PopupPalette = useMemo(
-    () => resolvePopupPalette(cfg?.popupTheme, forceDark || scheme === 'dark'),
-    [cfg?.popupTheme, forceDark, scheme]
+  return (
+    <View style={s.section}>
+      {visibleGroups.map((g, idx) => (
+        <View key={`meaning-${g.startIndex}-${g.partOfSpeech.join('|')}-${idx}`} style={{ marginTop: idx === 0 ? 6 : 4 }}>
+          <Text style={[s.posText, { color: colors.secondaryLabel }]}>
+            {(g.partOfSpeech.map((p) => PARTS_OF_SPEECH[p] ?? p).filter(Boolean).join(', ') || '—')}
+          </Text>
+          <View style={{ gap: 2, marginTop: 2 }}>
+            {g.glosses.map((gl, i) => (
+              <View key={`gloss-${g.startIndex}-${i}-${gl.join('; ').slice(0, 32)}`} style={{ flexDirection: 'row', gap: 7 }}>
+                <Text style={[s.glossIndex, { color: colors.tertiaryLabel }]}>{g.startIndex + i + 1}.</Text>
+                <Text style={[s.gloss, { color: colors.onSurface }]}>{gl.join('; ')}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+      ))}
+      {hiddenGlossCount > 0 ? (
+        <Pressable
+          onPress={() => {
+            Haptics.selectionAsync();
+            onShowDetails();
+            onToggleMeanings();
+          }}
+          style={({ pressed }) => [s.moreBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]}
+          hitSlop={6}
+        >
+          <Text style={[s.moreText, { color: colors.primary }]}>
+            {meaningsToggleLabel(showAllMeanings, hiddenGlossCount)}
+          </Text>
+        </Pressable>
+      ) : null}
+    </View>
   );
-  const isDark = palette.isDark;
-  const colors = useMemo(() => {
-    const { isDark: _drop, ...tokens } = palette;
-    return { ...(isDark ? darkColors : lightColors), ...tokens };
-  }, [isDark, palette]);
-  const insets = useSafeAreaInsets();
+}
 
-  const [adding, setAdding] = useState(false);
-  const [done, setDone] = useState(false);
-  const [playing, setPlaying] = useState(false);
-  const [flagLoading, setFlagLoading] = useState<string | null>(null);
-  const [localState, setLocalState] = useState<string[]>(word.state ?? []);
-  const [sentence, setSentence] = useState('');
-  const [translation, setTranslation] = useState('');
-  const [forq, setForq] = useState(true);
-  const [reviewLoading, setReviewLoading] = useState<string | null>(null);
-  const [kanjiDetails, setKanjiDetails] = useState<KanjiDetail[] | null>(null);
-  const [kanjiLoading, setKanjiLoading] = useState(false);
-  const [ikExamples, setIkExamples] = useState<ImmersionExample[] | null>(null);
-  const [ikLoading, setIkLoading] = useState(false);
-  const [ikPlaying, setIkPlaying] = useState(false);
-  const [ikLooping, setIkLooping] = useState(false);
-  const [ikPlayingAll, setIkPlayingAll] = useState(false);
-  const [ikIndex, setIkIndex] = useState(0);
-  const [ikError, setIkError] = useState<string | null>(null);
-  const [showExamples, setShowExamples] = useState(false);
-  const [geminiText, setGeminiText] = useState<string | null>(null);
-  const [geminiError, setGeminiError] = useState<string | null>(null);
-  const [geminiLoading, setGeminiLoading] = useState(false);
-  const [showKanjiPanel, setShowKanjiPanel] = useState<string | null>(null);
-  const [showMnemonic, setShowMnemonic] = useState(false);
-  const [showSentence, setShowSentence] = useState(false);
-  const [showAllMeanings, setShowAllMeanings] = useState(false);
-  const [showDetails, setShowDetails] = useState(false);
-  const ikRequest = useRef(0);
-  const ikPlaybackRun = useRef(0);
-  const pronunciationRun = useRef(0);
-  const pronunciationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+type ReviewRating = 'nothing' | 'something' | 'hard' | 'good' | 'easy';
 
-  const { vid, sid, spelling, reading, meanings, frequencyRank, pitchAccent = [] } = word;
+function ReviewSection(props: {
+  readonly showDetails: boolean;
+  readonly showReviewButtons: boolean | undefined;
+  readonly reviewLoading: string | null;
+  readonly onReview: (rating: ReviewRating) => void;
+  readonly colors: SheetColors;
+  readonly primary: string;
+  readonly isDark: boolean;
+}): React.ReactElement | null {
+  const { showDetails, showReviewButtons, reviewLoading, onReview, colors, primary, isDark } = props;
+  if (!showDetails || showReviewButtons !== true) {
+    return null;
+  }
+  return (
+    <View style={[s.reviewRow, { borderBottomColor: colors.separator }]}>
+      {(['nothing', 'something', 'hard', 'good', 'easy'] as const).map((r) => (
+        <Pressable key={r} onPress={() => onReview(r)} style={({ pressed }) => [s.reviewBtn, { backgroundColor: reviewColor(r, primary, isDark), opacity: pressed ? 0.8 : 1 }]}>
+          {(() => {
+            if (reviewLoading === r) {
+              return <ActivityIndicator size="small" color="#fff" />;
+            }
+            return <Text style={s.reviewText}>{reviewLabel(r)}</Text>;
+          })()}
+        </Pressable>
+      ))}
+    </View>
+  );
+}
 
+function usePlacementController(
+  word: any,
+  preview: Props['preview'],
+  anchorFrame: Props['anchorFrame'],
+  showDetails: boolean,
+  showExamples: boolean,
+  insets: { top: number; right: number; bottom: number; left: number },
+) {
   // Placement is pure geometry and lives in popupPlacement.ts so it can be
   // exercised headlessly -- see npm run test:placement. The short version: the
   // popup avoids the whole speech bubble (not just the glyph) and the patch of
@@ -161,13 +194,18 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
   const stickyRef = useRef<{ key: string; side: Side } | null>(null);
   const anchorKey = useMemo(() => {
     const r = word.rect;
-    return r ? `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}` : 'none';
+    if (!r) {
+      return 'none';
+    }
+    return `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.w)},${Math.round(r.h)}`;
   }, [word.rect]);
 
   const onSheetLayout = useCallback(
     (event: { nativeEvent: { layout: { height: number } } }) => {
       const h = Math.round(event.nativeEvent.layout.height);
-      if (!h) return;
+      if (!h) {
+        return;
+      }
       // First measurement per state only. Re-placing on every content change
       // would both loop (height feeds maxHeight feeds height) and twitch the
       // card while it is being read.
@@ -177,10 +215,7 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
     [measureKey]
   );
 
-  const cap = Math.min(
-    Math.round(winH * (popupExpanded ? 0.68 : 0.56)),
-    popupExpanded ? 560 : 440
-  );
+  const cap = computeCap(winH, popupExpanded);
   const desiredH = Math.min(heights[measureKey] ?? ESTIMATED_H[measureKey], cap);
   // One width for both states, so opening Details grows the card downward
   // instead of also shunting it sideways. The rule is jpd-breader's own
@@ -202,7 +237,7 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
     // page the reader only sees the visual viewport, so shift into it first.
     const visual = word.visual;
     const shift = <T extends { x: number; y: number }>(p: T | null | undefined): T | null =>
-      !p ? null : visual ? { ...p, x: p.x - visual.offsetLeft, y: p.y - visual.offsetTop } : p;
+      shiftPoint(p, visual);
     const rects: Rect[] | null = Array.isArray(word.rects)
       ? (word.rects.map(shift).filter(Boolean) as Rect[])
       : null;
@@ -230,9 +265,47 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
   const boxH = Math.min(desiredH, placement.maxHeight);
 
   const enter = useSharedValue(0);
-  const onCloseRef = useRef(onClose);
-  onCloseRef.current = onClose;
-  const dismiss = useCallback(() => {
+
+  // Grows out of the edge facing the word rather than out of its own centre,
+  // so the card visibly belongs to the thing that was tapped. Scaling about an
+  // arbitrary origin is a centre scale plus a translation of origin * (1 - s).
+  const animatedSheetStyle = useAnimatedStyle(() => {
+    const scale = 0.92 + enter.value * 0.08;
+    const rest = 1 - scale;
+    return {
+      opacity: enter.value,
+      transform: [
+        { translateX: (originX - 0.5) * boxW * rest },
+        { translateY: (originY - 0.5) * boxH * rest },
+        { scale },
+      ],
+    };
+  }, [originX, originY, boxW, boxH]);
+
+  return {
+    winW, winH, popupExpanded, measureKey,
+    heights, revealed, setRevealed,
+    anchorKey, onSheetLayout, cap, desiredH, desiredW,
+    placement, originX, originY, boxW, boxH,
+    enter, animatedSheetStyle,
+  };
+}
+
+function computeCap(winH: number, popupExpanded: boolean): number {
+  if (popupExpanded) {
+    return Math.min(Math.round(winH * 0.68), 560);
+  }
+  return Math.min(Math.round(winH * 0.56), 440);
+}
+
+function buildDismiss(
+  pronunciationRun: React.RefObject<number>,
+  pronunciationTimer: React.RefObject<ReturnType<typeof setTimeout> | null>,
+  ikRequest: React.RefObject<number>,
+  ikPlaybackRun: React.RefObject<number>,
+  onCloseRef: React.RefObject<() => void>,
+): () => void {
+  return () => {
     pronunciationRun.current++;
     if (pronunciationTimer.current) {
       clearTimeout(pronunciationTimer.current);
@@ -242,7 +315,1029 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
     ikPlaybackRun.current++;
     stopAudio();
     onCloseRef.current();
+  };
+}
+
+function ImmersionLoading({ accent, labelColor }: { readonly accent: string; readonly labelColor: string }) {
+  return (
+    <View style={s.exampleLoading}>
+      <ActivityIndicator size="small" color={accent} />
+      <Text style={[s.footnote, { color: labelColor }]}>Finding natural examples…</Text>
+    </View>
+  );
+}
+
+function ImmersionError({
+  message,
+  colors,
+  onRetry,
+}: {
+  readonly message: string;
+  readonly colors: any;
+  readonly onRetry: () => void;
+}) {
+  return (
+    <View style={s.exampleLoading}>
+      <Text style={[s.footnote, { color: colors.secondaryLabel, flex: 1 }]}>{message}</Text>
+      <Pressable onPress={onRetry} style={({ pressed }) => [s.exampleRetry, { backgroundColor: pressed ? colors.tertiarySystemFill : colors.secondarySystemFill }]}>
+        <Text style={[s.quickActionText, { color: colors.primary }]}>Retry</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function ExampleImage({
+  example,
+  playing,
+  onTogglePlay,
+}: {
+  readonly example: ImmersionExample;
+  readonly playing: boolean;
+  readonly onTogglePlay: () => void;
+}) {
+  if (!example.imageUrl) {
+    return null;
+  }
+  return (
+    <Pressable onPress={onTogglePlay} style={s.exampleImageWrap} accessibilityLabel={playing ? 'Stop example audio' : 'Play example audio'}>
+      <Image source={{ uri: example.imageUrl }} style={StyleSheet.absoluteFill as any} contentFit="cover" transition={180} cachePolicy="memory-disk" />
+      {example.soundUrl ? (
+        <View style={s.examplePlayOverlay}>
+          <Icon name={playing ? 'pause' : 'audio'} size={17} color="#fff" strokeWidth={2.2} />
+        </View>
+      ) : null}
+    </Pressable>
+  );
+}
+
+function ExampleCopy({
+  example,
+  playing,
+  colors,
+  onTogglePlay,
+}: {
+  readonly example: ImmersionExample;
+  readonly playing: boolean;
+  readonly colors: any;
+  readonly onTogglePlay: () => void;
+}) {
+  return (
+    <View style={s.exampleCopy}>
+      <View style={{ flexDirection: 'row', gap: 8, alignItems: 'flex-start' }}>
+        <Text style={[s.exampleSentence, { color: colors.onSurface }]}>{immersionText(example.sentence) || '—'}</Text>
+        {!example.imageUrl && example.soundUrl ? (
+          <Pressable onPress={onTogglePlay} style={({ pressed }) => [s.exampleAudioBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : colors.secondarySystemFill }]} accessibilityLabel={playing ? 'Stop example audio' : 'Play example audio'}>
+            <Icon name={playing ? 'pause' : 'audio'} size={16} color={colors.primary} strokeWidth={2.2} />
+          </Pressable>
+        ) : null}
+      </View>
+      {example.translation ? <Text style={[s.exampleTranslation, { color: colors.secondaryLabel }]}>{immersionText(example.translation)}</Text> : null}
+    </View>
+  );
+}
+
+function ImmersionBody({
+  loading,
+  error,
+  example,
+  playing,
+  colors,
+  accent,
+  onRetry,
+  onTogglePlay,
+}: {
+  readonly loading: boolean;
+  readonly error: string | null;
+  readonly example: ImmersionExample | undefined;
+  readonly playing: boolean;
+  readonly colors: any;
+  readonly accent: string;
+  readonly onRetry: () => void;
+  readonly onTogglePlay: () => void;
+}) {
+  if (loading) {
+    return <ImmersionLoading accent={accent} labelColor={colors.secondaryLabel} />;
+  }
+  if (error) {
+    return <ImmersionError message={error} colors={colors} onRetry={onRetry} />;
+  }
+  if (!example) {
+    return null;
+  }
+  return (
+    <>
+      <ExampleImage example={example} playing={playing} onTogglePlay={onTogglePlay} />
+      <ExampleCopy example={example} playing={playing} colors={colors} onTogglePlay={onTogglePlay} />
+    </>
+  );
+}
+
+async function awaitExampleAudio(soundUrl: string): Promise<'ended' | 'stopped' | 'error'> {
+  return new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
+    void playRemoteAudio(soundUrl, { onFinished: resolve }).then((ok) => {
+      if (!ok) resolve('error');
+    });
+  });
+}
+
+async function runPlayAllSequence(
+  examples: ImmersionExample[],
+  startIndex: number,
+  run: number,
+  ctx: {
+    runRef: { current: number };
+    setIkIndex: (i: number) => void;
+    setIkPlaying: (b: boolean) => void;
+    setIkPlayingAll: (b: boolean) => void;
+  },
+): Promise<void> {
+  for (let index = startIndex; index < examples.length; index++) {
+    if (isPlayAllCancelled(ctx.runRef, run)) return;
+    ctx.setIkIndex(index);
+    const example = examples[index];
+    ctx.setIkPlaying(!!example.soundUrl);
+    if (example.soundUrl) {
+      const reason = await awaitExampleAudio(example.soundUrl);
+      if (isPlayAllCancelled(ctx.runRef, run) || reason !== 'ended') return;
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      if (isPlayAllCancelled(ctx.runRef, run)) return;
+    }
+    ctx.setIkPlaying(false);
+    if (index < examples.length - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    }
+  }
+  if (!isPlayAllCancelled(ctx.runRef, run)) {
+    ctx.setIkPlaying(false);
+    ctx.setIkPlayingAll(false);
+    ctx.setIkIndex(0);
+  }
+}
+
+async function startExampleAudio(
+  target: ImmersionExample,
+  loop: boolean,
+  run: number,
+  runRef: { current: number },
+  setters: {
+    setPlaying: (b: boolean) => void;
+    setLooping: (b: boolean) => void;
+    setPlayingAll: (b: boolean) => void;
+  },
+): Promise<boolean> {
+  const ok = await playRemoteAudio(target.soundUrl as string, {
+    loop,
+    onFinished: (reason) => {
+      if (runRef.current !== run) return;
+      setters.setPlaying(false);
+      setters.setLooping(false);
+      if (reason === 'error') Alert.alert('Example audio unavailable', lastAudioError());
+    },
+  });
+  if (!ok && runRef.current === run) {
+    setters.setPlaying(false);
+    setters.setLooping(false);
+  }
+  return ok;
+}
+
+function useImmersionController(
+  spelling: string,
+  cancelAutomaticPronunciation: () => void,
+) {
+  const [ikExamples, setIkExamples] = useState<ImmersionExample[] | null>(null);
+  const [ikLoading, setIkLoading] = useState(false);
+  const [ikPlaying, setIkPlaying] = useState(false);
+  const [ikLooping, setIkLooping] = useState(false);
+  const [ikPlayingAll, setIkPlayingAll] = useState(false);
+  const [ikIndex, setIkIndex] = useState(0);
+  const [ikError, setIkError] = useState<string | null>(null);
+  const [showExamples, setShowExamples] = useState(false);
+  const ikRequest = useRef(0);
+  const ikPlaybackRun = useRef(0);
+
+  const stopExamplePlayback = useCallback(() => {
+    ikPlaybackRun.current++;
+    stopAudio();
+    setIkPlaying(false);
+    setIkLooping(false);
+    setIkPlayingAll(false);
   }, []);
+
+  const playExample = useCallback(async (example?: ImmersionExample, loop = false) => {
+    const target = example ?? ikExamples?.[ikIndex];
+    if (!target?.soundUrl) {
+      Alert.alert('No example audio', 'This ImmersionKit example only contains text.');
+      return;
+    }
+    cancelAutomaticPronunciation();
+    const run = ++ikPlaybackRun.current;
+    stopAudio();
+    setIkPlaying(true);
+    setIkLooping(loop);
+    setIkPlayingAll(false);
+    Haptics.selectionAsync();
+    await startExampleAudio(target, loop, run, ikPlaybackRun, {
+      setPlaying: setIkPlaying,
+      setLooping: setIkLooping,
+      setPlayingAll: setIkPlayingAll,
+    });
+  }, [ikExamples, ikIndex, cancelAutomaticPronunciation]);
+
+  const fetchImmersion = useCallback(async (w: string, autoplay = true) => {
+    const request = ++ikRequest.current;
+    setShowExamples(true);
+    setIkLoading(true);
+    setIkError(null);
+    try {
+      const examples = await fetchImmersionExamples(w);
+      if (request !== ikRequest.current) return;
+      applyFetchedExamples(examples, autoplay, {
+        setExamples: setIkExamples,
+        setIndex: setIkIndex,
+        setError: setIkError,
+      }, (first) => { void playExample(first); });
+    } catch (error: any) {
+      if (request !== ikRequest.current) return;
+      setIkExamples([]);
+      setIkError(error?.message ? String(error.message) : 'ImmersionKit is unavailable.');
+    } finally {
+      if (request === ikRequest.current) setIkLoading(false);
+    }
+  }, [playExample]);
+
+  const toggleExamples = useCallback(() => {
+    Haptics.selectionAsync();
+    if (showExamples) {
+      setShowExamples(false);
+      stopExamplePlayback();
+      return;
+    }
+    setShowExamples(true);
+    if (shouldAutoFetchExamples(ikExamples, ikLoading)) void fetchImmersion(spelling);
+  }, [showExamples, ikExamples, ikLoading, fetchImmersion, spelling, stopExamplePlayback]);
+
+  const moveExample = useCallback((delta: number) => {
+    if (!ikExamples?.length) return;
+    stopExamplePlayback();
+    const next = nextExampleIndex(ikIndex, delta, ikExamples.length);
+    setIkIndex(next);
+    Haptics.selectionAsync();
+    if (ikExamples[next].soundUrl) void playExample(ikExamples[next]);
+  }, [ikExamples, ikIndex, playExample, stopExamplePlayback]);
+
+  const toggleExamplePlay = useCallback(() => {
+    if (isAnyExamplePlaying(ikPlaying, ikLooping, ikPlayingAll)) {
+      stopExamplePlayback();
+      return;
+    }
+    void playExample();
+  }, [ikPlaying, ikLooping, ikPlayingAll, playExample, stopExamplePlayback]);
+
+  const toggleExampleLoop = useCallback(() => {
+    if (ikLooping) {
+      stopExamplePlayback();
+      return;
+    }
+    void playExample(undefined, true);
+  }, [ikLooping, playExample, stopExamplePlayback]);
+
+  const togglePlayAll = useCallback(async () => {
+    if (!canStartPlayAll(ikPlayingAll, ikExamples)) {
+      if (ikPlayingAll) {
+        stopExamplePlayback();
+      }
+      return;
+    }
+    cancelAutomaticPronunciation();
+    const run = ++ikPlaybackRun.current;
+    stopAudio();
+    setIkLooping(false);
+    setIkPlayingAll(true);
+    Haptics.selectionAsync();
+    await runPlayAllSequence(ikExamples, ikIndex, run, {
+      runRef: ikPlaybackRun,
+      setIkIndex,
+      setIkPlaying,
+      setIkPlayingAll,
+    });
+  }, [ikPlayingAll, ikExamples, ikIndex, cancelAutomaticPronunciation, stopExamplePlayback]);
+
+  return {
+    ikExamples, setIkExamples, ikLoading, ikPlaying, ikLooping, ikPlayingAll,
+    ikIndex, setIkIndex, ikError, showExamples, setShowExamples,
+    ikRequest, ikPlaybackRun,
+    stopExamplePlayback, playExample, fetchImmersion,
+    toggleExamples, moveExample, toggleExamplePlay, toggleExampleLoop, togglePlayAll,
+  };
+}
+
+function useWordActions(args: {
+  vid: number;
+  sid: number;
+  spelling: string;
+  reading: string;
+  meanings: any[];
+  pitchAccent: string[];
+  sentence: string;
+  translation: string;
+  forq: boolean;
+  cfg: any;
+  pushState: (st: string[]) => void;
+  dismiss: () => void;
+  setPlaying: (b: boolean) => void;
+  pronunciationRun: { current: number };
+  setShowDetails: (b: boolean) => void;
+}) {
+  const [adding, setAdding] = useState(false);
+  const [done, setDone] = useState(false);
+  const [flagLoading, setFlagLoading] = useState<string | null>(null);
+  const [reviewLoading, setReviewLoading] = useState<string | null>(null);
+  const [geminiText, setGeminiText] = useState<string | null>(null);
+  const [geminiError, setGeminiError] = useState<string | null>(null);
+  const [geminiLoading, setGeminiLoading] = useState(false);
+  const lastAudioAlert = useRef(0);
+
+  const explainWithGemini = useCallback(async () => {
+    if (geminiLoading) return;
+    if (!args.cfg?.geminiApiKey) {
+      Alert.alert('AI Explain', 'Add your Gemini API key in Settings → JPDB to use AI explanations.');
+      return;
+    }
+    Haptics.selectionAsync();
+    args.setShowDetails(true);
+    setGeminiError(null);
+    setGeminiText(null);
+    setGeminiLoading(true);
+    try {
+      const prompt = buildGeminiPrompt(args.spelling, args.reading, args.meanings, args.pitchAccent, args.sentence);
+      const text = await geminiApi.explainWord({ apiKey: args.cfg.geminiApiKey, prompt });
+      const trimmed = text?.trim();
+      if (trimmed) {
+        setGeminiText(trimmed);
+      } else {
+        setGeminiError('The AI returned an empty response. Please try again.');
+      }
+    } catch (e: any) {
+      console.warn('[wordsheet] gemini explain failed', e);
+      setGeminiError(String(e?.message ?? e));
+    } finally {
+      setGeminiLoading(false);
+    }
+  }, [geminiLoading, args]);
+
+  const mine = useCallback(async (rating?: ReviewRating) => {
+    setAdding(true);
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    try {
+      const token = args.cfg?.apiToken;
+      if (!token) throw new Error('Missing JPDB token — open Settings');
+      await jpdbApi.mine({ vid: args.vid, sid: args.sid, apiToken: token, sentence: args.sentence || undefined, translation: args.translation || undefined, forq: args.forq, reviewRating: rating });
+      setDone(true);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      const st = await jpdbApi.getCardState({ vid: args.vid, sid: args.sid, apiToken: token });
+      args.pushState(st);
+      if (!rating) setTimeout(args.dismiss, 650);
+    } catch (e: any) {
+      Alert.alert('Mine failed', String(e.message));
+    }
+    setAdding(false);
+  }, [args]);
+
+  const toggleFlag = useCallback(async (flag: FlagName, localState: string[]) => {
+    setFlagLoading(flag);
+    try {
+      const token = args.cfg?.apiToken;
+      if (!token) throw new Error('No token');
+      const stateKey = flag === 'blacklist' ? 'blacklisted' : 'never-forget';
+      const currently = localState.includes(stateKey);
+      await jpdbApi.setFlag({ vid: args.vid, sid: args.sid, flag, state: !currently, apiToken: token });
+      const st = await jpdbApi.getCardState({ vid: args.vid, sid: args.sid, apiToken: token });
+      args.pushState(st);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (e: any) {
+      console.warn(`[wordsheet] flag ${flag} failed`, e);
+      Alert.alert('Flag failed', String(e?.message ?? e));
+    }
+    setFlagLoading(null);
+  }, [args]);
+
+  const review = useCallback(async (rating: ReviewRating) => {
+    setReviewLoading(rating);
+    try {
+      await jpdbApi.review({ vid: args.vid, sid: args.sid, rating });
+      const token = args.cfg?.apiToken;
+      if (token) {
+        const st = await jpdbApi.getCardState({ vid: args.vid, sid: args.sid, apiToken: token });
+        args.pushState(st);
+      }
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch (e: any) {
+      Alert.alert('Review failed', String(e.message));
+    }
+    setReviewLoading(null);
+  }, [args]);
+
+  const play = useCallback(async () => {
+    args.setPlaying(true);
+    Haptics.selectionAsync();
+    const run = ++args.pronunciationRun.current;
+    const ok = await playAudioForWord(args.vid, args.spelling);
+    if (args.pronunciationRun.current === run) args.setPlaying(false);
+    if (!ok) {
+      const reason = lastAudioError();
+      const noisy = reason && reason !== 'No JPDB recording for this word';
+      if (args.pronunciationRun.current === run && noisy && Date.now() - lastAudioAlert.current > 10000) {
+        lastAudioAlert.current = Date.now();
+        Alert.alert('Audio unavailable', reason);
+      }
+    }
+  }, [args]);
+
+  return {
+    adding, done, flagLoading, reviewLoading,
+    geminiText, setGeminiText, geminiError, setGeminiError, geminiLoading,
+    explainWithGemini, mine, toggleFlag, review, play,
+  };
+}
+
+function WordHeader(props: {
+  readonly spelling: string;
+  readonly reading: string;
+  readonly frequencyRank: number | null | undefined;
+  readonly pitchSegments: { text: string; isHigh: boolean; isFinal: boolean }[] | null;
+  readonly playing: boolean;
+  readonly localState: string[];
+  readonly isDark: boolean;
+  readonly colors: SheetColors;
+  readonly onPlay: () => void;
+  readonly onDismiss: () => void;
+}): React.ReactElement {
+  const { spelling, reading, frequencyRank, pitchSegments, playing, localState, isDark, colors, onPlay, onDismiss } = props;
+  return (
+    <View style={s.header}>
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={[s.spelling, { color: colors.onSurface }]} numberOfLines={2}>{spelling}</Text>
+        <View style={s.metaRow}>
+          {frequencyRank ? (
+            <View style={[s.freqPill, { backgroundColor: isDark ? '#1c2f6b' : '#e8f0fe' }]}>
+              <Text style={[s.freqText, { color: colors.primary }]}>Top {frequencyRank}</Text>
+            </View>
+          ) : null}
+          {(() => {
+            if (pitchSegments) {
+              return (
+                <View style={{ flexDirection: 'row' }}>
+                  {pitchSegments.map((seg, i) => (
+                    <Text key={`${seg.text}-${seg.isHigh ? 'high' : 'low'}-${seg.isFinal ? 'final' : 'mid'}-${i}`} style={{ color: colors.secondaryLabel, fontWeight: '600', borderStyle: 'solid', borderColor: seg.isHigh ? colors.primary : '#d93025', borderTopWidth: seg.isHigh ? 1.6 : 0, borderBottomWidth: seg.isHigh ? 0 : 1.6, paddingHorizontal: 1.5, fontSize: em(0.95) }}>
+                      {seg.text}
+                    </Text>
+                  ))}
+                </View>
+              );
+            }
+            if (reading && reading !== spelling) {
+              return (
+                <Text style={[s.metaText, { color: colors.secondaryLabel }]} numberOfLines={1}>{reading}</Text>
+              );
+            }
+            return null;
+          })()}
+        </View>
+      </View>
+
+      <View style={{ alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
+        {/* Only the two actions worth reaching for mid-sentence stay
+            up here; AI and blacklist live in the actions row so the
+            word itself is not squeezed into two lines. */}
+        <View style={{ flexDirection: 'row', gap: 4 }}>
+          <Pressable onPress={onPlay} hitSlop={8} style={({ pressed }) => [s.iconBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]} accessibilityLabel="Play audio">
+            {playing ? <ActivityIndicator size="small" color={colors.secondaryLabel} /> : <Icon name="audio" size={17} color={colors.secondaryLabel} strokeWidth={2} />}
+          </Pressable>
+          <Pressable onPress={onDismiss} hitSlop={10} style={({ pressed }) => [s.iconBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]} accessibilityLabel="Close lookup">
+            <Icon name="close" size={15} color={colors.secondaryLabel} strokeWidth={2.2} />
+          </Pressable>
+        </View>
+        <View style={{ flexDirection: 'row', gap: 3, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          {(localState.length ? localState : ['not-in-deck']).map((st) => {
+            const c = stateColors(st, isDark);
+            return (
+              <View key={st} style={[s.statePill, { backgroundColor: c.bg }]}>
+                <Text style={[s.statePillText, { color: c.fg }]}>{st}</Text>
+              </View>
+            );
+          })}
+        </View>
+      </View>
+    </View>
+  );
+}
+
+function KanjiSection(props: {
+  readonly cfg: any;
+  readonly kanjiDetails: KanjiDetail[] | null;
+  readonly kanjiLoading: boolean;
+  readonly showKanjiPanel: string | null;
+  readonly showMnemonic: boolean;
+  readonly colors: SheetColors;
+  readonly onToggleKanji: (next: string | null) => void;
+  readonly onToggleMnemonic: () => void;
+}): React.ReactElement | null {
+  const { cfg, kanjiDetails, kanjiLoading, showKanjiPanel, showMnemonic, colors, onToggleKanji, onToggleMnemonic } = props;
+  if (cfg?.showKanji === false || (!kanjiDetails && !kanjiLoading)) {
+    return null;
+  }
+  return (
+    <View style={s.kanjiWrap}>
+      {kanjiDetails && kanjiDetails.length > 3 ? (
+        <View style={s.kanjiHeader}>
+          <Text style={[s.posText, { color: colors.secondaryLabel }]}>Kanji</Text>
+          <View style={[s.countBadge, { backgroundColor: colors.systemFill }]}>
+            <Text style={[s.countText, { color: colors.primary }]}>{kanjiDetails.length}</Text>
+          </View>
+        </View>
+      ) : null}
+      {(() => {
+        if (kanjiLoading && !kanjiDetails?.length) {
+          return (
+            <ActivityIndicator size="small" color={colors.secondaryLabel} style={{ alignSelf: 'flex-start' }} />
+          );
+        }
+        if (kanjiDetails?.length) {
+          return (
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
+              {kanjiDetails.map((d) => {
+                const active = showKanjiPanel === d.kanji;
+                return (
+                  <Pressable
+                    key={d.kanji}
+                    onPress={() => {
+                      Haptics.selectionAsync();
+                      onToggleKanji(active ? null : d.kanji);
+                    }}
+                    style={({ pressed }) => [s.kanjiChip, { backgroundColor: active ? colors.systemFill : colors.tertiarySystemFill, borderColor: active ? colors.primary : colors.separator, opacity: pressed ? 0.85 : 1 }]}
+                  >
+                    <Text style={{ fontSize: 15, fontWeight: '800', color: colors.primary }}>{d.kanji}</Text>
+                    <Text style={[s.kanjiMean, { color: colors.onSurface }]} numberOfLines={1}>
+                      {d.meanings?.slice(0, 28) || '—'}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          );
+        }
+        return null;
+      })()}
+      {(() => {
+        const sel = kanjiDetails?.find((d) => d.kanji === showKanjiPanel);
+        if (!showKanjiPanel || !sel) return null;
+        return (
+          <View style={[s.kanjiDetail, { backgroundColor: colors.systemFill, borderColor: colors.separator }]}>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <Text style={{ fontSize: 20, fontWeight: '800', color: colors.primary }}>{sel.kanji}</Text>
+              <Text style={[s.footnote, { color: colors.secondaryLabel }]}>·</Text>
+              <Text style={[s.bodySmall, { color: colors.onSurface, fontWeight: '600', flex: 1 }]} numberOfLines={2}>{sel.meanings || '—'}</Text>
+              <Pressable onPress={() => { onToggleKanji(null); }} hitSlop={8} style={[s.miniClose, { backgroundColor: colors.surface }]}>
+                <Icon name="close" size={12} color={colors.secondaryLabel} strokeWidth={2.2} />
+              </Pressable>
+            </View>
+            {sel.components?.length ? (
+              <View style={s.compGrid}>
+                {sel.components.map((c) => (
+                  <View key={c.component} style={[s.compCard, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
+                    <Text style={[s.compChar, { color: colors.primary }]}>{c.component}</Text>
+                    <Text style={[s.compMean, { color: colors.secondaryLabel }]} numberOfLines={2}>{c.meaning || '—'}</Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+            {cfg?.showRtk && sel.rtk ? (
+              <>
+                <Pressable onPress={() => { Haptics.selectionAsync(); onToggleMnemonic(); }} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: sel.components?.length ? 8 : 4 }} hitSlop={6}>
+                  <Text style={[s.footnote, { color: colors.secondaryLabel, fontWeight: '600' }]}>✦ Mnemonic</Text>
+                  <Icon name={showMnemonic ? 'chevronDown' : 'chevronRight'} size={12} color={colors.tertiaryLabel} strokeWidth={2.2} />
+                </Pressable>
+                {showMnemonic ? (
+                  <Text style={[s.footnote, { color: colors.onSurface, lineHeight: 19, marginTop: 4 }]}>{sel.rtk}</Text>
+                ) : null}
+              </>
+            ) : null}
+          </View>
+        );
+      })()}
+    </View>
+  );
+}
+
+function ActionsSection(props: {
+  readonly cfg: any;
+  readonly adding: boolean;
+  readonly doneOrInDeck: boolean;
+  readonly isNeverForget: boolean;
+  readonly isBlacklisted: boolean;
+  readonly flagLoading: string | null;
+  readonly showExamples: boolean;
+  readonly geminiLoading: boolean;
+  readonly showDetails: boolean;
+  readonly colors: SheetColors;
+  readonly ghostPurple: { readonly borderColor: string; readonly fg: string };
+  readonly exampleAccent: string;
+  readonly onMine: () => void;
+  readonly onToggleFlag: (flag: FlagName) => void;
+  readonly onToggleExamples: () => void;
+  readonly onExplain: () => void;
+  readonly onToggleDetails: () => void;
+}): React.ReactElement {
+  const { cfg, adding, doneOrInDeck, isNeverForget, isBlacklisted, flagLoading, showExamples, geminiLoading, showDetails, colors, ghostPurple, exampleAccent, onMine, onToggleFlag, onToggleExamples, onExplain, onToggleDetails } = props;
+  return (
+    <View style={[s.quickActions, { borderTopColor: colors.separator }]}>
+      {cfg?.showAddButton ? (
+        <Pressable
+          onPress={onMine}
+          disabled={adding}
+          style={({ pressed }) => [s.primaryAction, { backgroundColor: mineButtonBg(doneOrInDeck, colors.systemFill, colors.primary), opacity: pressed ? 0.82 : 1 }]}
+        >
+          {(() => {
+            if (adding) {
+              return <ActivityIndicator size="small" color="#fff" />;
+            }
+            const content = mineButtonContent(false, doneOrInDeck);
+            const fg = mineButtonFg(doneOrInDeck, colors.primary);
+            return <><Icon name={content.icon} size={14} color={fg} strokeWidth={2.3} /><Text style={[s.quickActionText, { color: fg }]}>{content.label}</Text></>;
+          })()}
+        </Pressable>
+      ) : null}
+      <Pressable
+        onPress={() => onToggleFlag('never-forget')}
+        style={({ pressed }) => [s.quickAction, { backgroundColor: quickActionBg(isNeverForget, ghostPurple.borderColor + '22', pressed, colors.systemFill) }]}
+      >
+        {(() => {
+          if (flagLoading === 'never-forget') {
+            return <ActivityIndicator size="small" color={ghostPurple.fg} />;
+          }
+          if (isNeverForget) {
+            return <Text style={[s.quickActionText, { color: ghostPurple.fg }]}>Remembering</Text>;
+          }
+          return <Text style={[s.quickActionText, { color: ghostPurple.fg }]}>Remember</Text>;
+        })()}
+      </Pressable>
+      <Pressable
+        onPress={onToggleExamples}
+        style={({ pressed }) => [s.quickAction, { backgroundColor: quickActionBg(showExamples, exampleAccent + '1F', pressed, colors.systemFill) }]}
+        accessibilityState={{ expanded: showExamples }}
+      >
+        <Icon name="play" size={12} color={exampleAccent} strokeWidth={2} />
+        <Text style={[s.quickActionText, { color: exampleAccent }]}>Examples</Text>
+      </Pressable>
+      <Pressable
+        onPress={onExplain}
+        style={({ pressed }) => [s.quickAction, { backgroundColor: pressed ? colors.systemFill : 'transparent', opacity: geminiLoading ? 0.6 : 1 }]}
+        accessibilityLabel="Explain with AI"
+      >
+        {geminiLoading
+          ? <ActivityIndicator size="small" color={ghostPurple.fg} />
+          : <Text style={[s.quickActionText, { color: ghostPurple.fg }]}>AI</Text>}
+      </Pressable>
+      {cfg?.showBlacklistButton ? (
+        <Pressable
+          onPress={() => onToggleFlag('blacklist')}
+          style={({ pressed }) => [s.quickAction, { backgroundColor: quickActionBg(isBlacklisted, colors.error + '1F', pressed, colors.systemFill) }]}
+          accessibilityLabel="Blacklist"
+        >
+          {(() => {
+            if (flagLoading === 'blacklist') {
+              return <ActivityIndicator size="small" color={colors.error} />;
+            }
+            return <Text style={[s.quickActionText, { color: colors.error }]}>Hide</Text>;
+          })()}
+        </Pressable>
+      ) : null}
+      <Pressable
+        onPress={onToggleDetails}
+        style={({ pressed }) => [s.quickAction, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]}
+      >
+        <Text style={[s.quickActionText, { color: colors.primary }]}>{showDetails ? 'Less' : 'Mine'}</Text>
+        <Icon name={showDetails ? 'chevronDown' : 'chevronRight'} size={13} color={colors.primary} strokeWidth={2.2} />
+      </Pressable>
+    </View>
+  );
+}
+
+function ExampleNav(props: {
+  readonly examples: ImmersionExample[];
+  readonly index: number;
+  readonly currentSoundUrl: string | undefined;
+  readonly playing: boolean;
+  readonly looping: boolean;
+  readonly playingAll: boolean;
+  readonly colors: SheetColors;
+  readonly accent: string;
+  readonly onMove: (delta: number) => void;
+  readonly onTogglePlay: () => void;
+  readonly onToggleLoop: () => void;
+  readonly onTogglePlayAll: () => void;
+}): React.ReactElement {
+  const { examples, index, currentSoundUrl, playing, looping, playingAll, colors, accent, onMove, onTogglePlay, onToggleLoop, onTogglePlayAll } = props;
+  const navDisabled = examples.length < 2;
+  return (
+    <View style={s.exampleNav}>
+      <Pressable onPress={() => onMove(-1)} disabled={navDisabled} style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : 'transparent', opacity: navDisabled ? 0.3 : 1 }]} accessibilityLabel="Previous example">
+        <Icon name="chevronLeft" size={14} color={colors.primary} strokeWidth={2.2} />
+      </Pressable>
+      <Text style={[s.exampleCounter, { color: colors.secondaryLabel }]}>{index + 1}/{examples.length}</Text>
+      <Pressable onPress={() => onMove(1)} disabled={navDisabled} style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : 'transparent', opacity: navDisabled ? 0.3 : 1 }]} accessibilityLabel="Next example">
+        <Icon name="chevronRight" size={14} color={colors.primary} strokeWidth={2.2} />
+      </Pressable>
+      <View style={[s.exampleControlDivider, { backgroundColor: colors.separator }]} />
+      <Pressable
+        onPress={onTogglePlay}
+        disabled={!currentSoundUrl}
+        style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : 'transparent', opacity: currentSoundUrl ? 1 : 0.3 }]}
+        accessibilityLabel={playPauseA11y(playing, looping, playingAll)}
+      >
+        <Icon name={playPauseLabel(playing, looping, playingAll)} size={13} color={accent} strokeWidth={2} />
+      </Pressable>
+      <Pressable
+        onPress={onToggleLoop}
+        disabled={!currentSoundUrl}
+        style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: quickActionBg(looping, accent + '26', pressed, colors.tertiarySystemFill), opacity: currentSoundUrl ? 1 : 0.3 }]}
+        accessibilityLabel={looping ? 'Stop repeating example' : 'Repeat current example'}
+        accessibilityState={{ selected: looping }}
+      >
+        <Icon name="repeat" size={15} color={looping ? accent : colors.secondaryLabel} strokeWidth={2} />
+      </Pressable>
+      <Pressable
+        onPress={() => { onTogglePlayAll(); }}
+        style={({ pressed }) => [s.exampleAllBtn, { backgroundColor: quickActionBg(playingAll, accent + '26', pressed, colors.tertiarySystemFill) }]}
+        accessibilityLabel={playingAll ? 'Stop all examples' : 'Play all examples'}
+        accessibilityState={{ selected: playingAll }}
+      >
+        <Text style={[s.exampleAllText, { color: playingAll ? accent : colors.secondaryLabel }]}>{playingAll ? 'Stop' : 'All'}</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+function ExamplesSection(props: {
+  readonly showExamples: boolean;
+  readonly currentExample: ImmersionExample | undefined;
+  readonly ikExamples: ImmersionExample[] | null;
+  readonly ikIndex: number;
+  readonly ikLoading: boolean;
+  readonly ikError: string | null;
+  readonly ikPlaying: boolean;
+  readonly ikLooping: boolean;
+  readonly ikPlayingAll: boolean;
+  readonly colors: SheetColors;
+  readonly exampleAccent: string;
+  readonly onMove: (delta: number) => void;
+  readonly onTogglePlay: () => void;
+  readonly onToggleLoop: () => void;
+  readonly onTogglePlayAll: () => void;
+  readonly onRetry: () => void;
+}): React.ReactElement | null {
+  const { showExamples, currentExample, ikExamples, ikIndex, ikLoading, ikError, ikPlaying, ikLooping, ikPlayingAll, colors, exampleAccent, onMove, onTogglePlay, onToggleLoop, onTogglePlayAll, onRetry } = props;
+  if (!showExamples) {
+    return null;
+  }
+  return (
+    <View style={[s.exampleCard, { backgroundColor: colors.systemFill, borderColor: colors.separator }]}>
+      <View style={s.exampleHeader}>
+        <Text numberOfLines={1} style={[s.exampleSource, { color: colors.secondaryLabel }]}>
+          {currentExample?.sourceTitle || 'ImmersionKit'}
+        </Text>
+        {ikExamples?.length ? (
+          <ExampleNav
+            examples={ikExamples}
+            index={ikIndex}
+            currentSoundUrl={currentExample?.soundUrl}
+            playing={ikPlaying}
+            looping={ikLooping}
+            playingAll={ikPlayingAll}
+            colors={colors}
+            accent={exampleAccent}
+            onMove={onMove}
+            onTogglePlay={onTogglePlay}
+            onToggleLoop={onToggleLoop}
+            onTogglePlayAll={onTogglePlayAll}
+          />
+        ) : null}
+      </View>
+
+      <ImmersionBody
+        loading={ikLoading}
+        error={ikError}
+        example={currentExample ?? undefined}
+        playing={ikPlaying}
+        colors={colors}
+        accent={exampleAccent}
+        onRetry={onRetry}
+        onTogglePlay={onTogglePlay}
+      />
+    </View>
+  );
+}
+
+function SentenceSection(props: {
+  readonly showDetails: boolean;
+  readonly showSentence: boolean;
+  readonly sentence: string;
+  readonly translation: string;
+  readonly forq: boolean;
+  readonly colors: SheetColors;
+  readonly onToggleSentence: () => void;
+  readonly onToggleForq: () => void;
+  readonly onExpandContext: () => void;
+  readonly onChangeSentence: (text: string) => void;
+  readonly onChangeTranslation: (text: string) => void;
+}): React.ReactElement | null {
+  const { showDetails, showSentence, sentence, translation, forq, colors, onToggleSentence, onToggleForq, onExpandContext, onChangeSentence, onChangeTranslation } = props;
+  if (!showDetails) {
+    return null;
+  }
+  return (
+    <View style={[s.section, { marginTop: 8 }]}>
+      <Pressable
+        onPress={onToggleSentence}
+        style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
+        hitSlop={6}
+      >
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+          <Text style={[s.posText, { color: colors.secondaryLabel }]}>Sentence</Text>
+          <Icon name={showSentence ? 'chevronDown' : 'chevronRight'} size={13} color={colors.tertiaryLabel} strokeWidth={2.2} />
+        </View>
+        <Pressable onPress={onToggleForq} style={[s.forqPill, { backgroundColor: forq ? colors.primary : 'transparent', borderColor: forq ? colors.primary : colors.separator }]}>
+          <Text style={[s.forqText, { color: forq ? '#fff' : colors.secondaryLabel }]}>{forq ? '✓ FORQ' : 'FORQ'}</Text>
+        </Pressable>
+      </Pressable>
+      {!showSentence && sentence ? (
+        <Text style={[s.footnote, { color: colors.secondaryLabel, marginTop: 3 }]} numberOfLines={2}>{sentence}</Text>
+      ) : null}
+      {showSentence ? (
+        <>
+          <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 2 }}>
+            <Pressable
+              onPress={onExpandContext}
+              hitSlop={6}
+            >
+              <Text style={[s.linkText, { color: colors.primary }]}>Expand context</Text>
+            </Pressable>
+          </View>
+          <TextInput
+            value={sentence}
+            onChangeText={onChangeSentence}
+            placeholder="Sentence for mining"
+            placeholderTextColor={colors.tertiaryLabel}
+            multiline
+            textAlignVertical="top"
+            style={[s.textArea, { color: colors.onSurface, backgroundColor: colors.systemFill }]}
+          />
+          <TextInput
+            value={translation}
+            onChangeText={onChangeTranslation}
+            placeholder="Translation (optional)"
+            placeholderTextColor={colors.tertiaryLabel}
+            multiline
+            textAlignVertical="top"
+            style={[s.textArea, { minHeight: 34, marginTop: 6, color: colors.onSurface, backgroundColor: colors.systemFill }]}
+          />
+        </>
+      ) : null}
+    </View>
+  );
+}
+
+function GeminiSection(props: {
+  readonly geminiLoading: boolean;
+  readonly geminiText: string | null;
+  readonly geminiError: string | null;
+  readonly colors: SheetColors;
+  readonly onRetry: () => void;
+  readonly onClear: () => void;
+}): React.ReactElement | null {
+  const { geminiLoading, geminiText, geminiError, colors, onRetry, onClear } = props;
+  if (!geminiLoading && !geminiText && !geminiError) {
+    return null;
+  }
+  return (
+    <View style={[s.aiBox, { backgroundColor: colors.systemFill, borderColor: geminiError ? colors.error : colors.separator }]}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Text style={[s.posText, { color: geminiError ? colors.error : colors.primary }]}>AI explanation</Text>
+        {(() => {
+          if (geminiLoading) {
+            return (
+              <ActivityIndicator size="small" color={colors.secondaryLabel} />
+            );
+          }
+          return (
+            <View style={{ flexDirection: 'row', gap: 14, alignItems: 'center' }}>
+              {geminiError ? (
+                <Pressable onPress={onRetry}>
+                  <Text style={[s.linkText, { color: colors.primary }]}>Retry</Text>
+                </Pressable>
+              ) : null}
+              <Pressable onPress={onClear}>
+                <Text style={[s.linkText, { color: colors.secondaryLabel }]}>Clear</Text>
+              </Pressable>
+            </View>
+          );
+        })()}
+      </View>
+      {(() => {
+        if (geminiLoading && !geminiText) {
+          return (
+            <Text style={[s.bodySmall, { color: colors.secondaryLabel, lineHeight: 20, marginTop: 4 }]}>Thinking…</Text>
+          );
+        }
+        if (geminiError) {
+          return (
+            <Text style={[s.bodySmall, { color: colors.error, lineHeight: 20, marginTop: 4 }]}>{geminiError}</Text>
+          );
+        }
+        return (
+          <View style={{ marginTop: 6 }}>
+            <Markdown
+              content={geminiText ?? ''}
+              color={colors.onSurface}
+              mutedColor={colors.secondaryLabel}
+              accentColor={colors.primary}
+              codeBg={colors.tertiarySystemFill}
+              size={14}
+            />
+          </View>
+        );
+      })()}
+    </View>
+  );
+}
+
+export default function WordSheet({ word, onClose, forceDark, onStateChange, anchorFrame, preview }: Props) {
+  const scheme = useColorScheme();
+  const [loadedCfg, setLoadedCfg] = useState<any>(null);
+  // In preview mode the config is driven from outside, so read it straight off
+  // the prop -- state would lag a frame behind every Settings change.
+  const cfg = preview ? preview.cfg : loadedCfg;
+  // `auto` keeps the pre-theme behaviour: reader forces dark, browser follows
+  // the system. Any named theme is an explicit opt-in.
+  const palette: PopupPalette = useMemo(
+    () => resolvePopupPalette(cfg?.popupTheme, forceDark || scheme === 'dark'),
+    [cfg?.popupTheme, forceDark, scheme]
+  );
+  const isDark = palette.isDark;
+  const colors = useMemo(() => {
+    const { isDark: _drop, ...tokens } = palette;
+    return { ...(isDark ? darkColors : lightColors), ...tokens };
+  }, [isDark, palette]);
+  const insets = useSafeAreaInsets();
+
+  const [playing, setPlaying] = useState(false);
+  const [localState, setLocalState] = useState<string[]>(word.state ?? []);
+  const [sentence, setSentence] = useState('');
+  const [translation, setTranslation] = useState('');
+  const [forq, setForq] = useState(true);
+  const [kanjiDetails, setKanjiDetails] = useState<KanjiDetail[] | null>(null);
+  const [kanjiLoading, setKanjiLoading] = useState(false);
+  const [showKanjiPanel, setShowKanjiPanel] = useState<string | null>(null);
+  const [showMnemonic, setShowMnemonic] = useState(false);
+  const [showSentence, setShowSentence] = useState(false);
+  const [showAllMeanings, setShowAllMeanings] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const pronunciationRun = useRef(0);
+  const pronunciationTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const { vid, sid, spelling, reading, meanings, frequencyRank, pitchAccent = [] } = word;
+
+  const cancelAutomaticPronunciation = useCallback(() => {
+    pronunciationRun.current++;
+    if (pronunciationTimer.current) {
+      clearTimeout(pronunciationTimer.current);
+      pronunciationTimer.current = null;
+    }
+    setPlaying(false);
+  }, []);
+
+  const {
+    ikExamples, ikLoading, ikPlaying, ikLooping, ikPlayingAll,
+    ikIndex, ikError, showExamples,
+    ikRequest, ikPlaybackRun,
+    fetchImmersion,
+    toggleExamples, moveExample, toggleExamplePlay, toggleExampleLoop, togglePlayAll,
+  } = useImmersionController(spelling, cancelAutomaticPronunciation);
+
+  const {
+    revealed, setRevealed, onSheetLayout,
+    placement,
+    enter, animatedSheetStyle,
+  } = usePlacementController(word, preview, anchorFrame, showDetails, showExamples, insets);
+
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const dismiss = useCallback(
+    buildDismiss(pronunciationRun, pronunciationTimer, ikRequest, ikPlaybackRun, onCloseRef),
+    [pronunciationRun, pronunciationTimer, ikRequest, ikPlaybackRun, onCloseRef],
+  );
 
   useEffect(() => {
     // Hold the first frame back until onLayout has reported the real card size,
@@ -268,6 +1363,17 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
     },
     [onStateChange, vid, sid]
   );
+
+  const {
+    adding, done, flagLoading, reviewLoading,
+    geminiText, setGeminiText, geminiError, setGeminiError, geminiLoading,
+    explainWithGemini, mine, toggleFlag, review, play,
+  } = useWordActions({
+    vid, sid, spelling, reading, meanings, pitchAccent,
+    sentence, translation, forq, cfg,
+    pushState, dismiss, setPlaying,
+    pronunciationRun, setShowDetails,
+  });
 
   useEffect(() => {
     if (preview) {
@@ -305,22 +1411,6 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
     // dismiss and before switching words, so nothing leaks.
   }, []);
 
-  // Grows out of the edge facing the word rather than out of its own centre,
-  // so the card visibly belongs to the thing that was tapped. Scaling about an
-  // arbitrary origin is a centre scale plus a translation of origin * (1 - s).
-  const animatedSheetStyle = useAnimatedStyle(() => {
-    const scale = 0.92 + enter.value * 0.08;
-    const rest = 1 - scale;
-    return {
-      opacity: enter.value,
-      transform: [
-        { translateX: (originX - 0.5) * boxW * rest },
-        { translateY: (originY - 0.5) * boxH * rest },
-        { scale },
-      ],
-    };
-  }, [originX, originY, boxW, boxH]);
-
   const fetchKanji = async () => {
     if (!word.spelling) return;
     setKanjiLoading(true);
@@ -332,283 +1422,20 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
     setKanjiLoading(false);
   };
 
-  const stopExamplePlayback = () => {
-    ikPlaybackRun.current++;
-    stopAudio();
-    setIkPlaying(false);
-    setIkLooping(false);
-    setIkPlayingAll(false);
-  };
-
-  const cancelAutomaticPronunciation = () => {
-    pronunciationRun.current++;
-    if (pronunciationTimer.current) {
-      clearTimeout(pronunciationTimer.current);
-      pronunciationTimer.current = null;
-    }
-    setPlaying(false);
-  };
-
-  const playExample = async (example?: ImmersionExample, loop = false) => {
-    const target = example ?? ikExamples?.[ikIndex];
-    if (!target?.soundUrl) {
-      Alert.alert('No example audio', 'This ImmersionKit example only contains text.');
-      return;
-    }
-    cancelAutomaticPronunciation();
-    const run = ++ikPlaybackRun.current;
-    stopAudio();
-    setIkPlaying(true);
-    setIkLooping(loop);
-    setIkPlayingAll(false);
-    Haptics.selectionAsync();
-    const ok = await playRemoteAudio(target.soundUrl, {
-      loop,
-      onFinished: (reason) => {
-        if (ikPlaybackRun.current !== run) return;
-        setIkPlaying(false);
-        setIkLooping(false);
-        if (reason === 'error') Alert.alert('Example audio unavailable', lastAudioError());
-      },
-    });
-    if (!ok && ikPlaybackRun.current === run) {
-      setIkPlaying(false);
-      setIkLooping(false);
-    }
-  };
-
-  const fetchImmersion = async (w: string, autoplay = true) => {
-    const request = ++ikRequest.current;
-    setShowExamples(true);
-    setIkLoading(true);
-    setIkError(null);
-    try {
-      const examples = await fetchImmersionExamples(w);
-      if (request !== ikRequest.current) return;
-      setIkExamples(examples);
-      setIkIndex(0);
-      if (!examples.length) setIkError('No examples found for this word.');
-      else if (autoplay && examples[0].soundUrl) void playExample(examples[0]);
-    } catch (error: any) {
-      if (request !== ikRequest.current) return;
-      setIkExamples([]);
-      setIkError(error?.message ? String(error.message) : 'ImmersionKit is unavailable.');
-    } finally {
-      if (request === ikRequest.current) setIkLoading(false);
-    }
-  };
-
-  const toggleExamples = () => {
-    Haptics.selectionAsync();
-    if (showExamples) {
-      setShowExamples(false);
-      stopExamplePlayback();
-      return;
-    }
-    setShowExamples(true);
-    if (ikExamples === null && !ikLoading) void fetchImmersion(spelling);
-  };
-
-  const moveExample = (delta: number) => {
-    if (!ikExamples?.length) return;
-    // Moving always cancels current, repeat, and play-all first. This also
-    // handles examples with no sound, which previously left the old loop alive.
-    stopExamplePlayback();
-    const next = (ikIndex + delta + ikExamples.length) % ikExamples.length;
-    setIkIndex(next);
-    Haptics.selectionAsync();
-    if (ikExamples[next].soundUrl) void playExample(ikExamples[next]);
-  };
-
-  const toggleExamplePlay = () => {
-    if (ikPlaying || ikLooping || ikPlayingAll) {
-      stopExamplePlayback();
-      return;
-    }
-    void playExample();
-  };
-
-  const toggleExampleLoop = () => {
-    if (ikLooping) {
-      stopExamplePlayback();
-      return;
-    }
-    void playExample(undefined, true);
-  };
-
-  const togglePlayAll = async () => {
-    if (ikPlayingAll) {
-      stopExamplePlayback();
-      return;
-    }
-    if (!ikExamples?.length) return;
-
-    cancelAutomaticPronunciation();
-    const run = ++ikPlaybackRun.current;
-    stopAudio();
-    setIkLooping(false);
-    setIkPlayingAll(true);
-    Haptics.selectionAsync();
-
-    for (let index = ikIndex; index < ikExamples.length; index++) {
-      if (ikPlaybackRun.current !== run) return;
-      setIkIndex(index);
-      const example = ikExamples[index];
-      setIkPlaying(!!example.soundUrl);
-
-      if (example.soundUrl) {
-        const reason = await new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
-          void playRemoteAudio(example.soundUrl, { onFinished: resolve }).then((ok) => {
-            if (!ok) resolve('error');
-          });
-        });
-        if (ikPlaybackRun.current !== run || reason !== 'ended') return;
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, 900));
-        if (ikPlaybackRun.current !== run) return;
-      }
-
-      setIkPlaying(false);
-      if (index < ikExamples.length - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 350));
-      }
-    }
-
-    if (ikPlaybackRun.current === run) {
-      setIkPlaying(false);
-      setIkPlayingAll(false);
-      setIkIndex(0);
-    }
-  };
-
-  const explainWithGemini = async () => {
-    if (geminiLoading) return;
-    if (!cfg?.geminiApiKey) {
-      Alert.alert('AI Explain', 'Add your Gemini API key in Settings → JPDB to use AI explanations.');
-      return;
-    }
-    Haptics.selectionAsync();
-    // Expand the sheet so the result is in view, and reset any previous run.
-    setShowDetails(true);
-    setGeminiError(null);
-    setGeminiText(null);
-    setGeminiLoading(true);
-    try {
-      const prompt = `Explain the Japanese word "${spelling}" (${reading}) — meanings: ${(meanings || []).map((m: any) => (m.glosses || []).join(', ')).join(' ; ')}. Pitch: ${pitchAccent.join(', ')}. Sentence: "${sentence}". Give a concise, learner-focused explanation with nuance, collocations, and one example.\n\nFormatting rules: reply in clean, simple Markdown. Use "## " for section headings, "**bold**" only for key terms, and "- " for bullet points. Do not stack markers like *** or ****, and never leave a * or ** unbalanced.`;
-      const text = await geminiApi.explainWord({ apiKey: cfg.geminiApiKey, prompt });
-      if (text && text.trim()) setGeminiText(text.trim());
-      else setGeminiError('The AI returned an empty response. Please try again.');
-    } catch (e: any) {
-      console.warn('[wordsheet] gemini explain failed', e);
-      setGeminiError(String(e?.message ?? e));
-    } finally {
-      setGeminiLoading(false);
-    }
-  };
-
-  const mine = async (rating?: 'nothing' | 'something' | 'hard' | 'good' | 'easy') => {
-    setAdding(true);
-    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    try {
-      const token = cfg?.apiToken;
-      if (!token) throw new Error('Missing JPDB token — open Settings');
-      await jpdbApi.mine({ vid, sid, apiToken: token, sentence: sentence || undefined, translation: translation || undefined, forq, reviewRating: rating });
-      setDone(true);
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      const st = await jpdbApi.getCardState({ vid, sid, apiToken: token });
-      pushState(st);
-      if (!rating) setTimeout(dismiss, 650);
-    } catch (e: any) {
-      Alert.alert('Mine failed', String(e.message));
-    }
-    setAdding(false);
-  };
-
-  const toggleFlag = async (flag: 'blacklist' | 'never-forget') => {
-    setFlagLoading(flag);
-    try {
-      const token = cfg?.apiToken;
-      if (!token) throw new Error('No token');
-      const stateKey = flag === 'blacklist' ? 'blacklisted' : 'never-forget';
-      const currently = localState.includes(stateKey);
-      await jpdbApi.setFlag({ vid, sid, flag, state: !currently, apiToken: token });
-      const st = await jpdbApi.getCardState({ vid, sid, apiToken: token });
-      pushState(st);
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch (e: any) {
-      // Log the stack in dev so unlocatable TypeErrors become actionable.
-      console.warn(`[wordsheet] flag ${flag} failed`, e);
-      Alert.alert('Flag failed', String(e?.message ?? e));
-    }
-    setFlagLoading(null);
-  };
-
-  const review = async (rating: 'nothing' | 'something' | 'hard' | 'good' | 'easy') => {
-    setReviewLoading(rating);
-    try {
-      await jpdbApi.review({ vid, sid, rating });
-      const token = cfg?.apiToken;
-      if (token) {
-        const st = await jpdbApi.getCardState({ vid, sid, apiToken: token });
-        pushState(st);
-      }
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch (e: any) {
-      Alert.alert('Review failed', String(e.message));
-    }
-    setReviewLoading(null);
-  };
-
-  const lastAudioAlert = useRef(0);
-  const play = async () => {
-    cancelAutomaticPronunciation();
-    const run = ++pronunciationRun.current;
-    setPlaying(true);
-    Haptics.selectionAsync();
-    const ok = await playAudioForWord(vid, spelling);
-    if (pronunciationRun.current === run) setPlaying(false);
-    if (!ok) {
-      // Silent spinner-stop is indistinguishable from broken — say why,
-      // throttled so repeated taps on unrecorded words don't nag.
-      const reason = lastAudioError();
-      const noisy = reason && reason !== 'No JPDB recording for this word';
-      if (pronunciationRun.current === run && noisy && Date.now() - lastAudioAlert.current > 10000) {
-        lastAudioAlert.current = Date.now();
-        Alert.alert('Audio unavailable', reason);
-      }
-    }
+  const handleToggleFlag = (flag: FlagName) => {
+    void toggleFlag(flag, localState);
   };
 
   // Defensive: malformed lookup payloads must never blank the sheet.
-  let grouped: { partOfSpeech: string[]; glosses: string[][]; startIndex: number }[] = [];
-  try {
-    grouped = groupMeanings({ meanings: Array.isArray(meanings) ? meanings : [] });
-  } catch {}
+  const grouped = safeGroupMeanings(meanings);
   const isBlacklisted = localState.includes('blacklisted');
   const isNeverForget = localState.includes('never-forget');
 
   // Trim the gloss list to the first few entries, keeping whole POS groups.
-  const MAX_GLOSSES = showDetails ? 8 : 5;
-  const totalGlosses = grouped.reduce((n, g) => n + g.glosses.length, 0);
-  let visibleGroups = grouped;
-  if (!showAllMeanings && totalGlosses > MAX_GLOSSES) {
-    const out: typeof grouped = [];
-    let used = 0;
-    for (const g of grouped) {
-      if (used >= MAX_GLOSSES) break;
-      const take = Math.min(g.glosses.length, MAX_GLOSSES - used);
-      out.push({ ...g, glosses: g.glosses.slice(0, take) });
-      used += take;
-    }
-    visibleGroups = out;
-  }
-  const hiddenGlossCount = Math.max(0, totalGlosses - visibleGroups.reduce((n, g) => n + g.glosses.length, 0));
+  const { visibleGroups, hiddenGlossCount } = trimGlossGroups(grouped, showDetails, showAllMeanings);
 
   const inDeck = localState.length > 0 && !localState.includes('not-in-deck');
-  let pitchSegments: { text: string; isHigh: boolean; isFinal: boolean }[] | null = null;
-  try {
-    pitchSegments = pitchAccent?.length ? parsePitch(reading, pitchAccent[0]) : null;
-  } catch {}
+  const pitchSegments = safeParsePitch(reading, pitchAccent);
 
   // Popup visual language mirrors jpd-breader content/popup.css: compact
   // floating card, single surface, small ghost buttons + traffic-light
@@ -653,424 +1480,127 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
             bounces
             keyboardShouldPersistTaps="handled"
           >
-              {/* One clear first read: word, reading, status, audio, close. */}
-              <View style={s.header}>
-                <View style={{ flex: 1, minWidth: 0 }}>
-                  <Text style={[s.spelling, { color: colors.onSurface }]} numberOfLines={2}>{spelling}</Text>
-                  <View style={s.metaRow}>
-                    {frequencyRank ? (
-                      <View style={[s.freqPill, { backgroundColor: isDark ? '#1c2f6b' : '#e8f0fe' }]}>
-                        <Text style={[s.freqText, { color: colors.primary }]}>Top {frequencyRank}</Text>
-                      </View>
-                    ) : null}
-                    {pitchSegments ? (
-                      <View style={{ flexDirection: 'row' }}>
-                        {pitchSegments.map((seg, i) => (
-                          <Text key={i} style={{ color: colors.secondaryLabel, fontWeight: '600', borderStyle: 'solid', borderColor: seg.isHigh ? colors.primary : '#d93025', borderTopWidth: seg.isHigh ? 1.6 : 0, borderBottomWidth: seg.isHigh ? 0 : 1.6, paddingHorizontal: 1.5, fontSize: em(0.95) }}>
-                            {seg.text}
-                          </Text>
-                        ))}
-                      </View>
-                    ) : reading && reading !== spelling ? (
-                      <Text style={[s.metaText, { color: colors.secondaryLabel }]} numberOfLines={1}>{reading}</Text>
-                    ) : null}
-                  </View>
-                </View>
-
-                <View style={{ alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
-                  {/* Only the two actions worth reaching for mid-sentence stay
-                      up here; AI and blacklist live in the actions row so the
-                      word itself is not squeezed into two lines. */}
-                  <View style={{ flexDirection: 'row', gap: 4 }}>
-                    <Pressable onPress={play} hitSlop={8} style={({ pressed }) => [s.iconBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]} accessibilityLabel="Play audio">
-                      {playing ? <ActivityIndicator size="small" color={colors.secondaryLabel} /> : <Icon name="audio" size={17} color={colors.secondaryLabel} strokeWidth={2} />}
-                    </Pressable>
-                    <Pressable onPress={dismiss} hitSlop={10} style={({ pressed }) => [s.iconBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]} accessibilityLabel="Close lookup">
-                      <Icon name="close" size={15} color={colors.secondaryLabel} strokeWidth={2.2} />
-                    </Pressable>
-                  </View>
-                  <View style={{ flexDirection: 'row', gap: 3, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-                    {(localState.length ? localState : ['not-in-deck']).map((st) => {
-                      const c = stateColors(st, isDark);
-                      return (
-                        <View key={st} style={[s.statePill, { backgroundColor: c.bg }]}>
-                          <Text style={[s.statePillText, { color: c.fg }]}>{st}</Text>
-                        </View>
-                      );
-                    })}
-                  </View>
-                </View>
-              </View>
+              <WordHeader
+                spelling={spelling}
+                reading={reading}
+                frequencyRank={frequencyRank}
+                pitchSegments={pitchSegments}
+                playing={playing}
+                localState={localState}
+                isDark={isDark}
+                colors={colors}
+                onPlay={play}
+                onDismiss={dismiss}
+              />
 
               {/* Meanings. Common verbs carry 15+ glosses, so the tail is
                   collapsed behind a disclosure rather than filling the card. */}
-              {grouped.length ? (
-                <View style={s.section}>
-                  {visibleGroups.map((g, idx) => (
-                    <View key={idx} style={{ marginTop: idx === 0 ? 6 : 4 }}>
-                      <Text style={[s.posText, { color: colors.secondaryLabel }]}>
-                        {(g.partOfSpeech.map((p) => PARTS_OF_SPEECH[p] ?? p).filter(Boolean).join(', ') || '—')}
-                      </Text>
-                      <View style={{ gap: 2, marginTop: 2 }}>
-                        {g.glosses.map((gl, i) => (
-                          <View key={i} style={{ flexDirection: 'row', gap: 7 }}>
-                            <Text style={[s.glossIndex, { color: colors.tertiaryLabel }]}>{g.startIndex + i + 1}.</Text>
-                            <Text style={[s.gloss, { color: colors.onSurface }]}>{gl.join('; ')}</Text>
-                          </View>
-                        ))}
-                      </View>
-                    </View>
-                  ))}
-                  {hiddenGlossCount > 0 ? (
-                    <Pressable
-                      onPress={() => {
-                        Haptics.selectionAsync();
-                        if (!showDetails) setShowDetails(true);
-                        setShowAllMeanings((v) => !v);
-                      }}
-                      style={({ pressed }) => [s.moreBtn, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]}
-                      hitSlop={6}
-                    >
-                      <Text style={[s.moreText, { color: colors.primary }]}>
-                        {showAllMeanings ? 'Show fewer meanings' : `${hiddenGlossCount} more meaning${hiddenGlossCount === 1 ? '' : 's'}`}
-                      </Text>
-                    </Pressable>
-                  ) : null}
-                </View>
-              ) : (
-                <View style={{ alignItems: 'center', paddingVertical: 12 }}>
-                  <Text style={[s.footnote, { color: colors.secondaryLabel }]}>No glosses yet</Text>
-                </View>
-              )}
+              <MeaningsSection
+                grouped={grouped}
+                visibleGroups={visibleGroups}
+                hiddenGlossCount={hiddenGlossCount}
+                showAllMeanings={showAllMeanings}
+                onShowDetails={() => {
+                  if (!showDetails) {
+                    setShowDetails(true);
+                  }
+                }}
+                onToggleMeanings={() => setShowAllMeanings((v) => !v)}
+                colors={colors}
+              />
 
-              {/* Kanji breakdown — chip row (popup.css .kanji-breakdown).
-                  Always visible: for a manga reader this is the most useful
-                  thing in the card, and it sits right under the meanings so the
-                  card reads word -> meaning -> kanji. */}
-              {cfg?.showKanji !== false && (kanjiDetails || kanjiLoading) ? (
-                <View style={s.kanjiWrap}>
-                  {kanjiDetails && kanjiDetails.length > 3 ? (
-                    <View style={s.kanjiHeader}>
-                      <Text style={[s.posText, { color: colors.secondaryLabel }]}>Kanji</Text>
-                      <View style={[s.countBadge, { backgroundColor: colors.systemFill }]}>
-                        <Text style={[s.countText, { color: colors.primary }]}>{kanjiDetails.length}</Text>
-                      </View>
-                    </View>
-                  ) : null}
-                  {kanjiLoading && !kanjiDetails?.length ? (
-                    <ActivityIndicator size="small" color={colors.secondaryLabel} style={{ alignSelf: 'flex-start' }} />
-                  ) : kanjiDetails?.length ? (
-                    <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-                      {kanjiDetails.map((d) => {
-                        const active = showKanjiPanel === d.kanji;
-                        return (
-                          <Pressable
-                            key={d.kanji}
-                            onPress={() => {
-                              Haptics.selectionAsync();
-                              setShowKanjiPanel(active ? null : d.kanji);
-                              setShowMnemonic(false);
-                            }}
-                            style={({ pressed }) => [s.kanjiChip, { backgroundColor: active ? colors.systemFill : colors.tertiarySystemFill, borderColor: active ? colors.primary : colors.separator, opacity: pressed ? 0.85 : 1 }]}
-                          >
-                            <Text style={{ fontSize: 15, fontWeight: '800', color: colors.primary }}>{d.kanji}</Text>
-                            <Text style={[s.kanjiMean, { color: colors.onSurface }]} numberOfLines={1}>
-                              {d.meanings?.slice(0, 28) || '—'}
-                            </Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
-                  ) : null}
-                  {(() => {
-                    const sel = kanjiDetails?.find((d) => d.kanji === showKanjiPanel);
-                    if (!showKanjiPanel || !sel) return null;
-                    return (
-                      <View style={[s.kanjiDetail, { backgroundColor: colors.systemFill, borderColor: colors.separator }]}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                          <Text style={{ fontSize: 20, fontWeight: '800', color: colors.primary }}>{sel.kanji}</Text>
-                          <Text style={[s.footnote, { color: colors.secondaryLabel }]}>·</Text>
-                          <Text style={[s.bodySmall, { color: colors.onSurface, fontWeight: '600', flex: 1 }]} numberOfLines={2}>{sel.meanings || '—'}</Text>
-                          <Pressable onPress={() => { setShowKanjiPanel(null); setShowMnemonic(false); }} hitSlop={8} style={[s.miniClose, { backgroundColor: colors.surface }]}>
-                            <Icon name="close" size={12} color={colors.secondaryLabel} strokeWidth={2.2} />
-                          </Pressable>
-                        </View>
-                        {sel.components?.length ? (
-                          <View style={s.compGrid}>
-                            {sel.components.map((c) => (
-                              <View key={c.component} style={[s.compCard, { backgroundColor: colors.surface, borderColor: colors.separator }]}>
-                                <Text style={[s.compChar, { color: colors.primary }]}>{c.component}</Text>
-                                <Text style={[s.compMean, { color: colors.secondaryLabel }]} numberOfLines={2}>{c.meaning || '—'}</Text>
-                              </View>
-                            ))}
-                          </View>
-                        ) : null}
-                        {cfg?.showRtk && sel.rtk ? (
-                          <>
-                            <Pressable onPress={() => { Haptics.selectionAsync(); setShowMnemonic((v) => !v); }} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, marginTop: sel.components?.length ? 8 : 4 }} hitSlop={6}>
-                              <Text style={[s.footnote, { color: colors.secondaryLabel, fontWeight: '600' }]}>✦ Mnemonic</Text>
-                              <Icon name={showMnemonic ? 'chevronDown' : 'chevronRight'} size={12} color={colors.tertiaryLabel} strokeWidth={2.2} />
-                            </Pressable>
-                            {showMnemonic ? (
-                              <Text style={[s.footnote, { color: colors.onSurface, lineHeight: 19, marginTop: 4 }]}>{sel.rtk}</Text>
-                            ) : null}
-                          </>
-                        ) : null}
-                      </View>
-                    );
-                  })()}
-                </View>
-              ) : null}
+              <KanjiSection
+                cfg={cfg}
+                kanjiDetails={kanjiDetails}
+                kanjiLoading={kanjiLoading}
+                showKanjiPanel={showKanjiPanel}
+                showMnemonic={showMnemonic}
+                colors={colors}
+                onToggleKanji={(next) => {
+                  setShowKanjiPanel(next);
+                  setShowMnemonic(false);
+                }}
+                onToggleMnemonic={() => setShowMnemonic((v) => !v)}
+              />
 
-              {/* Frequent actions stay reachable; mining tools live behind Mine
-                  so a lookup never opens as a miniature app. */}
-              <View style={[s.quickActions, { borderTopColor: colors.separator }]}>
-                {cfg?.showAddButton ? (
-                  <Pressable
-                    onPress={() => mine()}
-                    disabled={adding}
-                    style={({ pressed }) => [s.primaryAction, { backgroundColor: done || inDeck ? colors.systemFill : colors.primary, opacity: pressed ? 0.82 : 1 }]}
-                  >
-                    {adding
-                      ? <ActivityIndicator size="small" color="#fff" />
-                      : <><Icon name={done || inDeck ? 'check' : 'plus'} size={14} color={done || inDeck ? colors.primary : '#fff'} strokeWidth={2.3} /><Text style={[s.quickActionText, { color: done || inDeck ? colors.primary : '#fff' }]}>{done || inDeck ? 'Added' : 'Add'}</Text></>}
-                  </Pressable>
-                ) : null}
-                <Pressable
-                  onPress={() => toggleFlag('never-forget')}
-                  style={({ pressed }) => [s.quickAction, { backgroundColor: isNeverForget ? ghostPurple.borderColor + '22' : pressed ? colors.systemFill : 'transparent' }]}
-                >
-                  {flagLoading === 'never-forget' ? <ActivityIndicator size="small" color={ghostPurple.fg} /> : <Text style={[s.quickActionText, { color: ghostPurple.fg }]}>{isNeverForget ? 'Remembering' : 'Remember'}</Text>}
-                </Pressable>
-                <Pressable
-                  onPress={toggleExamples}
-                  style={({ pressed }) => [s.quickAction, { backgroundColor: showExamples ? exampleAccent + '1F' : pressed ? colors.systemFill : 'transparent' }]}
-                  accessibilityState={{ expanded: showExamples }}
-                >
-                  <Icon name="play" size={12} color={exampleAccent} strokeWidth={2} />
-                  <Text style={[s.quickActionText, { color: exampleAccent }]}>Examples</Text>
-                </Pressable>
-                <Pressable
-                  onPress={explainWithGemini}
-                  style={({ pressed }) => [s.quickAction, { backgroundColor: pressed ? colors.systemFill : 'transparent', opacity: geminiLoading ? 0.6 : 1 }]}
-                  accessibilityLabel="Explain with AI"
-                >
-                  {geminiLoading
-                    ? <ActivityIndicator size="small" color={ghostPurple.fg} />
-                    : <Text style={[s.quickActionText, { color: ghostPurple.fg }]}>AI</Text>}
-                </Pressable>
-                {cfg?.showBlacklistButton ? (
-                  <Pressable
-                    onPress={() => toggleFlag('blacklist')}
-                    style={({ pressed }) => [s.quickAction, { backgroundColor: isBlacklisted ? colors.error + '1F' : pressed ? colors.systemFill : 'transparent' }]}
-                    accessibilityLabel="Blacklist"
-                  >
-                    {flagLoading === 'blacklist'
-                      ? <ActivityIndicator size="small" color={colors.error} />
-                      : <Text style={[s.quickActionText, { color: colors.error }]}>Hide</Text>}
-                  </Pressable>
-                ) : null}
-                <Pressable
-                  onPress={() => { Haptics.selectionAsync(); setShowDetails((v) => !v); }}
-                  style={({ pressed }) => [s.quickAction, { backgroundColor: pressed ? colors.systemFill : 'transparent' }]}
-                >
-                  <Text style={[s.quickActionText, { color: colors.primary }]}>{showDetails ? 'Less' : 'Mine'}</Text>
-                  <Icon name={showDetails ? 'chevronDown' : 'chevronRight'} size={13} color={colors.primary} strokeWidth={2.2} />
-                </Pressable>
-              </View>
+              <ActionsSection
+                cfg={cfg}
+                adding={adding}
+                doneOrInDeck={done || inDeck}
+                isNeverForget={isNeverForget}
+                isBlacklisted={isBlacklisted}
+                flagLoading={flagLoading}
+                showExamples={showExamples}
+                geminiLoading={geminiLoading}
+                showDetails={showDetails}
+                colors={colors}
+                ghostPurple={ghostPurple}
+                exampleAccent={exampleAccent}
+                onMine={() => { void mine(); }}
+                onToggleFlag={handleToggleFlag}
+                onToggleExamples={toggleExamples}
+                onExplain={explainWithGemini}
+                onToggleDetails={() => { Haptics.selectionAsync(); setShowDetails((v) => !v); }}
+              />
 
-              {showExamples ? (
-                <View style={[s.exampleCard, { backgroundColor: colors.systemFill, borderColor: colors.separator }]}>
-                  <View style={s.exampleHeader}>
-                    <Text numberOfLines={1} style={[s.exampleSource, { color: colors.secondaryLabel }]}>
-                      {currentExample?.sourceTitle || 'ImmersionKit'}
-                    </Text>
-                    {ikExamples?.length ? (
-                      <View style={s.exampleNav}>
-                        <Pressable onPress={() => moveExample(-1)} disabled={ikExamples.length < 2} style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : 'transparent', opacity: ikExamples.length < 2 ? 0.3 : 1 }]} accessibilityLabel="Previous example">
-                          <Icon name="chevronLeft" size={14} color={colors.primary} strokeWidth={2.2} />
-                        </Pressable>
-                        <Text style={[s.exampleCounter, { color: colors.secondaryLabel }]}>{ikIndex + 1}/{ikExamples.length}</Text>
-                        <Pressable onPress={() => moveExample(1)} disabled={ikExamples.length < 2} style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : 'transparent', opacity: ikExamples.length < 2 ? 0.3 : 1 }]} accessibilityLabel="Next example">
-                          <Icon name="chevronRight" size={14} color={colors.primary} strokeWidth={2.2} />
-                        </Pressable>
-                        <View style={[s.exampleControlDivider, { backgroundColor: colors.separator }]} />
-                        <Pressable
-                          onPress={toggleExamplePlay}
-                          disabled={!currentExample?.soundUrl}
-                          style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : 'transparent', opacity: currentExample?.soundUrl ? 1 : 0.3 }]}
-                          accessibilityLabel={ikPlaying && !ikLooping && !ikPlayingAll ? 'Stop example audio' : 'Play example audio'}
-                        >
-                          <Icon name={ikPlaying && !ikLooping && !ikPlayingAll ? 'pause' : 'play'} size={13} color={exampleAccent} strokeWidth={2} />
-                        </Pressable>
-                        <Pressable
-                          onPress={toggleExampleLoop}
-                          disabled={!currentExample?.soundUrl}
-                          style={({ pressed }) => [s.exampleNavBtn, { backgroundColor: ikLooping ? exampleAccent + '26' : pressed ? colors.tertiarySystemFill : 'transparent', opacity: currentExample?.soundUrl ? 1 : 0.3 }]}
-                          accessibilityLabel={ikLooping ? 'Stop repeating example' : 'Repeat current example'}
-                          accessibilityState={{ selected: ikLooping }}
-                        >
-                          <Icon name="repeat" size={15} color={ikLooping ? exampleAccent : colors.secondaryLabel} strokeWidth={2} />
-                        </Pressable>
-                        <Pressable
-                          onPress={() => void togglePlayAll()}
-                          style={({ pressed }) => [s.exampleAllBtn, { backgroundColor: ikPlayingAll ? exampleAccent + '26' : pressed ? colors.tertiarySystemFill : 'transparent' }]}
-                          accessibilityLabel={ikPlayingAll ? 'Stop all examples' : 'Play all examples'}
-                          accessibilityState={{ selected: ikPlayingAll }}
-                        >
-                          <Text style={[s.exampleAllText, { color: ikPlayingAll ? exampleAccent : colors.secondaryLabel }]}>{ikPlayingAll ? 'Stop' : 'All'}</Text>
-                        </Pressable>
-                      </View>
-                    ) : null}
-                  </View>
-
-                  {ikLoading ? (
-                    <View style={s.exampleLoading}>
-                      <ActivityIndicator size="small" color={exampleAccent} />
-                      <Text style={[s.footnote, { color: colors.secondaryLabel }]}>Finding natural examples…</Text>
-                    </View>
-                  ) : ikError ? (
-                    <View style={s.exampleLoading}>
-                      <Text style={[s.footnote, { color: colors.secondaryLabel, flex: 1 }]}>{ikError}</Text>
-                      <Pressable onPress={() => fetchImmersion(spelling)} style={({ pressed }) => [s.exampleRetry, { backgroundColor: pressed ? colors.tertiarySystemFill : colors.secondarySystemFill }]}>
-                        <Text style={[s.quickActionText, { color: colors.primary }]}>Retry</Text>
-                      </Pressable>
-                    </View>
-                  ) : currentExample ? (
-                    <>
-                      {currentExample.imageUrl ? (
-                        <Pressable onPress={toggleExamplePlay} style={s.exampleImageWrap} accessibilityLabel={ikPlaying ? 'Stop example audio' : 'Play example audio'}>
-                          <Image source={{ uri: currentExample.imageUrl }} style={StyleSheet.absoluteFill as any} contentFit="cover" transition={180} cachePolicy="memory-disk" />
-                          {currentExample.soundUrl ? (
-                            <View style={s.examplePlayOverlay}>
-                              <Icon name={ikPlaying ? 'pause' : 'audio'} size={17} color="#fff" strokeWidth={2.2} />
-                            </View>
-                          ) : null}
-                        </Pressable>
-                      ) : null}
-                      <View style={s.exampleCopy}>
-                        <View style={{ flexDirection: 'row', gap: 8, alignItems: 'flex-start' }}>
-                          <Text style={[s.exampleSentence, { color: colors.onSurface }]}>{immersionText(currentExample.sentence) || '—'}</Text>
-                          {!currentExample.imageUrl && currentExample.soundUrl ? (
-                            <Pressable onPress={toggleExamplePlay} style={({ pressed }) => [s.exampleAudioBtn, { backgroundColor: pressed ? colors.tertiarySystemFill : colors.secondarySystemFill }]} accessibilityLabel={ikPlaying ? 'Stop example audio' : 'Play example audio'}>
-                              <Icon name={ikPlaying ? 'pause' : 'audio'} size={16} color={colors.primary} strokeWidth={2.2} />
-                            </Pressable>
-                          ) : null}
-                        </View>
-                        {currentExample.translation ? <Text style={[s.exampleTranslation, { color: colors.secondaryLabel }]}>{immersionText(currentExample.translation)}</Text> : null}
-                      </View>
-                    </>
-                  ) : null}
-                </View>
-              ) : null}
+              <ExamplesSection
+                showExamples={showExamples}
+                currentExample={currentExample ?? undefined}
+                ikExamples={ikExamples}
+                ikIndex={ikIndex}
+                ikLoading={ikLoading}
+                ikError={ikError}
+                ikPlaying={ikPlaying}
+                ikLooping={ikLooping}
+                ikPlayingAll={ikPlayingAll}
+                colors={colors}
+                exampleAccent={exampleAccent}
+                onMove={moveExample}
+                onTogglePlay={toggleExamplePlay}
+                onToggleLoop={toggleExampleLoop}
+                onTogglePlayAll={togglePlayAll}
+                onRetry={() => fetchImmersion(spelling)}
+              />
 
               {/* Review buttons — solid traffic-light pills, opt-in via Settings */}
-              {showDetails && cfg?.showReviewButtons === true ? (
-                <View style={[s.reviewRow, { borderBottomColor: colors.separator }]}>
-                  {(['nothing', 'something', 'hard', 'good', 'easy'] as const).map((r) => (
-                    <Pressable key={r} onPress={() => review(r)} style={({ pressed }) => [s.reviewBtn, { backgroundColor: reviewColor(r, colors.primary, isDark), opacity: pressed ? 0.8 : 1 }]}>
-                      {reviewLoading === r
-                        ? <ActivityIndicator size="small" color="#fff" />
-                        : <Text style={s.reviewText}>{r === 'nothing' ? 'Nothing' : r === 'something' ? 'Something' : r[0].toUpperCase() + r.slice(1)}</Text>}
-                    </Pressable>
-                  ))}
-                </View>
-              ) : null}
+              <ReviewSection
+                showDetails={showDetails}
+                showReviewButtons={cfg?.showReviewButtons}
+                reviewLoading={reviewLoading}
+                onReview={(r) => review(r)}
+                colors={colors}
+                primary={colors.primary}
+                isDark={isDark}
+              />
 
-              {/* Sentence — collapsed disclosure (auto-mined from context; tap to tweak) */}
-              {showDetails ? <View style={[s.section, { marginTop: 8 }]}>
-                <Pressable
-                  onPress={() => { Haptics.selectionAsync(); setShowSentence((v) => !v); }}
-                  style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
-                  hitSlop={6}
-                >
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
-                    <Text style={[s.posText, { color: colors.secondaryLabel }]}>Sentence</Text>
-                    <Icon name={showSentence ? 'chevronDown' : 'chevronRight'} size={13} color={colors.tertiaryLabel} strokeWidth={2.2} />
-                  </View>
-                  <Pressable onPress={() => setForq((v) => !v)} style={[s.forqPill, { backgroundColor: forq ? colors.primary : 'transparent', borderColor: forq ? colors.primary : colors.separator }]}>
-                    <Text style={[s.forqText, { color: forq ? '#fff' : colors.secondaryLabel }]}>{forq ? '✓ FORQ' : 'FORQ'}</Text>
-                  </Pressable>
-                </Pressable>
-                {!showSentence && sentence ? (
-                  <Text style={[s.footnote, { color: colors.secondaryLabel, marginTop: 3 }]} numberOfLines={2}>{sentence}</Text>
-                ) : null}
-                {showSentence ? (
-                  <>
-                    <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 2 }}>
-                      <Pressable
-                        onPress={() => {
-                          if (cfg && word.context) {
-                            const wider = getSentences(word, Math.min(10, cfg.contextWidth + 1));
-                            setSentence(wider);
-                            Haptics.selectionAsync();
-                          }
-                        }}
-                        hitSlop={6}
-                      >
-                        <Text style={[s.linkText, { color: colors.primary }]}>Expand context</Text>
-                      </Pressable>
-                    </View>
-                    <TextInput
-                      value={sentence}
-                      onChangeText={setSentence}
-                      placeholder="Sentence for mining"
-                      placeholderTextColor={colors.tertiaryLabel}
-                      multiline
-                      textAlignVertical="top"
-                      style={[s.textArea, { color: colors.onSurface, backgroundColor: colors.systemFill }]}
-                    />
-                    <TextInput
-                      value={translation}
-                      onChangeText={setTranslation}
-                      placeholder="Translation (optional)"
-                      placeholderTextColor={colors.tertiaryLabel}
-                      multiline
-                      textAlignVertical="top"
-                      style={[s.textArea, { minHeight: 34, marginTop: 6, color: colors.onSurface, backgroundColor: colors.systemFill }]}
-                    />
-                  </>
-                ) : null}
-              </View> : null}
+              <SentenceSection
+                showDetails={showDetails}
+                showSentence={showSentence}
+                sentence={sentence}
+                translation={translation}
+                forq={forq}
+                colors={colors}
+                onToggleSentence={() => { Haptics.selectionAsync(); setShowSentence((v) => !v); }}
+                onToggleForq={() => setForq((v) => !v)}
+                onExpandContext={() => {
+                  if (cfg && word.context) {
+                    const wider = getSentences(word, Math.min(10, cfg.contextWidth + 1));
+                    setSentence(wider);
+                    Haptics.selectionAsync();
+                  }
+                }}
+                onChangeSentence={setSentence}
+                onChangeTranslation={setTranslation}
+              />
 
-              {/* Gemini */}
-              {geminiLoading || geminiText || geminiError ? (
-                <View style={[s.aiBox, { backgroundColor: colors.systemFill, borderColor: geminiError ? colors.error : colors.separator }]}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <Text style={[s.posText, { color: geminiError ? colors.error : colors.primary }]}>AI explanation</Text>
-                    {geminiLoading ? (
-                      <ActivityIndicator size="small" color={colors.secondaryLabel} />
-                    ) : (
-                      <View style={{ flexDirection: 'row', gap: 14, alignItems: 'center' }}>
-                        {geminiError ? (
-                          <Pressable onPress={explainWithGemini}>
-                            <Text style={[s.linkText, { color: colors.primary }]}>Retry</Text>
-                          </Pressable>
-                        ) : null}
-                        <Pressable onPress={() => { setGeminiText(null); setGeminiError(null); }}>
-                          <Text style={[s.linkText, { color: colors.secondaryLabel }]}>Clear</Text>
-                        </Pressable>
-                      </View>
-                    )}
-                  </View>
-                  {geminiLoading && !geminiText ? (
-                    <Text style={[s.bodySmall, { color: colors.secondaryLabel, lineHeight: 20, marginTop: 4 }]}>Thinking…</Text>
-                  ) : geminiError ? (
-                    <Text style={[s.bodySmall, { color: colors.error, lineHeight: 20, marginTop: 4 }]}>{geminiError}</Text>
-                  ) : (
-                    <View style={{ marginTop: 6 }}>
-                      <Markdown
-                        content={geminiText ?? ''}
-                        color={colors.onSurface}
-                        mutedColor={colors.secondaryLabel}
-                        accentColor={colors.primary}
-                        codeBg={colors.tertiarySystemFill}
-                        size={14}
-                      />
-                    </View>
-                  )}
-                </View>
-              ) : null}
+              <GeminiSection
+                geminiLoading={geminiLoading}
+                geminiText={geminiText}
+                geminiError={geminiError}
+                colors={colors}
+                onRetry={explainWithGemini}
+                onClear={() => { setGeminiText(null); setGeminiError(null); }}
+              />
 
           </ScrollView>
         </Animated.View>

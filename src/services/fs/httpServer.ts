@@ -182,6 +182,77 @@ async function copyFile(srcUri: string, destUri: string) {
 // Prepare volume for WebView: returns local html file uri and baseUrl dir
 // volume.htmlUri = content://.../Detective Conan/Meitantei Konan 001.mobile.html
 // volume.uri = content://.../Detective Conan/Meitantei Konan 001
+function sanitizeCacheSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9-_ ]/g, '_');
+}
+
+function findUnzippedHtml(names: string[]): string | undefined {
+  return names.find((f) => f.endsWith('.mobile.html')) ?? names.find((f) => f.endsWith('.html'));
+}
+
+async function prepareMokuroVolume(
+  safeSeries: string,
+  safeVolume: string,
+  mokuroUri: string
+): Promise<{ localHtmlUri: string; baseUrl: string; isZipped?: boolean } | null> {
+  const seriesDir = cacheDir(safeSeries);
+  const volumeDir = cacheDir(safeSeries, safeVolume);
+  ensureDir(seriesDir);
+  ensureDir(volumeDir);
+  touchVolumeCache(volumeCacheKey(safeSeries, safeVolume));
+  await reserveSpaceFor(volumeCacheKey(safeSeries, safeVolume));
+  const zipFile = new File(seriesDir, `${safeVolume}.zip`);
+  await copyFile(mokuroUri, zipFile.uri);
+  try {
+    await unzip(zipFile.uri, volumeDir.uri);
+    // Find html inside
+    const items = volumeDir.list();
+    const names = items.map((i) => i.name);
+    const htmlName = findUnzippedHtml(names);
+    if (htmlName) {
+      const htmlFile = new File(volumeDir, htmlName);
+      return { localHtmlUri: htmlFile.uri, baseUrl: volumeDir.uri, isZipped: true };
+    }
+  } catch (e) {
+    console.warn('unzip failed', e);
+  }
+  return null;
+}
+
+function isContentVolume(htmlUri: string, uri: string): boolean {
+  return htmlUri.startsWith('content://') || uri.startsWith('content://');
+}
+
+async function copyVolumeImages(volumeUri: string, cacheVolumeDir: Directory, onProgress?: (done: number, total: number) => void) {
+  const probe = new File(cacheVolumeDir, 'page0001.jpeg');
+  if (probe.exists) {
+    onProgress?.(1, 1);
+    return;
+  }
+  const all = new Directory(volumeUri).list();
+  const imgs = all.filter(
+    (entry) => !(entry instanceof Directory) && /\.(jpeg|jpg|png|webp)$/i.test(entry.name)
+  );
+  let done = 0;
+  onProgress?.(0, imgs.length);
+  for (const entry of imgs) {
+    await copySingleImage(entry, cacheVolumeDir);
+    done++;
+    if (done % 10 === 0 || done === imgs.length) onProgress?.(done, imgs.length);
+  }
+}
+
+async function copySingleImage(entry: File | Directory, cacheVolumeDir: Directory) {
+  if (entry instanceof Directory) return;
+  const dest = new File(cacheVolumeDir, entry.name);
+  if (dest.exists) return;
+  try {
+    await copyFile(entry.uri, dest.uri);
+  } catch (e) {
+    console.warn('copy image', entry.name, e);
+  }
+}
+
 export async function prepareVolumeForWebView(
   volume: {
     htmlUri?: string;
@@ -193,40 +264,19 @@ export async function prepareVolumeForWebView(
   onProgress?: (done: number, total: number) => void
 ): Promise<{ localHtmlUri: string; baseUrl: string; isZipped?: boolean }> {
   const seriesName = volume.series ?? 'Detective Conan';
-  const safeSeries = seriesName.replace(/[^a-zA-Z0-9-_ ]/g, '_');
-  const safeVolume = volume.title.replace(/[^a-zA-Z0-9-_ ]/g, '_');
+  const safeSeries = sanitizeCacheSegment(seriesName);
+  const safeVolume = sanitizeCacheSegment(volume.title);
 
   // Handle .mokuro zip (single file share, iOS friendly) - unzip to cache
   if (volume.mokuroUri && !volume.htmlUri) {
-    const seriesDir = cacheDir(safeSeries);
-    const volumeDir = cacheDir(safeSeries, safeVolume);
-    ensureDir(seriesDir);
-    ensureDir(volumeDir);
-    touchVolumeCache(volumeCacheKey(safeSeries, safeVolume));
-    await reserveSpaceFor(volumeCacheKey(safeSeries, safeVolume));
-    const zipFile = new File(seriesDir, `${safeVolume}.zip`);
-    await copyFile(volume.mokuroUri, zipFile.uri);
-    try {
-      await unzip(zipFile.uri, volumeDir.uri);
-      // Find html inside
-      const items = volumeDir.list();
-      const names = items.map((i) => i.name);
-      const htmlName =
-        names.find((f) => f.endsWith('.mobile.html')) ?? names.find((f) => f.endsWith('.html'));
-      if (htmlName) {
-        const htmlFile = new File(volumeDir, htmlName);
-        return { localHtmlUri: htmlFile.uri, baseUrl: volumeDir.uri, isZipped: true };
-      }
-    } catch (e) {
-      console.warn('unzip failed', e);
-    }
+    const unzipped = await prepareMokuroVolume(safeSeries, safeVolume, volume.mokuroUri);
+    if (unzipped) return unzipped;
   }
 
   if (!volume.htmlUri) throw new Error('No htmlUri for volume');
 
   // Content:// needs copy to cache for file:// WebView access
-  const isContentUri = volume.htmlUri.startsWith('content://') || volume.uri.startsWith('content://');
-  if (Platform.OS === 'web' || !isContentUri) {
+  if (Platform.OS === 'web' || !isContentVolume(volume.htmlUri, volume.uri)) {
     // file:// can be loaded directly - baseUrl is parent dir
     const baseUrl = volume.uri.endsWith('/') ? volume.uri : volume.uri + '/';
     return { localHtmlUri: volume.htmlUri, baseUrl };
@@ -255,31 +305,7 @@ export async function prepareVolumeForWebView(
 
   // Copy images for this volume (lazy, only if not cached)
   try {
-    const probe = new File(cacheVolumeDir, 'page0001.jpeg');
-    if (!probe.exists) {
-      const all = new Directory(volume.uri).list();
-      const imgs = all.filter(
-        (entry) =>
-          !(entry instanceof Directory) &&
-          /\.(jpeg|jpg|png|webp)$/i.test(entry.name)
-      );
-      let done = 0;
-      onProgress?.(0, imgs.length);
-      for (const entry of imgs) {
-        const dest = new File(cacheVolumeDir, entry.name);
-        if (!dest.exists) {
-          try {
-            await copyFile(entry.uri, dest.uri);
-          } catch (e) {
-            console.warn('copy image', entry.name, e);
-          }
-        }
-        done++;
-        if (done % 10 === 0 || done === imgs.length) onProgress?.(done, imgs.length);
-      }
-    } else {
-      onProgress?.(1, 1);
-    }
+    await copyVolumeImages(volume.uri, cacheVolumeDir, onProgress);
   } catch (e) {
     console.warn('copy images', e);
   }

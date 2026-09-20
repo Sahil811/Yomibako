@@ -699,7 +699,7 @@ export const YOMIBAKO_JS = `
     // The spread wrapper is Yomibako's own node, not a late-arriving mokuro page.
     if(page && page.classList && page.classList.contains('yomibako-spread')) return;
     if(!ownedPages || !page || ownedPages.indexOf(page)>=0) return;
-    var match=String(page.id||'').match(/^page(\d+)$/);
+    var match=String(page.id||'').match(/^page([0-9]+)$/);
     var at=match?Number(match[1]):-1;
     if(at>=0 && at<=ownedPages.length) ownedPages.splice(at,0,page);
     else ownedPages.push(page);
@@ -1314,7 +1314,7 @@ export const YOMIBAKO_JS = `
       }
       var surface=pageSurface(next);
       var background=(surface.style&&surface.style.backgroundImage)||'';
-      var match=background.match(/url\(["']?([^"')]+)["']?\)/);
+      var match=background.match(/url[(]["']?([^"')]+)["']?[)]/);
       if(match&&match[1]) urls.push(match[1]);
       warmedAssets.length=0;
       for(i=0;i<urls.length&&i<3;i++){

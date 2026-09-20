@@ -6,7 +6,8 @@ import { BlurView } from 'expo-blur';
 import { StatusBar } from 'expo-status-bar';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
-import Animated, { runOnJS, useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import Animated, { useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import { runOnJS } from 'react-native-worklets';
 import * as Haptics from 'expo-haptics';
 import { darkColors } from '../../theme/colors';
 import { Icon } from '../../components/ui/Icon';
@@ -24,98 +25,61 @@ import {
 import { loadConfig } from '../../services/jpdb/config';
 import { useWordAudio } from '../shared/useWordAudio';
 import QuizModal from '../quiz/QuizModal';
+import {
+  applyInteractionState,
+  applyToggleOptionsSideEffects,
+  applyWordHover,
+  clearAnchoredWord,
+  clearToastTimer,
+  clamp01,
+  computeSeekPage,
+  computeToggleOptionsNext,
+  currentIndexFor,
+  decideCenterTap,
+  formatPageLabel,
+  handleControlInfo,
+  hideChromeForWord,
+  isReadableVolume,
+  maybePlayTapAudio,
+  mergePageState,
+  nextProgressValue,
+  reanchorWord,
+  shouldShowFab,
+  shouldShowOptions,
+  shouldShowWebView,
+  type ReaderPageState,
+} from './readerHelpers';
 
 const AUTO_HIDE_MS = 2200;
-const clamp01 = (value: number) => Math.max(0, Math.min(1, value));
 
-function Chip({ label, active, onPress }: { label: string; active?: boolean; onPress: () => void }) {
+function ReaderEmptyState({ onBack }: { readonly onBack: () => void }) {
+  const colors = darkColors;
   return (
-    <Pressable
-      onPress={onPress}
-      hitSlop={4}
-      accessibilityRole="button"
-      accessibilityState={{ selected: !!active }}
-      style={({ pressed }) => [s.chip, active && s.chipActive, pressed && s.pressed]}
-    >
-      <Text style={[s.chipText, active && s.chipTextActive]}>{label}</Text>
-    </Pressable>
-  );
-}
-
-// Zoom is one choice out of three, so it reads as a segmented control rather
-// than three chips that look independently toggleable.
-function Segmented({
-  items,
-  selected,
-  onSelect,
-}: {
-  items: { key: ZoomMode; label: string }[];
-  selected: ZoomMode;
-  onSelect: (key: ZoomMode) => void;
-}) {
-  return (
-    <View style={s.segment}>
-      {items.map((item) => (
-        <Pressable
-          key={item.key}
-          onPress={() => onSelect(item.key)}
-          accessibilityRole="button"
-          accessibilityState={{ selected: selected === item.key }}
-          style={({ pressed }) => [s.segmentItem, selected === item.key && s.segmentItemActive, pressed && s.pressed]}
-        >
-          <Text style={[s.chipText, selected === item.key && s.chipTextActive]}>{item.label}</Text>
-        </Pressable>
-      ))}
+    <View style={[s.root, s.empty]}>
+      <Icon name="book" size={28} color={colors.secondaryLabel} strokeWidth={1.6} />
+      <Text style={s.emptyTitle}>No readable file</Text>
+      <Text style={s.emptySub}>This volume has no HTML to display.</Text>
+      <Pressable onPress={onBack} style={s.emptyButton}>
+        <Text style={s.emptyButtonText}>Back to Library</Text>
+      </Pressable>
     </View>
   );
 }
 
-export default function ReaderScreen() {
-  const route = useRoute<any>();
-  const navigation = useNavigation<any>();
-  const insets = useSafeAreaInsets();
-  const colors = darkColors;
-  const volume = route.params.volume as {
-    htmlUri?: string;
-    mokuroUri?: string;
-    uri: string;
-    title: string;
-    series?: string;
-    pageCount?: number;
-    progressKey?: string;
-  };
-  const progressUri = volume.progressKey ?? volume.uri;
-
-  const readerRef = useRef<MokuroWebViewHandle>(null);
-  const [resumePage, setResumePage] = useState<number | null>(null);
-  const [prefs, setPrefs] = useState<ReaderPreferences | null>(null);
-  const [word, setWord] = useState<any>(null);
-  const [chromeVisible, setChromeVisible] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [scrubTo, setScrubTo] = useState<number | null>(null);
-  const [page, setPage] = useState({ index: -1, total: volume.pageCount ?? 0, paged: false, rtl: false, twoPage: false });
-  const [optionsOpen, setOptionsOpen] = useState(false);
-  const [mokuroMenu, setMokuroMenu] = useState(false);
-  const [zoomMode, setZoomMode] = useState<ZoomMode>(defaultReaderPreferences.zoomMode);
-  const [controlError, setControlError] = useState<string | null>(null);
-  const [quizWords, setQuizWords] = useState<any[] | null>(null);
-
-  const interactionRef = useRef({ showPopupOnHover: true, playSoundOnHover: false });
-  const wordRef = useRef<any>(null);
-  const chromeRef = useRef(false);
-  const optionsRef = useRef(false);
-  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastToastPage = useRef(-1);
-  wordRef.current = word;
-  chromeRef.current = chromeVisible;
-  optionsRef.current = optionsOpen;
-
+function useChromeController(
+  readerRef: React.RefObject<MokuroWebViewHandle | null>,
+  wordRef: React.RefObject<any>,
+  optionsRef: React.RefObject<boolean>,
+) {
   const headerY = useSharedValue(-240);
   const footerY = useSharedValue(180);
   const headerH = useSharedValue(90);
   const footerH = useSharedValue(80);
   const toastOpacity = useSharedValue(0);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [chromeVisible, setChromeVisible] = useState(false);
+  const [optionsOpen, setOptionsOpen] = useState(false);
+  const [mokuroMenu, setMokuroMenu] = useState(false);
 
   const clearHideTimer = useCallback(() => {
     if (hideTimer.current) {
@@ -131,11 +95,13 @@ export default function ReaderScreen() {
     setOptionsOpen(false);
     setMokuroMenu((open) => {
       // Putting the chrome away also closes mokuro's own menu.
-      if (open) readerRef.current?.setMokuroMenu(false);
+      if (open) {
+        readerRef.current?.setMokuroMenu(false);
+      }
       return false;
     });
     setChromeVisible(false);
-  }, [clearHideTimer, footerH, footerY, headerH, headerY]);
+  }, [clearHideTimer, footerH, footerY, headerH, headerY, readerRef]);
 
   const showChrome = useCallback(() => {
     clearHideTimer();
@@ -145,244 +111,55 @@ export default function ReaderScreen() {
     hideTimer.current = setTimeout(() => {
       hideTimer.current = null;
       // Never steal the chrome out from under an open lookup or options bar.
-      if (!wordRef.current && !optionsRef.current) hideChrome();
+      if (!wordRef.current && !optionsRef.current) {
+        hideChrome();
+      }
     }, AUTO_HIDE_MS);
-  }, [clearHideTimer, footerY, headerY, hideChrome]);
+  }, [clearHideTimer, footerY, headerY, hideChrome, wordRef, optionsRef]);
 
-  const applyInteraction = useCallback(async (forceReload = false) => {
-    const config = await loadConfig(forceReload);
-    interactionRef.current = {
-      showPopupOnHover: config.showPopupOnHover !== false,
-      playSoundOnHover: !!config.playSoundOnHover,
-    };
-  }, []);
+  const headerStyle = useAnimatedStyle(() => ({ transform: [{ translateY: headerY.value }] }));
+  const footerStyle = useAnimatedStyle(() => ({ transform: [{ translateY: footerY.value }] }));
+  // Rides on the footer's own animation: lift equals how far the footer has
+  // travelled into view, so the two can never sit on top of each other.
+  // Clamped at 0 because footerY starts below footerH (chrome starts hidden),
+  // which would otherwise push the button off the bottom of the screen until
+  // the chrome had been shown once.
+  const fabStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: -Math.max(0, footerH.value - footerY.value) }],
+  }));
+  const toastStyle = useAnimatedStyle(() => ({ opacity: toastOpacity.value }));
 
-  useEffect(() => {
-    let cancelled = false;
-    Promise.all([getSavedPage(progressUri), loadConfig(), loadReaderPreferences()]).then(([saved, config, savedPrefs]) => {
-      if (cancelled) return;
-      interactionRef.current = {
-        showPopupOnHover: config.showPopupOnHover !== false,
-        playSoundOnHover: !!config.playSoundOnHover,
-      };
-      setPrefs(savedPrefs);
-      setZoomMode(savedPrefs.zoomMode);
-      setPage((previous) => ({ ...previous, rtl: savedPrefs.rtl, twoPage: savedPrefs.twoPage }));
-      setResumePage(saved ?? 0);
-    });
-    return () => { cancelled = true; };
-  }, [progressUri]);
+  return {
+    headerY, footerY, headerH, footerH, toastOpacity,
+    chromeVisible, setChromeVisible, optionsOpen, setOptionsOpen,
+    mokuroMenu, setMokuroMenu, hideTimer,
+    clearHideTimer, hideChrome, showChrome,
+    headerStyle, footerStyle, fabStyle, toastStyle,
+  };
+}
 
-  useEffect(() => navigation.addListener('focus', () => { void applyInteraction(false); }), [applyInteraction, navigation]);
-
-  useEffect(() => {
-    if (Platform.OS !== 'android') return;
-    void import('expo-navigation-bar')
-      .then(({ NavigationBar }) => NavigationBar.setHidden(true))
-      .catch(() => {});
-    return () => {
-      void import('expo-navigation-bar')
-        .then(({ NavigationBar }) => NavigationBar.setHidden(false))
-        .catch(() => {});
-    };
-  }, []);
-
-  useEffect(() => {
-    // Respect the user's device rotation lock. SCREEN_ORIENTATION_USER (2) on
-    // Android honours the system auto-rotate toggle, so the reader stays put
-    // when auto-rotate is off. On iOS, DEFAULT already follows the lock.
-    const applyRotationPolicy = Platform.OS === 'android'
-      ? ScreenOrientation.lockPlatformAsync({ screenOrientationConstantAndroid: 2 })
-      : ScreenOrientation.unlockAsync();
-
-    void applyRotationPolicy.catch((error) => {
-      console.warn('[Reader] could not apply rotation policy', error);
-    });
-
-    return () => {
-      void ScreenOrientation.unlockAsync().catch((error) => {
-        console.warn('[Reader] could not restore orientation policy', error);
-      });
-    };
-  }, []);
-
-  const { cancel: cancelHoverAudio, scheduleHover: scheduleHoverAudio, playNow: playWordAudio } = useWordAudio();
-
-  // The page reports progress on every scroll frame. Re-rendering the whole
-  // reader chrome at 60fps drops frames — only commit visible changes.
-  const handleProgress = useCallback((p: number) => {
-    setProgress((prev) => (Math.abs(prev - p) < 0.003 ? prev : p));
-  }, []);
-
-  const dismissWord = useCallback(() => {
-    cancelHoverAudio(true);
-    // Guarded: onPage calls this on every turn, and injecting into the WebView
-    // when nothing is anchored is pure waste.
-    if (wordRef.current) readerRef.current?.clearAnchor();
-    setWord(null);
-  }, [cancelHoverAudio]);
-
-  useEffect(() => navigation.addListener('blur', dismissWord), [dismissWord, navigation]);
-  useEffect(() => () => {
-    clearHideTimer();
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    void flushProgress();
-    void flushReaderPreferences();
-  }, [clearHideTimer]);
-
-  // Only the presence of a lookup should put the chrome away. Anchor updates
-  // replace the word object on every pan, and hiding on each of those would
-  // churn state for the whole gesture.
-  const hasWord = !!word;
-  useEffect(() => {
-    if (hasWord) hideChrome();
-  }, [hideChrome, hasWord]);
-
-  const onWordTap = useCallback((nextWord: any) => {
-    cancelHoverAudio(true);
-    setOptionsOpen(false);
-    setWord(nextWord);
-    // "Auto-play pronunciation" — a tap plays the word's audio immediately.
-    if (interactionRef.current.playSoundOnHover) playWordAudio(nextWord);
-    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  }, [cancelHoverAudio, playWordAudio]);
-
-  const onWordHover = useCallback((nextWord: any) => {
-    const interaction = interactionRef.current;
-    if (interaction.showPopupOnHover) {
-      setOptionsOpen(false);
-      setWord(nextWord);
-    }
-    if (interaction.playSoundOnHover) scheduleHoverAudio(nextWord);
-    else cancelHoverAudio(true);
-  }, [cancelHoverAudio, scheduleHoverAudio]);
-
-  // Panning or zooming moves the page under an open popup. Re-anchor to the
-  // word's new position instead of leaving the card pointing at blank page.
-  // The tap point is deliberately dropped: the finger has since moved, so it
-  // no longer marks anything the popup needs to avoid.
-  const onWordAnchor = useCallback((next: any) => {
-    setWord((previous: any) =>
-      previous
-        ? { ...previous, rect: next.rect, rects: next.rects, boxRect: next.boxRect, vertical: next.vertical, vw: next.vw, point: null }
-        : previous
-    );
-  }, []);
-
-  const handleCenterTap = useCallback(() => {
-    if (wordRef.current) dismissWord();
-    else if (chromeRef.current) hideChrome();
-    else showChrome();
-    void Haptics.selectionAsync();
-  }, [dismissWord, hideChrome, showChrome]);
-
-  const onPage = useCallback((info: ReaderPageInfo) => {
-    if (info.zoomMode) setZoomMode(info.zoomMode);
-    setMokuroMenu(info.menuOpen);
-    setPage((previous) => previous.index === info.index && previous.total === info.total && previous.paged === info.paged
-      && previous.rtl === info.rtl && previous.twoPage === info.twoPage
-      ? previous
-      : { index: info.index, total: info.total, paged: info.paged, rtl: info.rtl, twoPage: info.twoPage });
-    if (info.index >= 0) savePage(progressUri, info.index, info.total || volume.pageCount);
-    if (info.index >= 0 && info.index !== lastToastPage.current) {
-      const first = lastToastPage.current < 0;
-      lastToastPage.current = info.index;
-      if (!first) {
-        dismissWord();
-        void Haptics.selectionAsync();
-        if (!chromeRef.current) {
-          toastOpacity.value = withTiming(1, { duration: 90 });
-          if (toastTimer.current) clearTimeout(toastTimer.current);
-          toastTimer.current = setTimeout(() => {
-            toastTimer.current = null;
-            toastOpacity.value = withTiming(0, { duration: 260 });
-          }, 650);
-        }
-      }
-    }
-  }, [dismissWord, progressUri, toastOpacity, volume.pageCount]);
-
-  const onControl = useCallback((info: ReaderControlInfo) => {
-    if (!info.ok) {
-      setControlError('This file does not expose that control.');
-      return;
-    }
-    setControlError(null);
-    if (info.key === 'zoom' && info.mode) {
-      setZoomMode(info.mode);
-      setReaderPreferences({ zoomMode: info.mode });
-    }
-    if (info.key === 'twoPage' && typeof info.value === 'boolean') {
-      const value = info.value;
-      setPage((previous) => ({ ...previous, twoPage: value }));
-      setReaderPreferences({ twoPage: value });
-    }
-    if (info.key === 'rtl' && typeof info.value === 'boolean') {
-      const value = info.value;
-      setPage((previous) => ({ ...previous, rtl: value }));
-      setReaderPreferences({ rtl: value });
-    }
-  }, []);
-
-  const total = page.total || volume.pageCount || 0;
-  const canPage = page.paged && total > 1;
-  const currentIndex = Math.max(0, scrubTo ?? page.index);
-  const pageLabel = canPage ? `${Math.min(total, currentIndex + 1)} / ${total}` : `${Math.round(progress * 100)}%`;
-
-  const step = useCallback((delta: number) => {
-    readerRef.current?.step(delta);
-    void Haptics.selectionAsync();
-    showChrome();
-  }, [showChrome]);
-
-  // Options bar actions — every one keeps the chrome alive so the bar does not
-  // vanish mid-interaction.
-  const act = useCallback((fn: () => void) => {
-    void Haptics.selectionAsync();
-    fn();
-    showChrome();
-  }, [showChrome]);
-
-  const toggleOptions = useCallback(() => {
-    void Haptics.selectionAsync();
-    setOptionsOpen((open) => {
-      const next = !open;
-      if (!next && mokuroMenu) {
-        setMokuroMenu(false);
-        readerRef.current?.setMokuroMenu(false);
-      }
-      return next;
-    });
-    showChrome();
-  }, [mokuroMenu, showChrome]);
-
-  // The page already holds every parsed card, so the quiz just asks for them.
-  // quizWords stays null until the WebView answers, which is what opens it.
-  const startQuiz = useCallback(() => {
-    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    dismissWord();
-    setOptionsOpen(false);
-    readerRef.current?.collectWords();
-  }, [dismissWord]);
-
-  const onWords = useCallback((words: any[]) => {
-    hideChrome();
-    setQuizWords(words);
-  }, [hideChrome]);
-
-  const seekTo = useCallback((value: number) => {
-    if (total > 1) readerRef.current?.goToPage(Math.round(clamp01(value) * (total - 1)));
-  }, [total]);
-
+function useScrubController(
+  total: number,
+  progress: number,
+  showChrome: () => void,
+  seekTo: (value: number) => void,
+) {
+  const [scrubTo, setScrubTo] = useState<number | null>(null);
   const trackW = useSharedValue(1);
   const scrubbing = useSharedValue(0);
   const scrubValue = useSharedValue(0);
   useEffect(() => {
-    if (scrubTo === null) scrubValue.value = progress;
+    if (scrubTo === null) {
+      scrubValue.value = progress;
+    }
   }, [progress, scrubTo, scrubValue]);
 
   const previewAt = useCallback((value: number) => {
-    setScrubTo(total > 1 ? Math.round(clamp01(value) * (total - 1)) : null);
+    if (total > 1) {
+      setScrubTo(Math.round(clamp01(value) * (total - 1)));
+    } else {
+      setScrubTo(null);
+    }
   }, [total]);
 
   const endScrub = useCallback((value: number) => {
@@ -409,22 +186,361 @@ export default function ReaderScreen() {
     .onEnd((event) => runOnJS(endScrub)(clamp01(event.x / Math.max(1, trackW.value))))
     .onFinalize(() => { scrubbing.value = 0; }), [endScrub, previewAt, scrubValue, scrubbing, trackW]);
 
-  const headerStyle = useAnimatedStyle(() => ({ transform: [{ translateY: headerY.value }] }));
-  const footerStyle = useAnimatedStyle(() => ({ transform: [{ translateY: footerY.value }] }));
-  // Rides on the footer's own animation: lift equals how far the footer has
-  // travelled into view, so the two can never sit on top of each other.
-  // Clamped at 0 because footerY starts below footerH (chrome starts hidden),
-  // which would otherwise push the button off the bottom of the screen until
-  // the chrome had been shown once.
-  const fabStyle = useAnimatedStyle(() => ({
-    transform: [{ translateY: -Math.max(0, footerH.value - footerY.value) }],
-  }));
   const fillStyle = useAnimatedStyle(() => ({ width: `${scrubValue.value * 100}%` }));
   const thumbStyle = useAnimatedStyle(() => ({
     left: `${scrubValue.value * 100}%`,
     transform: [{ scale: withSpring(scrubbing.value ? 1.35 : 1, { damping: 18, stiffness: 320 }) }],
   }));
-  const toastStyle = useAnimatedStyle(() => ({ opacity: toastOpacity.value }));
+
+  return { scrubTo, setScrubTo, trackW, scrubbing, scrubValue, previewAt, endScrub, scrub, fillStyle, thumbStyle };
+}
+
+function ControlErrorText({ message }: { readonly message: string | null }) {
+  if (!message) {
+    return null;
+  }
+  return <Text style={s.controlError}>{message}</Text>;
+}
+
+function PageToast({ visible, text, bottom, style }: { readonly visible: boolean; readonly text: string; readonly bottom: number; readonly style: any }) {
+  if (!visible) {
+    return null;
+  }
+  return (
+    <Animated.View pointerEvents="none" style={[s.toast, { bottom }, style]}>
+      <Text style={s.toastText}>{text}</Text>
+    </Animated.View>
+  );
+}
+
+function WordOverlay({ word, onClose, onStateChange }: { readonly word: any; readonly onClose: () => void; readonly onStateChange: (vid: number, sid: number, state: string[]) => void }) {
+  if (!word) {
+    return null;
+  }
+  return (
+    <WordSheet
+      key={`${word.vid}/${word.sid}`}
+      word={word}
+      onClose={onClose}
+      onStateChange={onStateChange}
+      forceDark
+    />
+  );
+}
+
+function QuizOverlay({ words, onClose }: { readonly words: any[] | null; readonly onClose: () => void }) {
+  if (!words) {
+    return null;
+  }
+  return <QuizModal words={words} onClose={onClose} forceDark />;
+}
+
+function triggerPageToast(
+  toastOpacity: { value: number },
+  timerRef: { current: ReturnType<typeof setTimeout> | null },
+): void {
+  toastOpacity.value = withTiming(1, { duration: 90 });
+  clearToastTimer(timerRef);
+  timerRef.current = setTimeout(() => {
+    timerRef.current = null;
+    toastOpacity.value = withTiming(0, { duration: 260 });
+  }, 650);
+}
+
+function useReaderBoot(
+  progressUri: string,
+  interactionRef: React.RefObject<{ showPopupOnHover: boolean; playSoundOnHover: boolean }>,
+  setPrefs: (p: ReaderPreferences | null) => void,
+  setZoomMode: (z: ZoomMode) => void,
+  setPage: React.Dispatch<React.SetStateAction<{ index: number; total: number; paged: boolean; rtl: boolean; twoPage: boolean }>>,
+  setResumePage: (n: number | null) => void,
+): void {
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([getSavedPage(progressUri), loadConfig(), loadReaderPreferences()]).then(([saved, config, savedPrefs]) => {
+      if (cancelled) return;
+      applyInteractionState(config, interactionRef as { current: { showPopupOnHover: boolean; playSoundOnHover: boolean } });
+      setPrefs(savedPrefs);
+      setZoomMode(savedPrefs.zoomMode);
+      setPage((previous) => ({ ...previous, rtl: savedPrefs.rtl, twoPage: savedPrefs.twoPage }));
+      setResumePage(saved ?? 0);
+    });
+    return () => { cancelled = true; };
+  }, [progressUri, interactionRef, setPrefs, setZoomMode, setPage, setResumePage]);
+}
+
+function useReaderSystemEffects(): void {
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    void import('expo-navigation-bar')
+      .then(({ NavigationBar }) => NavigationBar.setHidden(true))
+      .catch(() => {});
+    return () => {
+      void import('expo-navigation-bar')
+        .then(({ NavigationBar }) => NavigationBar.setHidden(false))
+        .catch(() => {});
+    };
+  }, []);
+
+  useEffect(() => {
+    const applyRotationPolicy = Platform.OS === 'android'
+      ? ScreenOrientation.lockPlatformAsync({ screenOrientationConstantAndroid: 2 })
+      : ScreenOrientation.unlockAsync();
+
+    void applyRotationPolicy.catch((error) => {
+      console.warn('[Reader] could not apply rotation policy', error);
+    });
+
+    return () => {
+      void ScreenOrientation.unlockAsync().catch((error) => {
+        console.warn('[Reader] could not restore orientation policy', error);
+      });
+    };
+  }, []);
+}
+
+function applyPageInfo(
+  info: ReaderPageInfo,
+  ctx: {
+    progressUri: string;
+    pageCount?: number;
+    lastToastPage: React.RefObject<number>;
+    chromeRef: React.RefObject<boolean>;
+    setZoomMode: (z: ZoomMode) => void;
+    setMokuroMenu: (b: boolean) => void;
+    setPage: React.Dispatch<React.SetStateAction<{ index: number; total: number; paged: boolean; rtl: boolean; twoPage: boolean }>>;
+    dismissWord: () => void;
+    showPageToast: () => void;
+  },
+): void {
+  if (info.zoomMode) {
+    ctx.setZoomMode(info.zoomMode);
+  }
+  ctx.setMokuroMenu(info.menuOpen);
+  ctx.setPage((previous) => mergePageState(previous, info));
+  if (info.index >= 0) {
+    savePage(ctx.progressUri, info.index, info.total || ctx.pageCount);
+  }
+  if (info.index < 0 || info.index === ctx.lastToastPage.current) {
+    return;
+  }
+  const first = (ctx.lastToastPage.current ?? -1) < 0;
+  ctx.lastToastPage.current = info.index;
+  if (first) {
+    return;
+  }
+  ctx.dismissWord();
+  void Haptics.selectionAsync();
+  if (!ctx.chromeRef.current) {
+    ctx.showPageToast();
+  }
+}
+
+function Chip({ label, active, onPress }: { readonly label: string; readonly active?: boolean; readonly onPress: () => void }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={4}
+      accessibilityRole="button"
+      accessibilityState={{ selected: !!active }}
+      style={({ pressed }) => [s.chip, active && s.chipActive, pressed && s.pressed]}
+    >
+      <Text style={[s.chipText, active && s.chipTextActive]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+// Zoom is one choice out of three, so it reads as a segmented control rather
+// than three chips that look independently toggleable.
+function Segmented({
+  items,
+  selected,
+  onSelect,
+}: {
+  readonly items: readonly { readonly key: ZoomMode; readonly label: string }[];
+  readonly selected: ZoomMode;
+  readonly onSelect: (key: ZoomMode) => void;
+}) {
+  return (
+    <View style={s.segment}>
+      {items.map((item) => (
+        <Pressable
+          key={item.key}
+          onPress={() => onSelect(item.key)}
+          accessibilityRole="button"
+          accessibilityState={{ selected: selected === item.key }}
+          style={({ pressed }) => [s.segmentItem, selected === item.key && s.segmentItemActive, pressed && s.pressed]}
+        >
+          <Text style={[s.chipText, selected === item.key && s.chipTextActive]}>{item.label}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
+type UseReaderCallbacksParams = {
+  readonly readerRef: { current: MokuroWebViewHandle | null };
+  readonly wordRef: { current: any };
+  readonly chromeRef: { current: boolean };
+  readonly interactionRef: { current: { showPopupOnHover: boolean; playSoundOnHover: boolean } };
+  readonly toastTimer: { current: ReturnType<typeof setTimeout> | null };
+  readonly lastToastPage: { current: number };
+  readonly toastOpacity: { value: number };
+  readonly navigation: any;
+  readonly volumePageCount?: number;
+  readonly progressUri: string;
+  readonly total: number;
+  readonly mokuroMenu: boolean;
+  readonly showChrome: () => void;
+  readonly hideChrome: () => void;
+  readonly setProgress: React.Dispatch<React.SetStateAction<number>>;
+  readonly setWord: React.Dispatch<React.SetStateAction<any>>;
+  readonly setOptionsOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  readonly setZoomMode: (mode: ZoomMode) => void;
+  readonly setMokuroMenu: React.Dispatch<React.SetStateAction<boolean>>;
+  readonly setPage: React.Dispatch<React.SetStateAction<ReaderPageState>>;
+  readonly setControlError: React.Dispatch<React.SetStateAction<string | null>>;
+  readonly setQuizWords: React.Dispatch<React.SetStateAction<any[] | null>>;
+  readonly cancelHoverAudio: (stop?: boolean) => void;
+  readonly scheduleHoverAudio: (word: any) => void;
+  readonly playWordAudio: (word: any) => void;
+};
+
+function useReaderCallbacks(params: UseReaderCallbacksParams) {
+  const {
+    readerRef,
+    wordRef,
+    chromeRef,
+    interactionRef,
+    toastTimer,
+    lastToastPage,
+    toastOpacity,
+    navigation,
+    volumePageCount,
+    progressUri,
+    total,
+    mokuroMenu,
+    showChrome,
+    hideChrome,
+    setProgress,
+    setWord,
+    setOptionsOpen,
+    setZoomMode,
+    setMokuroMenu,
+    setPage,
+    setControlError,
+    setQuizWords,
+    cancelHoverAudio,
+    scheduleHoverAudio,
+    playWordAudio,
+  } = params;
+
+  // The page reports progress on every scroll frame. Re-rendering the whole
+  // reader chrome at 60fps drops frames — only commit visible changes.
+  const handleProgress = useCallback((p: number) => {
+    setProgress((prev) => nextProgressValue(prev, p));
+  }, []);
+
+  const dismissWord = useCallback(() => {
+    cancelHoverAudio(true);
+    // Guarded: onPage calls this on every turn, and injecting into the WebView
+    // when nothing is anchored is pure waste.
+    clearAnchoredWord(wordRef as React.RefObject<any>, readerRef);
+    setWord(null);
+  }, [cancelHoverAudio]);
+
+  const onWordTap = useCallback((nextWord: any) => {
+    cancelHoverAudio(true);
+    setOptionsOpen(false);
+    setWord(nextWord);
+    // "Auto-play pronunciation" — a tap plays the word's audio immediately.
+    maybePlayTapAudio(interactionRef.current.playSoundOnHover, nextWord, playWordAudio);
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  }, [cancelHoverAudio, playWordAudio]);
+
+  const onWordHover = useCallback((nextWord: any) => {
+    applyWordHover(nextWord, interactionRef.current, setOptionsOpen, setWord, scheduleHoverAudio, cancelHoverAudio);
+  }, [cancelHoverAudio, scheduleHoverAudio]);
+
+  // Panning or zooming moves the page under an open popup. Re-anchor to the
+  // word's new position instead of leaving the card pointing at blank page.
+  // The tap point is deliberately dropped: the finger has since moved, so it
+  // no longer marks anything the popup needs to avoid.
+  const onWordAnchor = useCallback((next: any) => {
+    setWord((previous: any) => reanchorWord(previous, next));
+  }, []);
+
+  const handleCenterTap = useCallback(() => {
+    decideCenterTap(!!wordRef.current, chromeRef.current, dismissWord, hideChrome, showChrome);
+    void Haptics.selectionAsync();
+  }, [dismissWord, hideChrome, showChrome]);
+
+  const showPageToast = useCallback(() => {
+    triggerPageToast(toastOpacity as { value: number }, toastTimer);
+  }, [toastOpacity]);
+
+  const onPage = useCallback((info: ReaderPageInfo) => {
+    applyPageInfo(info, {
+      progressUri,
+      pageCount: volumePageCount,
+      lastToastPage: lastToastPage as React.RefObject<number>,
+      chromeRef: chromeRef as React.RefObject<boolean>,
+      setZoomMode,
+      setMokuroMenu,
+      setPage,
+      dismissWord,
+      showPageToast,
+    });
+  }, [dismissWord, progressUri, volumePageCount, showPageToast, setMokuroMenu, setPage, setZoomMode]);
+
+  const onControl = useCallback((info: ReaderControlInfo) => {
+    handleControlInfo(info, setControlError, setZoomMode, setPage);
+  }, []);
+
+  const step = useCallback((delta: number) => {
+    readerRef.current?.step(delta);
+    void Haptics.selectionAsync();
+    showChrome();
+  }, [showChrome]);
+
+  // Options bar actions — every one keeps the chrome alive so the bar does not
+  // vanish mid-interaction.
+  const act = useCallback((fn: () => void) => {
+    void Haptics.selectionAsync();
+    fn();
+    showChrome();
+  }, [showChrome]);
+
+  const toggleOptions = useCallback(() => {
+    void Haptics.selectionAsync();
+    setOptionsOpen((open) => {
+      const next = computeToggleOptionsNext(open, mokuroMenu);
+      applyToggleOptionsSideEffects(next, mokuroMenu, setMokuroMenu, readerRef);
+      return next;
+    });
+    showChrome();
+  }, [mokuroMenu, showChrome]);
+
+  // The page already holds every parsed card, so the quiz just asks for them.
+  // quizWords stays null until the WebView answers, which is what opens it.
+  const startQuiz = useCallback(() => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    dismissWord();
+    setOptionsOpen(false);
+    readerRef.current?.collectWords();
+  }, [dismissWord]);
+
+  const onWords = useCallback((words: any[]) => {
+    hideChrome();
+    setQuizWords(words);
+  }, [hideChrome]);
+
+  const seekTo = useCallback((value: number) => {
+    const pageIndex = computeSeekPage(total, value);
+    if (pageIndex !== null) {
+      readerRef.current?.goToPage(pageIndex);
+    }
+  }, [total]);
 
   const openSettings = useCallback(() => {
     void Haptics.selectionAsync();
@@ -432,24 +548,166 @@ export default function ReaderScreen() {
     navigation.navigate('Tabs', { screen: 'Settings' });
   }, [navigation]);
 
-  if (!volume.htmlUri && !volume.mokuroUri) {
-    return (
-      <View style={[s.root, s.empty]}>
-        <Icon name="book" size={28} color={colors.secondaryLabel} strokeWidth={1.6} />
-        <Text style={s.emptyTitle}>No readable file</Text>
-        <Text style={s.emptySub}>This volume has no HTML to display.</Text>
-        <Pressable onPress={() => navigation.goBack()} style={s.emptyButton}>
-          <Text style={s.emptyButtonText}>Back to Library</Text>
-        </Pressable>
-      </View>
-    );
+  const goBack = useCallback(() => {
+    navigation.goBack();
+  }, [navigation]);
+
+  return {
+    handleProgress,
+    dismissWord,
+    onWordTap,
+    onWordHover,
+    onWordAnchor,
+    handleCenterTap,
+    showPageToast,
+    onPage,
+    onControl,
+    step,
+    act,
+    toggleOptions,
+    startQuiz,
+    onWords,
+    seekTo,
+    openSettings,
+    goBack,
+  };
+}
+
+export default function ReaderScreen() {
+  const route = useRoute<any>();
+  const navigation = useNavigation<any>();
+  const insets = useSafeAreaInsets();
+  const volume = route.params.volume as {
+    htmlUri?: string;
+    mokuroUri?: string;
+    uri: string;
+    title: string;
+    series?: string;
+    pageCount?: number;
+    progressKey?: string;
+  };
+  const progressUri = volume.progressKey ?? volume.uri;
+
+  const readerRef = useRef<MokuroWebViewHandle>(null);
+  const [resumePage, setResumePage] = useState<number | null>(null);
+  const [prefs, setPrefs] = useState<ReaderPreferences | null>(null);
+  const [word, setWord] = useState<any>(null);
+  const [progress, setProgress] = useState(0);
+  const [page, setPage] = useState({ index: -1, total: volume.pageCount ?? 0, paged: false, rtl: false, twoPage: false });
+  const [zoomMode, setZoomMode] = useState<ZoomMode>(defaultReaderPreferences.zoomMode);
+  const [controlError, setControlError] = useState<string | null>(null);
+  const [quizWords, setQuizWords] = useState<any[] | null>(null);
+
+  const interactionRef = useRef({ showPopupOnHover: true, playSoundOnHover: false });
+  const wordRef = useRef<any>(null);
+  const chromeRef = useRef(false);
+  const optionsRef = useRef(false);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastToastPage = useRef(-1);
+
+  const chrome = useChromeController(readerRef, wordRef, optionsRef);
+  const {
+    headerH, footerH, toastOpacity,
+    chromeVisible, optionsOpen, setOptionsOpen,
+    mokuroMenu, setMokuroMenu,
+    clearHideTimer, hideChrome, showChrome,
+    headerStyle, footerStyle, fabStyle, toastStyle,
+  } = chrome;
+  wordRef.current = word;
+  chromeRef.current = chromeVisible;
+  optionsRef.current = optionsOpen;
+
+  const applyInteraction = useCallback(async (forceReload = false) => {
+    const config = await loadConfig(forceReload);
+    applyInteractionState(config, interactionRef as { current: { showPopupOnHover: boolean; playSoundOnHover: boolean } });
+  }, []);
+
+  useReaderBoot(progressUri, interactionRef as { current: { showPopupOnHover: boolean; playSoundOnHover: boolean } } as React.RefObject<{ showPopupOnHover: boolean; playSoundOnHover: boolean }>, setPrefs, setZoomMode, setPage, setResumePage);
+
+  useEffect(() => navigation.addListener('focus', () => { void applyInteraction(false); }), [applyInteraction, navigation]);
+
+  useReaderSystemEffects();
+
+  const { cancel: cancelHoverAudio, scheduleHover: scheduleHoverAudio, playNow: playWordAudio } = useWordAudio();
+
+  const total = page.total || volume.pageCount || 0;
+  const canPage = page.paged && total > 1;
+
+  const {
+    handleProgress,
+    dismissWord,
+    onWordTap,
+    onWordHover,
+    onWordAnchor,
+    handleCenterTap,
+    onPage,
+    onControl,
+    step,
+    act,
+    toggleOptions,
+    startQuiz,
+    onWords,
+    seekTo,
+    openSettings,
+    goBack,
+  } = useReaderCallbacks({
+    readerRef,
+    wordRef,
+    chromeRef,
+    interactionRef,
+    toastTimer,
+    lastToastPage,
+    toastOpacity,
+    navigation,
+    volumePageCount: volume.pageCount,
+    progressUri,
+    total,
+    mokuroMenu,
+    showChrome,
+    hideChrome,
+    setProgress,
+    setWord,
+    setOptionsOpen,
+    setZoomMode,
+    setMokuroMenu,
+    setPage,
+    setControlError,
+    setQuizWords,
+    cancelHoverAudio,
+    scheduleHoverAudio,
+    playWordAudio,
+  });
+
+  useEffect(() => navigation.addListener('blur', dismissWord), [dismissWord, navigation]);
+  useEffect(() => () => {
+    clearHideTimer();
+    clearToastTimer(toastTimer);
+    void flushProgress();
+    void flushReaderPreferences();
+  }, [clearHideTimer]);
+
+  // Only the presence of a lookup should put the chrome away. Anchor updates
+  // replace the word object on every pan, and hiding on each of those would
+  // churn state for the whole gesture.
+  const hasWord = !!word;
+  useEffect(() => {
+    hideChromeForWord(hasWord, hideChrome);
+  }, [hideChrome, hasWord]);
+
+  const scrubController = useScrubController(total, progress, showChrome, seekTo);
+  const { scrubTo, trackW, scrub, fillStyle, thumbStyle } = scrubController;
+  const currentIndex = currentIndexFor(scrubTo, page.index);
+  const pageLabel = formatPageLabel(canPage, total, currentIndex, progress);
+
+  if (!isReadableVolume(volume)) {
+    return <ReaderEmptyState onBack={goBack} />;
   }
 
   return (
     <View style={s.root}>
       <StatusBar style="light" hidden={!chromeVisible} animated />
       <View style={s.readerStage}>
-        {resumePage !== null && prefs ? (
+        {shouldShowWebView(resumePage, prefs) ? (
           <MokuroWebView
             ref={readerRef}
             htmlUri={volume.htmlUri}
@@ -457,8 +715,8 @@ export default function ReaderScreen() {
             volumeDir={volume.uri}
             title={volume.title}
             series={volume.series}
-            initialPage={resumePage}
-            initialPreferences={prefs}
+            initialPage={resumePage as number}
+            initialPreferences={prefs as ReaderPreferences}
             onOpenSettings={openSettings}
             onWordTap={onWordTap}
             onWordHover={onWordHover}
@@ -507,7 +765,7 @@ export default function ReaderScreen() {
 
         {/* Options bar — zoom, layout and re-parse. Collapsed by default so the
             page stays unobstructed. */}
-        {optionsOpen && !word ? (
+        {shouldShowOptions(optionsOpen, word) ? (
           <BlurView intensity={34} tint="dark" style={s.optionsBar}>
             <Segmented
               selected={zoomMode}
@@ -536,7 +794,7 @@ export default function ReaderScreen() {
                 })}
               />
             </View>
-            {controlError ? <Text style={s.controlError}>{controlError}</Text> : null}
+            <ControlErrorText message={controlError} />
           </BlurView>
         ) : null}
       </Animated.View>
@@ -576,15 +834,11 @@ export default function ReaderScreen() {
         </BlurView>
       </Animated.View>
 
-      {canPage ? (
-        <Animated.View pointerEvents="none" style={[s.toast, { bottom: Math.max(insets.bottom, 12) + 4 }, toastStyle]}>
-          <Text style={s.toastText}>{`${Math.min(total, page.index + 1)} / ${total}`}</Text>
-        </Animated.View>
-      ) : null}
+      <PageToast visible={canPage} text={`${Math.min(total, page.index + 1)} / ${total}`} bottom={Math.max(insets.bottom, 12) + 4} style={toastStyle} />
 
       {/* Quiz is one tap from anywhere in the page, within thumb reach. It
           rides above the footer so the two never overlap. */}
-      {!word && !quizWords ? (
+      {shouldShowFab(word, quizWords) ? (
         <Animated.View style={[s.fab, { bottom: Math.max(insets.bottom, 12), right: Math.max(insets.right, 14) }, fabStyle]}>
           <BlurView intensity={30} tint="dark" style={s.fabSurface}>
             <Pressable
@@ -600,19 +854,9 @@ export default function ReaderScreen() {
         </Animated.View>
       ) : null}
 
-      {word ? (
-        <WordSheet
-          key={`${word.vid}/${word.sid}`}
-          word={word}
-          onClose={dismissWord}
-          onStateChange={(vid, sid, state) => readerRef.current?.setCardState(vid, sid, state)}
-          forceDark
-        />
-      ) : null}
+      <WordOverlay word={word} onClose={dismissWord} onStateChange={(vid, sid, state) => readerRef.current?.setCardState(vid, sid, state)} />
 
-      {quizWords ? (
-        <QuizModal words={quizWords} onClose={() => setQuizWords(null)} forceDark />
-      ) : null}
+      <QuizOverlay words={quizWords} onClose={() => setQuizWords(null)} />
     </View>
   );
 }

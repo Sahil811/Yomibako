@@ -38,9 +38,26 @@ let readyWaiters: { resolve: () => void; reject: (e: Error) => void }[] = [];
 const pending = new Map<string, PendingJob>();
 const wakers = new Set<() => void>();
 const statusListeners = new Set<(s: SessionStatus) => void>();
+let newIdCounter = 0;
 
-function newId(): string {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+export function newId(): string {
+  const cryptoObj = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => void } }).crypto;
+  const bytes = new Uint8Array(8);
+  if (cryptoObj?.getRandomValues) {
+    cryptoObj.getRandomValues(bytes);
+  } else {
+    newIdCounter = (newIdCounter + 1) >>> 0;
+    let seed = (Date.now() ^ (jobsRun * 0x9e3779b1) ^ (newIdCounter * 0x85ebca6b)) >>> 0;
+    for (let i = 0; i < bytes.length; i++) {
+      seed ^= (seed << 13) >>> 0;
+      seed ^= seed >>> 17;
+      seed ^= (seed << 5) >>> 0;
+      bytes[i] = seed & 0xff;
+    }
+  }
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex + Date.now().toString(36);
 }
 
 /** Called once by JpdbSessionWebView to plug in injectJavaScript. */
@@ -105,7 +122,8 @@ export function pokeSession() {
 
 /** One-line bridge health for Settings → Diagnostics. */
 export function sessionDebug(): string {
-  return `bridge ${ready ? 'ready' : 'NOT-READY'}, login ${status}, jobs ${jobsOk}/${jobsRun}${lastJobError ? `, last: ${lastJobError}` : ''}`;
+  const lastPart = lastJobError ? `, last: ${lastJobError}` : '';
+  return `bridge ${ready ? 'ready' : 'NOT-READY'}, login ${status}, jobs ${jobsOk}/${jobsRun}${lastPart}`;
 }
 
 export function lastSessionJobError(): string {
@@ -199,6 +217,41 @@ export async function sessionFetch(url: string, init: SessionFetchInit = {}): Pr
   });
 }
 
+function applySessionStatusValue(value: unknown): void {
+  if (value === 'in' || value === 'out') setStatus(value);
+}
+
+function handleSessionMetaMessage(msg: any): void {
+  const p = pending.get(msg.id);
+  if (!p || typeof msg.chunks !== 'number') return;
+  p.total = msg.chunks;
+  p.parts = new Array(msg.chunks);
+  if (msg.chunks === 0) {
+    pending.delete(msg.id);
+    clearTimeout(p.timer);
+    p.resolve('');
+  }
+}
+
+function handleSessionChunkMessage(msg: any): void {
+  const p = pending.get(msg.id);
+  if (!p || typeof msg.i !== 'number' || typeof msg.part !== 'string') return;
+  p.parts[msg.i] = msg.part;
+  const got = p.parts.filter((x) => x !== undefined).length;
+  if (p.total < 0 || got < p.total) return;
+  pending.delete(msg.id);
+  clearTimeout(p.timer);
+  p.resolve(p.parts.join(''));
+}
+
+function handleSessionErrorMessage(msg: any): void {
+  const p = pending.get(msg.id);
+  if (!p) return;
+  pending.delete(msg.id);
+  clearTimeout(p.timer);
+  p.reject(new Error(String(msg.error ?? 'JPDB request failed')));
+}
+
 /** Routed from JpdbSessionWebView.onMessage — do not call elsewhere. */
 export function handleSessionMessage(msg: any): boolean {
   if (!msg || typeof msg.type !== 'string') return false;
@@ -207,43 +260,17 @@ export function handleSessionMessage(msg: any): boolean {
       markSessionReady();
       return true;
     case 'sessionStatus':
-      if (msg.value === 'in' || msg.value === 'out') setStatus(msg.value);
+      applySessionStatusValue(msg.value);
       return true;
-    case 'sessionMeta': {
-      const p = pending.get(msg.id);
-      if (p && typeof msg.chunks === 'number') {
-        p.total = msg.chunks;
-        p.parts = new Array(msg.chunks);
-        if (msg.chunks === 0) {
-          pending.delete(msg.id);
-          clearTimeout(p.timer);
-          p.resolve('');
-        }
-      }
+    case 'sessionMeta':
+      handleSessionMetaMessage(msg);
       return true;
-    }
-    case 'sessionChunk': {
-      const p = pending.get(msg.id);
-      if (p && typeof msg.i === 'number' && typeof msg.part === 'string') {
-        p.parts[msg.i] = msg.part;
-        const got = p.parts.filter((x) => x !== undefined).length;
-        if (p.total >= 0 && got >= p.total) {
-          pending.delete(msg.id);
-          clearTimeout(p.timer);
-          p.resolve(p.parts.join(''));
-        }
-      }
+    case 'sessionChunk':
+      handleSessionChunkMessage(msg);
       return true;
-    }
-    case 'sessionError': {
-      const p = pending.get(msg.id);
-      if (p) {
-        pending.delete(msg.id);
-        clearTimeout(p.timer);
-        p.reject(new Error(String(msg.error ?? 'JPDB request failed')));
-      }
+    case 'sessionError':
+      handleSessionErrorMessage(msg);
       return true;
-    }
     default:
       return false;
   }

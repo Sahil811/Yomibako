@@ -31,15 +31,15 @@ export const QUIZ_MIN_OPTIONS = 2;
  * The same set the userscript selects on (`failed`, `due`, `new`,
  * `not-in-deck`) — quizzing settled vocabulary is just noise.
  */
-const ASKABLE = ['new', 'not-in-deck', 'due', 'failed'];
+const ASKABLE: ReadonlySet<string> = new Set(['new', 'not-in-deck', 'due', 'failed']);
 /** States that must never be shown, whatever else the card is tagged with. */
-const SUPPRESSED = ['blacklisted', 'suspended', 'locked', 'redundant', 'never-forget'];
+const SUPPRESSED: ReadonlySet<string> = new Set(['blacklisted', 'suspended', 'locked', 'redundant', 'never-forget']);
 
 export function isAskable(state: string[] | undefined): boolean {
   // A card with no state at all has not been added to any deck.
-  if (!state || !state.length) return true;
-  if (state.some((s) => SUPPRESSED.includes(s))) return false;
-  return state.some((s) => ASKABLE.includes(s));
+  if (!state?.length) return true;
+  if (state.some((s) => SUPPRESSED.has(s))) return false;
+  return state.some((s) => ASKABLE.has(s));
 }
 
 /** Words the quiz will actually ask about, out of everything on the page. */
@@ -51,13 +51,44 @@ export function wordKey(word: { vid: number; sid: number }): string {
   return `${word.vid}/${word.sid}`;
 }
 
+export function secureRandomIndex(upperExclusive: number): number {
+  const cryptoObj = (globalThis as { crypto?: { getRandomValues?: (a: Uint32Array) => void } }).crypto;
+  if (cryptoObj?.getRandomValues) {
+    const buf = new Uint32Array(1);
+    const range = 4294967296;
+    const limit = Math.floor(range / upperExclusive) * upperExclusive;
+    do {
+      cryptoObj.getRandomValues(buf);
+    } while (buf[0] >= limit);
+    return buf[0] % upperExclusive;
+  }
+  // Test/headless fallback without Math.random: xorshift-mix time + counter.
+  secureRandomIndex.counter = (secureRandomIndex.counter + 1) >>> 0;
+  let x = (Date.now() ^ (secureRandomIndex.counter * 0x9e3779b1)) >>> 0;
+  x = (x ^ (x << 13)) >>> 0;
+  x = (x ^ (x >>> 17)) >>> 0;
+  x = (x ^ (x << 5)) >>> 0;
+  return x % upperExclusive;
+}
+secureRandomIndex.counter = 0;
+
 function shuffle<T>(list: T[]): T[] {
   const out = list.slice();
   for (let i = out.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = secureRandomIndex(i + 1);
     [out[i], out[j]] = [out[j], out[i]];
   }
   return out;
+}
+
+function extractGlossText(meaning: unknown): string {
+  if (typeof meaning === 'string') {
+    return meaning;
+  }
+  if (typeof meaning === 'object' && meaning !== null && Array.isArray((meaning as { glosses?: unknown }).glosses)) {
+    return (meaning as { glosses: string[] }).glosses.join('; ');
+  }
+  return '';
 }
 
 function glossesOf(raw: any): string[] {
@@ -65,7 +96,7 @@ function glossesOf(raw: any): string[] {
   const out: string[] = [];
   for (const meaning of raw) {
     // Cards carry { glosses, partOfSpeech }; be tolerant of plain strings too.
-    const text = typeof meaning === 'string' ? meaning : Array.isArray(meaning?.glosses) ? meaning.glosses.join('; ') : '';
+    const text = extractGlossText(meaning);
     const trimmed = text.trim();
     if (trimmed && !out.includes(trimmed)) out.push(trimmed);
   }

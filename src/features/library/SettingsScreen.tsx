@@ -38,6 +38,26 @@ const SAMPLE_WORD = {
 };
 
 // ——————————————— iOS Grouped Row Components ———————————————
+function sessionStatusLabel(status: string): string {
+  if (status === 'in') {
+    return 'Logged in ✓ — audio & reviews work';
+  }
+  if (status === 'out') {
+    return 'Logged out — tap to sign in';
+  }
+  return 'Checking…';
+}
+
+function themeOptionLabel(opt: 'auto' | 'light' | 'dark'): string {
+  if (opt === 'auto') {
+    return 'Automatic';
+  }
+  if (opt === 'light') {
+    return 'Light';
+  }
+  return 'Dark';
+}
+
 function SectionHeader({ title, footnote, colors }: any) {
   return (
     <View style={{ paddingHorizontal: 20, paddingTop: 22, paddingBottom: 7, gap: 3 }}>
@@ -51,7 +71,7 @@ function Group({ children, colors }: any) {
   return (
     <View style={[s.group, { backgroundColor: colors.secondaryGroupedBackground }]}>
       {kids.map((child: any, idx) => (
-        <View key={idx} style={{}}>
+        <View key={String((child as any)?.key)} style={{}}>
           {child}
           {idx !== kids.length - 1 ? <View style={[s.rowSeparator, { backgroundColor: colors.separator, marginLeft: 57 }]} /> : null}
         </View>
@@ -59,7 +79,7 @@ function Group({ children, colors }: any) {
     </View>
   );
 }
-function Tile({ icon, color }: { icon: IconName; color: string }) {
+function Tile({ icon, color }: { readonly icon: IconName; readonly color: string }) {
   return (
     <View style={[s.rowIcon, { backgroundColor: color }]}>
       <Icon name={icon} size={15} color="#fff" strokeWidth={2.1} />
@@ -189,7 +209,7 @@ export default function SettingsScreen() {
     useCallback(() => {
       const update = () => {
         const s = getSessionStatus();
-        setJpdbLogin(s === 'in' ? 'Logged in ✓ — audio & reviews work' : s === 'out' ? 'Logged out — tap to sign in' : 'Checking…');
+        setJpdbLogin(sessionStatusLabel(s));
       };
       update();
       pokeSession();
@@ -218,6 +238,11 @@ export default function SettingsScreen() {
         return;
       }
       const d = JSON.parse(raw);
+      let applyErrSuffix = '';
+      if (d.applyErr) {
+        applyErrSuffix = `, applyErr ${d.applyErr}`;
+      }
+      const tapsLine = `taps: bg ${d.taps ?? 0}, words ${d.lookups ?? 0}, spans applied ${d.applied ?? 0}${applyErrSuffix}`;
       setDiag(
         [
           `volume: ${d.title ?? '—'}`,
@@ -226,7 +251,7 @@ export default function SettingsScreen() {
           `pages: ${d.pages ?? 0} (sel: ${d.sel || '—'}, textBoxes: ${d.boxes ?? 0})`,
           `parse requests: ${d.parseReq ?? 0}, ok: ${d.parseOk ?? 0}, failed: ${d.parseErr ?? 0}`,
           d.lastErr ? `last error: ${d.lastErr}` : 'last error: —',
-          `taps: bg ${d.taps ?? 0}, words ${d.lookups ?? 0}, spans applied ${d.applied ?? 0}${d.applyErr ? `, applyErr ${d.applyErr}` : ''}`,
+          tapsLine,
           `audio: ${lastAudioError() || '—'}`,
           `session: ${sessionDebug()}`,
         ].join('\n')
@@ -284,7 +309,7 @@ export default function SettingsScreen() {
     for (const k of ['miningDeckId', 'forqDeckId', 'blacklistDeckId', 'neverForgetDeckId'] as const) {
       const v = (toSave as any)[k];
       if (v === '' || v === undefined) (toSave as any)[k] = (defaultConfig as any)[k];
-      else if (typeof v === 'string' && !isNaN(Number(v)) && v.trim() !== '' && k !== 'forqDeckId' && k !== 'blacklistDeckId' && k !== 'neverForgetDeckId') {
+      else if (typeof v === 'string' && !Number.isNaN(Number(v)) && v.trim() !== '' && k !== 'forqDeckId' && k !== 'blacklistDeckId' && k !== 'neverForgetDeckId') {
         const n = Number(v);
         if (!Number.isNaN(n)) (toSave as any)[k] = n;
       }
@@ -459,7 +484,7 @@ export default function SettingsScreen() {
             <View style={{ flexDirection: 'row', gap: 8 }}>
               {(['auto', 'light', 'dark'] as const).map((opt) => (
                 <Pressable key={opt} onPress={() => update({ theme: opt })} style={[s.segBtn, { backgroundColor: cfg.theme === opt ? colors.primary : colors.tertiarySystemFill }]}>
-                  <Text style={[s.segText, { color: cfg.theme === opt ? '#fff' : colors.onSurface }]}>{opt === 'auto' ? 'Automatic' : opt === 'light' ? 'Light' : 'Dark'}</Text>
+                  <Text style={[s.segText, { color: cfg.theme === opt ? '#fff' : colors.onSurface }]}>{themeOptionLabel(opt)}</Text>
                 </Pressable>
               ))}
             </View>

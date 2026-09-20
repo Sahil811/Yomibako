@@ -11,6 +11,7 @@ import {
   isAskable,
   normalizeQuizWords,
   scoreMessage,
+  secureRandomIndex,
   wordKey,
   type QuizWord,
 } from '../quiz';
@@ -141,4 +142,25 @@ test('score messages cover the whole range', () => {
     assert.ok(scoreMessage(percent).length > 0, String(percent));
   }
   assert.notEqual(scoreMessage(100), scoreMessage(0));
+});
+
+test('secureRandomIndex stays inside the range', () => {
+  assert.equal(secureRandomIndex(1), 0);
+  for (let i = 0; i < 300; i++) {
+    const v = secureRandomIndex(4);
+    assert.ok(Number.isInteger(v) && v >= 0 && v < 4, String(v));
+  }
+});
+
+test('secureRandomIndex works without WebCrypto', () => {
+  const desc = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+  try {
+    Object.defineProperty(globalThis, 'crypto', { value: undefined, configurable: true });
+    for (let i = 0; i < 200; i++) {
+      const v = secureRandomIndex(7);
+      assert.ok(Number.isInteger(v) && v >= 0 && v < 7, String(v));
+    }
+  } finally {
+    if (desc) Object.defineProperty(globalThis, 'crypto', desc);
+  }
 });

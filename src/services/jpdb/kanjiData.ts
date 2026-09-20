@@ -40,21 +40,19 @@ function ensureMaps() {
     const raw = componentsJson as Record<string, string[]>;
     for (const k of Object.keys(raw)) componentsMap.set(k, dedupe(raw[k]));
   }
-  if (!componentMeaningsMap) {
-    componentMeaningsMap = new Map(Object.entries(componentMeaningsJson as Record<string, string>));
-  }
+  componentMeaningsMap ??= new Map(Object.entries(componentMeaningsJson as Record<string, string>));
 }
 
 function cleanRtkText(rtk: string): string {
   if (!rtk || typeof rtk !== 'string') return '';
   return rtk
-    .replace(/#\*/g, '')
-    .replace(/\*#/g, '')
-    .replace(/#/g, '')
-    .replace(/\*/g, '')
-    .replace(/\{/g, '')
-    .replace(/\}/g, '')
-    .replace(/\s+/g, ' ')
+    .replaceAll('#*', '')
+    .replaceAll('*#', '')
+    .replaceAll('#', '')
+    .replaceAll('*', '')
+    .replaceAll('{', '')
+    .replaceAll('}', '')
+    .replaceAll(/\s+/g, ' ')
     .trim();
 }
 

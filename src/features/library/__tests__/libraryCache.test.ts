@@ -78,6 +78,7 @@ test('save + load roundtrips and filters by granted roots', async () => {
 
 test('saveLibraryIndex ignores empty series', () => {
   __resetLibraryCacheForTests();
-  saveLibraryIndex([], ['r']); // must not throw or schedule
+  assert.doesNotThrow(() => saveLibraryIndex([], ['r']));
   __flushLibraryIndexForTests();
+  assert.ok(true, 'saveLibraryIndex with empty series must not throw or schedule');
 });

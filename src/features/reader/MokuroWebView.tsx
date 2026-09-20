@@ -73,6 +73,79 @@ export type MokuroWebViewHandle = {
 // Loads mokuro .mobile.html, serves images from a file:// cache copy so the
 // WebView loads <img> natively. The data-URI bridge path blanked pages
 // (giant base64 injects + SAF URI guessing), so cache-copy is primary.
+function mimeForExtension(ext: string): string {
+  if (ext === 'png') {
+    return 'image/png';
+  }
+  if (ext === 'webp') {
+    return 'image/webp';
+  }
+  return 'image/jpeg';
+}
+
+const WORD_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  'lookup',
+  'hover',
+  'anchor',
+  'anchorLost',
+  'textGuard',
+  'tap',
+  'viewReset',
+  'words',
+]);
+const STATUS_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  'applied',
+  'applyError',
+  'parseError',
+  'progress',
+  'page',
+  'control',
+  'layoutError',
+]);
+
+function isContentVolume(htmlUri: string | undefined, mokuroUri: string | undefined, volumeDir: string): boolean {
+  if (htmlUri?.startsWith('content://') ?? false) {
+    return true;
+  }
+  if (mokuroUri?.startsWith('content://') ?? false) {
+    return true;
+  }
+  return volumeDir.startsWith('content://');
+}
+
+type VolumeLoadResult = { content: string; baseUrl: string };
+
+async function fetchVolumeHtml(
+  args: { htmlUri?: string; mokuroUri?: string; volumeDir: string; title: string; series?: string },
+  onProgress: (done: number, total: number) => void,
+  isCancelled: () => boolean,
+): Promise<VolumeLoadResult> {
+  if (isContentVolume(args.htmlUri, args.mokuroUri, args.volumeDir)) {
+    const prepared = await prepareVolumeForWebView(
+      { htmlUri: args.htmlUri, mokuroUri: args.mokuroUri, uri: args.volumeDir, title: args.title, series: args.series },
+      (done, total) => {
+        onProgress(done, total);
+      },
+    );
+    if (isCancelled()) {
+      throw new Error('cancelled');
+    }
+    // Let the status paint before the (sync) file read.
+    await new Promise((r) => setTimeout(r, 30));
+    if (isCancelled()) {
+      throw new Error('cancelled');
+    }
+    const content = await new File(prepared.localHtmlUri).text();
+    return { content, baseUrl: prepared.baseUrl };
+  }
+  if (!args.htmlUri) {
+    throw new Error('No html for volume');
+  }
+  const content = await new File(args.htmlUri).text();
+  const baseUrl = args.volumeDir.endsWith('/') ? args.volumeDir : `${args.volumeDir}/`;
+  return { content, baseUrl };
+}
+
 function MokuroWebView(
   { htmlUri, mokuroUri, volumeDir, title, series, initialPage, initialPreferences, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onProgress, onPage, onControl, onWords, onOpenSettings, onTapBackground, onViewReset }: Props,
   ref: React.Ref<MokuroWebViewHandle>
@@ -121,7 +194,10 @@ function MokuroWebView(
     try {
       candidates.push(decodeURIComponent(rawBase));
     } catch {}
-    for (const c of [...candidates]) candidates.push(c.toLowerCase());
+    const initialCount = candidates.length;
+    for (let i = 0; i < initialCount; i++) {
+      candidates.push(candidates[i].toLowerCase());
+    }
     for (const c of candidates) {
       const hit = map.get(c);
       if (hit) return hit;
@@ -228,45 +304,38 @@ function MokuroWebView(
     let cancelled = false;
     bridgeReadyHandled.current = false;
     resumeDone.current = false;
+    const isCancelled = () => cancelled;
     (async () => {
       try {
         setLoadError(null);
-        setStatus('Loading…');
-        const isContent =
-          (htmlUri?.startsWith('content://') ?? false) ||
-          (mokuroUri?.startsWith('content://') ?? false) ||
-          volumeDir.startsWith('content://');
-        if (isContent) {
-          // Cache-copy mode: copy this volume (html + ~180 jpgs) to
-          // file:// cache once, then <img> loads natively. Shows progress
-          // because the first copy of a volume takes a while over SAF.
+        const contentVolume = isContentVolume(htmlUri, mokuroUri, volumeDir);
+        if (contentVolume) {
           setStatus('Copying volume…');
-          const prepared = await prepareVolumeForWebView(
-            { htmlUri, mokuroUri, uri: volumeDir, title, series },
-            (done, total) => {
-              if (!cancelled && total > 1)
-                setStatus(`Copying volume… ${done}/${total}`);
-            }
-          );
-          if (cancelled) return;
-          setStatus('Loading pages…');
-          // Let the status paint before the (sync) file read.
-          await new Promise((r) => setTimeout(r, 30));
-          if (cancelled) return;
-          const content = await new File(prepared.localHtmlUri).text();
-          if (cancelled) return;
-          setHtml(content);
-          setBaseUrl(prepared.baseUrl);
-          setDirectFile(true);
         } else {
-          if (!htmlUri) throw new Error('No html for volume');
-          const content = await new File(htmlUri).text();
-          if (cancelled) return;
-          setHtml(content);
-          setBaseUrl(volumeDir.endsWith('/') ? volumeDir : volumeDir + '/');
-          setDirectFile(true);
+          setStatus('Loading…');
         }
+        const result = await fetchVolumeHtml(
+          { htmlUri, mokuroUri, volumeDir, title, series },
+          (done, total) => {
+            if (!cancelled && total > 1) {
+              setStatus(`Copying volume… ${done}/${total}`);
+            }
+          },
+          isCancelled,
+        );
+        if (cancelled) {
+          return;
+        }
+        if (contentVolume) {
+          setStatus('Loading pages…');
+        }
+        setHtml(result.content);
+        setBaseUrl(result.baseUrl);
+        setDirectFile(true);
       } catch (e: any) {
+        if (String(e?.message) === 'cancelled') {
+          return;
+        }
         if (!cancelled) {
           const message = String(e?.message ?? e);
           setLoadError(message);
@@ -299,188 +368,268 @@ function MokuroWebView(
     }
   }, []);
 
+  function buildCssInject(customWordCSS: string, customPopupCSS: string, disableFade: boolean): string {
+    const baseRule = `let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${JSON.stringify(YOMIBAKO_CSS)}; document.head.appendChild(s);}`;
+    let wordRule = '';
+    if (customWordCSS) {
+      wordRule = `let cw=document.getElementById('yomibako-custom-word'); if(!cw){ cw=document.createElement('style'); cw.id='yomibako-custom-word'; cw.textContent=${JSON.stringify(customWordCSS)}; document.head.appendChild(cw); }`;
+    }
+    let popupRule = '';
+    if (customPopupCSS) {
+      popupRule = `let cp=document.getElementById('yomibako-custom-popup'); if(!cp){ cp=document.createElement('style'); cp.id='yomibako-custom-popup'; cp.textContent=${JSON.stringify(customPopupCSS)}; document.head.appendChild(cp); }`;
+    }
+    let fadeRule = '';
+    if (disableFade) {
+      fadeRule = `document.documentElement.style.setProperty('--jpdb-fade-duration','0s');`;
+    }
+    return `(function(){ ${baseRule} ${wordRule} ${popupRule} ${fadeRule} true;})();`;
+  }
+
+  async function readCustomCss(): Promise<{ customWordCSS: string; customPopupCSS: string; disableFade: boolean }> {
+    const cfgRaw = await getItemAsync('yomibako_config_json');
+    if (!cfgRaw) {
+      return { customWordCSS: '', customPopupCSS: '', disableFade: false };
+    }
+    try {
+      const cfg = JSON.parse(cfgRaw);
+      return {
+        customWordCSS: cfg.customWordCSS || '',
+        customPopupCSS: cfg.customPopupCSS || '',
+        disableFade: !!cfg.disableFadeAnimation,
+      };
+    } catch {
+      return { customWordCSS: '', customPopupCSS: '', disableFade: false };
+    }
+  }
+
+  const handleBridgeReady = useCallback(async (msg: any) => {
+    // The bundle posts exactly one bridgeReady with payload. Ignore
+    // stray empties so pages/sel/boxes are never clobbered back to 0.
+    if (msg.pages !== undefined) {
+      diag.current.pages = Number(msg.pages ?? 0);
+    }
+    if (msg.sel !== undefined) {
+      diag.current.sel = String(msg.sel ?? '');
+    }
+    if (msg.boxes !== undefined) {
+      diag.current.boxes = Number(msg.boxes ?? 0);
+    }
+    if (bridgeReadyHandled.current) {
+      return;
+    }
+    bridgeReadyHandled.current = true;
+    console.log('[MokuroWebView] ready', title, `${diag.current.pages} pages`);
+    // Inject full CSS after bridge ready (calm color-only states + furigana) + customWordCSS/customPopupCSS from config
+    const custom = await readCustomCss();
+    webRef.current?.injectJavaScript(buildCssInject(custom.customWordCSS, custom.customPopupCSS, custom.disableFade));
+    // Resume where the reader stopped last time. Done once, and only after
+    // the bundle reports it is live so mokuro's own state is already loaded.
+    if (!resumeDone.current) {
+      resumeDone.current = true;
+      const target = Math.round(initialPage ?? 0);
+      const prefs = { ...initialPreferences, reduceMotion: custom.disableFade };
+      setTimeout(() => run(
+        `window.__yomibakoApplyPrefs && window.__yomibakoApplyPrefs(${JSON.stringify(prefs)}, ${target})`
+      ), 0);
+    }
+    // Surface the #1 lookup killer immediately: no token = no parsing,
+    // and taps silently do nothing. Actionable alert, once per volume.
+    diag.current.tokenPresent = !!(await getToken());
+    saveDiag();
+    if (!diag.current.tokenPresent) {
+      alertNoToken();
+    }
+  }, [title, getToken, saveDiag, alertNoToken, run, initialPage, initialPreferences]);
+
+  const handleParseMessage = useCallback(async (msg: any) => {
+    // msg.texts: [[seq, text], ...] and id for batch correlation.
+    // Chunks are bounded by the bundle (<=4000 chars) so each reply
+    // stays small; oversized replies are still chunk-sent below.
+    const texts: string[] = msg.texts.map((t: any) => t[1]);
+    const id = msg.id;
+    diag.current.parseReq++;
+    saveDiag();
+    const token = await getToken();
+    if (!token) {
+      const errInject = `window.__yomibakoOnError && window.__yomibakoOnError(${JSON.stringify(id)}, 'No JPDB token - set in Settings'); true;`;
+      webRef.current?.injectJavaScript(errInject);
+      diag.current.parseErr++;
+      diag.current.lastErr = 'No JPDB token - set in Settings';
+      saveDiag();
+      alertNoToken();
+      return;
+    }
+    try {
+      const { tokens } = await jpdbApi.parse({ text: texts, apiToken: token });
+      diag.current.parseOk++;
+      saveDiag();
+      // tokens is ParseToken[][] ordered same as texts.
+      // The bundle's pending resolver applies spans on resolve.
+      injectTokens(id, tokens);
+    } catch (err: any) {
+      webRef.current?.injectJavaScript(`window.__yomibakoOnError(${JSON.stringify(id)}, ${JSON.stringify(err.message)}); true;`);
+      diag.current.parseErr++;
+      diag.current.lastErr = String(err?.message ?? err);
+      saveDiag();
+      scheduleRetry();
+      // Silent parse failures = dead taps. Show the real error once.
+      if (!parseErrShown.current) {
+        parseErrShown.current = true;
+        Alert.alert('JPDB parse failed', `${err?.message ?? err}\n\nCheck the API token and network in Settings.`);
+      }
+    }
+  }, [getToken, saveDiag, alertNoToken, injectTokens, scheduleRetry]);
+
+  const handleWordMessages = useCallback((msg: any) => {
+    if (msg.type === 'lookup') {
+      diag.current.lookups++;
+      saveDiag();
+      onWordTap?.(msg);
+      return;
+    }
+    if (msg.type === 'hover') {
+      onWordHover?.(msg);
+      return;
+    }
+    if (msg.type === 'anchor') {
+      onWordAnchor?.(msg);
+      return;
+    }
+    if (msg.type === 'anchorLost') {
+      onWordAnchorLost?.();
+      return;
+    }
+    if (msg.type === 'textGuard') {
+      diag.current.guardedTextTaps++;
+      if (msg.pending) {
+        diag.current.deferredLookups++;
+      }
+      saveDiag();
+      return;
+    }
+    if (msg.type === 'tap') {
+      diag.current.taps++;
+      saveDiag();
+      onTapBackground?.();
+      return;
+    }
+    if (msg.type === 'viewReset') {
+      onViewReset?.();
+      return;
+    }
+    if (msg.type === 'words') {
+      onWords?.(Array.isArray(msg.words) ? msg.words : []);
+    }
+  }, [saveDiag, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onTapBackground, onViewReset, onWords]);
+
+  const handleStatusMessages = useCallback((msg: any) => {
+    if (msg.type === 'applied') {
+      diag.current.applied += Number(msg.spans ?? 0);
+      saveDiag();
+      return;
+    }
+    if (msg.type === 'applyError' || msg.type === 'parseError') {
+      diag.current.applyErr++;
+      diag.current.lastErr = String(msg.error ?? msg.type).slice(0, 200);
+      saveDiag();
+      scheduleRetry();
+      return;
+    }
+    if (msg.type === 'progress') {
+      onProgress?.(Math.max(0, Math.min(1, Number(msg.value) || 0)));
+      return;
+    }
+    if (msg.type === 'page') {
+      const value = Math.max(0, Math.min(1, Number(msg.value) || 0));
+      onProgress?.(value);
+      onPage?.({
+        index: Number(msg.index ?? -1),
+        total: Number(msg.total ?? 0),
+        value,
+        paged: !!msg.paged,
+        rtl: msg.rtl === true,
+        twoPage: !!msg.twoPage,
+        zoomMode: msg.zoomMode,
+        menuOpen: !!msg.menuOpen,
+      });
+      return;
+    }
+    if (msg.type === 'control') {
+      onControl?.({
+        key: msg.key,
+        ok: !!msg.ok,
+        mode: msg.mode,
+        value: typeof msg.value === 'boolean' ? msg.value : null,
+      });
+      return;
+    }
+    if (msg.type === 'layoutError') {
+      console.warn('[MokuroWebView] layout failed', msg.error, msg.stack ?? '');
+    }
+  }, [saveDiag, scheduleRetry, onProgress, onPage, onControl]);
+
+  const handleFetchImageMessage = useCallback(async (msg: any) => {
+    // Safety net only: in direct-file mode the bundle no longer hijacks
+    // <img>, so this should rarely fire (e.g. stale cached page).
+    const { orig, id } = msg as { orig: string; id: string };
+    try {
+      if (orig.startsWith('file://')) {
+        // Native-readable already — hand the URL straight back, no
+        // base64 round-trip (giant injects silently fail on Android).
+        webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(orig)}); true;`);
+        return;
+      }
+      if (orig.startsWith('content://')) {
+        await handleContentImage(orig, id);
+        return;
+      }
+      // Relative path — resolve against the file:// baseUrl cache dir.
+      const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
+      const absolute = `${base}${orig.replace(/^\.\//, '')}`;
+      webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(absolute)}); true;`);
+    } catch (e: any) {
+      console.warn('[MokuroWebView] fetchImage failed', orig, e?.message ?? e);
+      webRef.current?.injectJavaScript(`window.__yomibakoOnImageError && window.__yomibakoOnImageError(${JSON.stringify(id)}, ${JSON.stringify(e.message)}); true;`);
+    }
+  }, [resolveImageUri, baseUrl]);
+
+  async function handleContentImage(orig: string, id: string): Promise<void> {
+    const absolute = resolveImageUri(orig) ?? orig;
+    const b64 = await new File(absolute).base64();
+    const ext = absolute.split('.').pop()?.toLowerCase() ?? 'jpeg';
+    const mime = mimeForExtension(ext);
+    const dataUri = `data:${mime};base64,${b64}`;
+    webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(dataUri)}); true;`);
+  }
+
   const onMessage = useCallback(async (e: WebViewMessageEvent) => {
     try {
       const msg = JSON.parse(e.nativeEvent.data);
-      if (msg.type === 'bridgeReady') {
-        // The bundle posts exactly one bridgeReady with payload. Ignore
-        // stray empties so pages/sel/boxes are never clobbered back to 0.
-        if (msg.pages !== undefined) diag.current.pages = Number(msg.pages ?? 0);
-        if (msg.sel !== undefined) diag.current.sel = String(msg.sel ?? '');
-        if (msg.boxes !== undefined) diag.current.boxes = Number(msg.boxes ?? 0);
-        if (bridgeReadyHandled.current) return;
-        bridgeReadyHandled.current = true;
-        console.log('[MokuroWebView] ready', title, `${diag.current.pages} pages`);
-        // Inject full CSS after bridge ready (calm color-only states + furigana) + customWordCSS/customPopupCSS from config
-        const cfgRaw = await getItemAsync('yomibako_config_json');
-        let customWordCSS = '';
-        let customPopupCSS = '';
-        let disableFade = false;
-        if (cfgRaw) {
-          try {
-            const cfg = JSON.parse(cfgRaw);
-            customWordCSS = cfg.customWordCSS || '';
-            customPopupCSS = cfg.customPopupCSS || '';
-            disableFade = !!cfg.disableFadeAnimation;
-          } catch {}
-        }
-        const cssInject = `(function(){
-          let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${JSON.stringify(
-            YOMIBAKO_CSS
-          )}; document.head.appendChild(s);}
-          ${customWordCSS ? `let cw=document.getElementById('yomibako-custom-word'); if(!cw){ cw=document.createElement('style'); cw.id='yomibako-custom-word'; cw.textContent=${JSON.stringify(
-            customWordCSS
-          )}; document.head.appendChild(cw); }` : ''}
-          ${customPopupCSS ? `let cp=document.getElementById('yomibako-custom-popup'); if(!cp){ cp=document.createElement('style'); cp.id='yomibako-custom-popup'; cp.textContent=${JSON.stringify(
-            customPopupCSS
-          )}; document.head.appendChild(cp); }` : ''}
-          ${disableFade ? `document.documentElement.style.setProperty('--jpdb-fade-duration','0s');` : ''}
-          true;})();`;
-        webRef.current?.injectJavaScript(cssInject);
-        // Resume where the reader stopped last time. Done once, and only after
-        // the bundle reports it is live so mokuro's own state is already loaded.
-        if (!resumeDone.current) {
-          resumeDone.current = true;
-          const target = Math.round(initialPage ?? 0);
-          const prefs = { ...initialPreferences, reduceMotion: disableFade };
-          setTimeout(() => run(
-            `window.__yomibakoApplyPrefs && window.__yomibakoApplyPrefs(${JSON.stringify(prefs)}, ${target})`
-          ), 0);
-        }
-        // Surface the #1 lookup killer immediately: no token = no parsing,
-        // and taps silently do nothing. Actionable alert, once per volume.
-        diag.current.tokenPresent = !!(await getToken());
-        saveDiag();
-        if (!diag.current.tokenPresent) alertNoToken();
+      const type = msg.type as string;
+      if (type === 'bridgeReady') {
+        await handleBridgeReady(msg);
         return;
       }
-      if (msg.type === 'parse') {
-        // msg.texts: [[seq, text], ...] and id for batch correlation.
-        // Chunks are bounded by the bundle (<=4000 chars) so each reply
-        // stays small; oversized replies are still chunk-sent below.
-        const texts: string[] = msg.texts.map((t: any) => t[1]);
-        const id = msg.id;
-        diag.current.parseReq++;
-        saveDiag();
-        const token = await getToken();
-        if (!token) {
-          const errInject = `window.__yomibakoOnError && window.__yomibakoOnError(${JSON.stringify(id)}, 'No JPDB token - set in Settings'); true;`;
-          webRef.current?.injectJavaScript(errInject);
-          diag.current.parseErr++;
-          diag.current.lastErr = 'No JPDB token - set in Settings';
-          saveDiag();
-          alertNoToken();
-          return;
-        }
-        try {
-          const { tokens } = await jpdbApi.parse({ text: texts, apiToken: token });
-          diag.current.parseOk++;
-          saveDiag();
-          // tokens is ParseToken[][] ordered same as texts.
-          // The bundle's pending resolver applies spans on resolve.
-          injectTokens(id, tokens);
-        } catch (err: any) {
-          webRef.current?.injectJavaScript(`window.__yomibakoOnError(${JSON.stringify(id)}, ${JSON.stringify(err.message)}); true;`);
-          diag.current.parseErr++;
-          diag.current.lastErr = String(err?.message ?? err);
-          saveDiag();
-          scheduleRetry();
-          // Silent parse failures = dead taps. Show the real error once.
-          if (!parseErrShown.current) {
-            parseErrShown.current = true;
-            Alert.alert('JPDB parse failed', `${err?.message ?? err}\n\nCheck the API token and network in Settings.`);
-          }
-        }
+      if (type === 'parse') {
+        await handleParseMessage(msg);
         return;
       }
-      if (msg.type === 'applied') {
-        diag.current.applied += Number(msg.spans ?? 0);
-        saveDiag();
+      if (type === 'fetchImage') {
+        await handleFetchImageMessage(msg);
         return;
       }
-      if (msg.type === 'applyError' || msg.type === 'parseError') {
-        diag.current.applyErr++;
-        diag.current.lastErr = String(msg.error ?? msg.type).slice(0, 200);
-        saveDiag();
-        scheduleRetry();
+      if (WORD_MESSAGE_TYPES.has(type)) {
+        handleWordMessages(msg);
         return;
       }
-      if (msg.type === 'lookup') {
-        diag.current.lookups++;
-        saveDiag();
-        onWordTap?.(msg);
+      if (STATUS_MESSAGE_TYPES.has(type)) {
+        handleStatusMessages(msg);
+        return;
       }
-      if (msg.type === 'hover') onWordHover?.(msg);
-      if (msg.type === 'anchor') onWordAnchor?.(msg);
-      if (msg.type === 'anchorLost') onWordAnchorLost?.();
-      if (msg.type === 'textGuard') {
-        diag.current.guardedTextTaps++;
-        if (msg.pending) diag.current.deferredLookups++;
-        saveDiag();
-      }
-      if (msg.type === 'tap') {
-        diag.current.taps++;
-        saveDiag();
-        onTapBackground?.();
-      }
-      if (msg.type === 'viewReset') onViewReset?.();
-      if (msg.type === 'words') onWords?.(Array.isArray(msg.words) ? msg.words : []);
-      if (msg.type === 'progress') {
-        onProgress?.(Math.max(0, Math.min(1, Number(msg.value) || 0)));
-      }
-      if (msg.type === 'page') {
-        const value = Math.max(0, Math.min(1, Number(msg.value) || 0));
-        onProgress?.(value);
-        onPage?.({
-          index: Number(msg.index ?? -1),
-          total: Number(msg.total ?? 0),
-          value,
-          paged: !!msg.paged,
-          rtl: msg.rtl === true,
-          twoPage: !!msg.twoPage,
-          zoomMode: msg.zoomMode,
-          menuOpen: !!msg.menuOpen,
-        });
-      }
-      if (msg.type === 'control') {
-        onControl?.({
-          key: msg.key,
-          ok: !!msg.ok,
-          mode: msg.mode,
-          value: typeof msg.value === 'boolean' ? msg.value : null,
-        });
-      }
-      if (msg.type === 'layoutError') {
-        console.warn('[MokuroWebView] layout failed', msg.error, msg.stack ?? '');
-      }
-      if (msg.type === 'fetchImage') {
-        // Safety net only: in direct-file mode the bundle no longer hijacks
-        // <img>, so this should rarely fire (e.g. stale cached page).
-        const { orig, id } = msg as { orig: string; id: string };
-        try {
-          if (orig.startsWith('file://')) {
-            // Native-readable already — hand the URL straight back, no
-            // base64 round-trip (giant injects silently fail on Android).
-            webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(orig)}); true;`);
-          } else if (orig.startsWith('content://')) {
-            const absolute = resolveImageUri(orig) ?? orig;
-            const b64 = await new File(absolute).base64();
-            const ext = absolute.split('.').pop()?.toLowerCase() ?? 'jpeg';
-            const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-            webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(`data:${mime};base64,${b64}`)}); true;`);
-          } else {
-            // Relative path — resolve against the file:// baseUrl cache dir.
-            const base = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
-            const absolute = `${base}${orig.replace(/^\.\//, '')}`;
-            webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(absolute)}); true;`);
-          }
-        } catch (e: any) {
-          console.warn('[MokuroWebView] fetchImage failed', orig, e?.message ?? e);
-          webRef.current?.injectJavaScript(`window.__yomibakoOnImageError && window.__yomibakoOnImageError(${JSON.stringify(id)}, ${JSON.stringify(e.message)}); true;`);
-        }
-      }
+      handleWordMessages(msg);
+      handleStatusMessages(msg);
     } catch (err) { console.warn(err); }
-  }, [title, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onProgress, onPage, onControl, onWords, onTapBackground, onViewReset, resolveImageUri, volumeDir, baseUrl, getToken, alertNoToken, injectTokens, saveDiag, scheduleRetry, run, initialPage, initialPreferences]);
+  }, [handleBridgeReady, handleParseMessage, handleWordMessages, handleStatusMessages, handleFetchImageMessage]);
 
   // Stable identity: a fresh source object on every parent re-render (progress
   // ticks, scrubbing) can make the native WebView reload the whole volume.

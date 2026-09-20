@@ -139,8 +139,8 @@ export function migrateSchema(config: any): void {
     // v3: popup shows only Never forget + Examples by default (matches the
     // extension card). Extra buttons become opt-in via Settings → Behavior.
     config.showReviewButtons = false;
-    if (config.showAddButton == null) config.showAddButton = false;
-    if (config.showBlacklistButton == null) config.showBlacklistButton = false;
+    config.showAddButton ??= false;
+    config.showBlacklistButton ??= false;
     config.schemaVersion = 3;
   }
   if ((config.schemaVersion ?? 0) < 4) {
@@ -157,6 +157,27 @@ export function migrateSchema(config: any): void {
   }
 }
 
+function coerceLegacyDeckId(raw: string): string | number {
+  const n = Number(raw);
+  return Number.isNaN(n) ? raw : n;
+}
+
+type LegacyDeckValues = {
+  tok: string | null;
+  mining: string | null;
+  bl: string | null;
+  nf: string | null;
+  forq: string | null;
+};
+
+function applyLegacyValues(cfg: YomibakoConfig, legacy: LegacyDeckValues): void {
+  if (legacy.tok && !cfg.apiToken) cfg.apiToken = legacy.tok;
+  if (legacy.mining && cfg.miningDeckId == null) cfg.miningDeckId = coerceLegacyDeckId(legacy.mining);
+  if (legacy.bl && cfg.blacklistDeckId === 'blacklist') cfg.blacklistDeckId = coerceLegacyDeckId(legacy.bl);
+  if (legacy.nf && cfg.neverForgetDeckId === 'never-forget') cfg.neverForgetDeckId = coerceLegacyDeckId(legacy.nf);
+  if (legacy.forq && cfg.forqDeckId === 'forq') cfg.forqDeckId = coerceLegacyDeckId(legacy.forq);
+}
+
 async function loadLegacyIntoConfig(cfg: YomibakoConfig): Promise<void> {
   try {
     const [tok, mining, bl, nf, forq] = await Promise.all([
@@ -166,23 +187,7 @@ async function loadLegacyIntoConfig(cfg: YomibakoConfig): Promise<void> {
       getItemAsync(LEGACY_KEYS.neverForgetDeckId),
       getItemAsync(LEGACY_KEYS.forqDeckId),
     ]);
-    if (tok && !cfg.apiToken) cfg.apiToken = tok;
-    if (mining && cfg.miningDeckId == null) {
-      const n = Number(mining);
-      cfg.miningDeckId = Number.isNaN(n) ? mining : n;
-    }
-    if (bl && cfg.blacklistDeckId === 'blacklist') {
-      const n = Number(bl);
-      cfg.blacklistDeckId = Number.isNaN(n) ? bl : n;
-    }
-    if (nf && cfg.neverForgetDeckId === 'never-forget') {
-      const n = Number(nf);
-      cfg.neverForgetDeckId = Number.isNaN(n) ? nf : n;
-    }
-    if (forq && cfg.forqDeckId === 'forq') {
-      const n = Number(forq);
-      cfg.forqDeckId = Number.isNaN(n) ? forq : n;
-    }
+    applyLegacyValues(cfg, { tok, mining, bl, nf, forq });
   } catch {}
 }
 

@@ -5,10 +5,15 @@
 import { Directory, File } from 'expo-file-system';
 import type { Volume, Series } from './types';
 
+const LEADING_NUMBER_RE = /^\d{1,4}(?:$|[\s._-])/;
+const VOLUME_KEYWORD_RE = /(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*\d+\b/i;
+const TRAILING_NUMBER_RE = /[\s._-](\d{1,4})$/;
+const VOLUME_KEYWORD_SUFFIX_RE = /(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*\d+\s*$/i;
+
 export function isVolumeName(name: string) {
-  if (/^\d{1,4}(?:$|[\s._-])/.test(name)) return true;
-  if (/(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*0*\d+\b/i.test(name)) return true;
-  const trailing = name.match(/[\s._-](\d{1,4})$/);
+  if (LEADING_NUMBER_RE.test(name)) return true;
+  if (VOLUME_KEYWORD_RE.test(name)) return true;
+  const trailing = TRAILING_NUMBER_RE.exec(name);
   if (!trailing) return false;
   const value = Number(trailing[1]);
   return value < 1900 || value > 2099;
@@ -17,7 +22,7 @@ export function isVolumeName(name: string) {
 export function volumeStem(name: string): string {
   return name
     .toLowerCase()
-    .replace(/(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*0*\d+\s*$/i, '')
+    .replace(VOLUME_KEYWORD_SUFFIX_RE, '')
     .replace(/[\s._-]0*\d{1,4}\s*$/, '')
     .replace(/^0*\d{1,4}$/, '')
     .replace(/[\s._-]+/g, ' ')
@@ -50,7 +55,7 @@ function readLevel(uri: string): Level | null {
   for (const item of items) {
     if (item instanceof Directory) {
       if (item.name === '_ocr' || item.name === '_OCR') {
-        if (!ocrDir) ocrDir = item;
+        ocrDir ??= item;
       } else if (!item.name.startsWith('.')) {
         dirs.push(item);
       }
@@ -105,6 +110,94 @@ function shellsForLevel(
 
 // Phase 2 (slow, N SAF calls): count images + find covers per volume.
 // Pushes live updates so the UI fills in instead of blocking.
+type VolumeMedia = { jpegs: File[]; nestedHtml: string | undefined; nestedMokuro: string | undefined };
+
+function trackVolumeFile(media: VolumeMedia, name: string, uri: string): void {
+  const lowerName = name.toLowerCase();
+  if (lowerName.endsWith('.mobile.html')) {
+    media.nestedHtml = uri;
+    return;
+  }
+  if (lowerName.endsWith('.html') && !media.nestedHtml) {
+    media.nestedHtml = uri;
+    return;
+  }
+  if (lowerName.endsWith('.mokuro')) {
+    media.nestedMokuro = uri;
+  }
+}
+
+function collectVolumeMedia(dir: Directory): VolumeMedia | null {
+  try {
+    const media: VolumeMedia = { jpegs: [], nestedHtml: undefined, nestedMokuro: undefined };
+    for (const entry of dir.list()) {
+      if (entry instanceof Directory) {
+        continue;
+      }
+      if (isImageName(entry.name)) {
+        media.jpegs.push(entry as File);
+      }
+      trackVolumeFile(media, entry.name, entry.uri);
+    }
+    return media;
+  } catch {
+    return null;
+  }
+}
+
+function isSkippableVolume(
+  shell: Volume,
+  media: VolumeMedia
+): boolean {
+  if (media.jpegs.length > 0) {
+    return false;
+  }
+  if (shell.htmlUri || shell.mokuroUri || media.nestedHtml || media.nestedMokuro) {
+    return false;
+  }
+  return !isVolumeName(shell.title);
+}
+
+function findVolumeCover(jpegs: File[]): File | undefined {
+  const byCover = jpegs.find((f) => f.name.toLowerCase().includes('cover'));
+  if (byCover) {
+    return byCover;
+  }
+  const byFirstPage = jpegs.find((f) => f.name.toLowerCase().includes('page0001'));
+  if (byFirstPage) {
+    return byFirstPage;
+  }
+  return jpegs.toSorted((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))[0];
+}
+
+function pushVolumeDetail(
+  out: Volume[],
+  shell: Volume,
+  media: VolumeMedia,
+  total: { pages: number }
+): void {
+  const cover = findVolumeCover(media.jpegs);
+  out.push({
+    ...shell,
+    htmlUri: shell.htmlUri ?? media.nestedHtml,
+    mokuroUri: shell.mokuroUri ?? media.nestedMokuro,
+    pageCount: media.jpegs.length,
+    coverUri: cover?.uri,
+  });
+  total.pages += media.jpegs.length;
+}
+
+async function reportFillProgress(
+  n: number,
+  totalDirs: number,
+  onProgress?: (done: number, totalDirs: number) => void,
+  onUpdate?: () => void
+): Promise<void> {
+  onProgress?.(n, totalDirs);
+  onUpdate?.();
+  await yieldToUI();
+}
+
 async function fillDetails(
   level: Level,
   shells: Volume[],
@@ -118,46 +211,20 @@ async function fillDetails(
   const totalDirs = shells.length;
   for (const shell of shells) {
     const dir = byUri.get(shell.uri);
-    if (dir) {
-      let jpegs: File[] = [];
-      let nestedHtml: string | undefined;
-      let nestedMokuro: string | undefined;
-      try {
-        const items = dir.list();
-        for (const f of items) {
-          if (f instanceof Directory) continue;
-          if (isImageName(f.name)) jpegs.push(f as File);
-          const lowerName = f.name.toLowerCase();
-          if (lowerName.endsWith('.mobile.html')) nestedHtml = f.uri;
-          else if (!nestedHtml && lowerName.endsWith('.html')) nestedHtml = f.uri;
-          else if (lowerName.endsWith('.mokuro')) nestedMokuro = f.uri;
-        }
-      } catch {
-        continue;
-      }
-      if (jpegs.length === 0 && !shell.htmlUri && !shell.mokuroUri && !nestedHtml && !nestedMokuro && !isVolumeName(shell.title)) continue;
-
-      const lower = (s: string) => s.toLowerCase();
-      const cover =
-        jpegs.find((f) => lower(f.name).includes('cover')) ??
-        jpegs.find((f) => lower(f.name).includes('page0001')) ??
-        jpegs.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))[0];
-
-      out.push({
-        ...shell,
-        htmlUri: shell.htmlUri ?? nestedHtml,
-        mokuroUri: shell.mokuroUri ?? nestedMokuro,
-        pageCount: jpegs.length,
-        coverUri: cover?.uri,
-      });
-      total.pages += jpegs.length;
+    if (!dir) {
+      n++;
+      continue;
     }
+    const media = collectVolumeMedia(dir);
+    if (media === null || isSkippableVolume(shell, media)) {
+      continue;
+    }
+    pushVolumeDetail(out, shell, media, total);
+    n++;
     // list() is sync native — yield + report every 10 volumes so the
     // UI stays alive instead of looking stuck.
-    if (++n % 10 === 0) {
-      onProgress?.(n, totalDirs);
-      onUpdate?.();
-      await yieldToUI();
+    if (n % 10 === 0) {
+      await reportFillProgress(n, totalDirs, onProgress, onUpdate);
     }
   }
   onProgress?.(n, totalDirs);
@@ -174,28 +241,58 @@ function decodedName(name: string): string {
 
 type FolderShape = 'volume' | 'series' | 'empty';
 
+type FolderCounts = { images: number; readable: number; childDirs: number };
+
+function isCountableChildDir(name: string): boolean {
+  if (name.startsWith('.')) {
+    return false;
+  }
+  return name.toLowerCase() !== '_ocr';
+}
+
+function countFolderContents(dir: Directory): FolderCounts {
+  const counts: FolderCounts = { images: 0, readable: 0, childDirs: 0 };
+  for (const item of dir.list()) {
+    if (item instanceof Directory) {
+      if (isCountableChildDir(item.name)) {
+        counts.childDirs++;
+      }
+      continue;
+    }
+    const lower = item.name.toLowerCase();
+    if (isImageName(lower)) {
+      counts.images++;
+    } else if (lower.endsWith('.html') || lower.endsWith('.mokuro')) {
+      counts.readable++;
+    }
+  }
+  return counts;
+}
+
+function classifyFolderCounts(counts: FolderCounts): FolderShape {
+  if (counts.images > 0) {
+    return 'volume';
+  }
+  // Mokuro commonly stores each volume's HTML beside its image folder, so a
+  // series root can contain both readable files and many child directories.
+  if (counts.childDirs > 0) {
+    return 'series';
+  }
+  if (counts.readable > 1) {
+    return 'series';
+  }
+  if (counts.readable > 0) {
+    return 'volume';
+  }
+  return 'empty';
+}
+
 function inspectFolder(dir: Directory): FolderShape {
   try {
-    let images = 0;
-    let readable = 0;
-    let childDirs = 0;
-    for (const item of dir.list()) {
-      if (item instanceof Directory) {
-        if (item.name.toLowerCase() !== '_ocr' && !item.name.startsWith('.')) childDirs++;
-      } else {
-        const lower = item.name.toLowerCase();
-        if (isImageName(lower)) images++;
-        else if (lower.endsWith('.html') || lower.endsWith('.mokuro')) readable++;
-      }
-    }
-    if (images > 0) return 'volume';
-    // Mokuro commonly stores each volume's HTML beside its image folder, so a
-    // series root can contain both readable files and many child directories.
-    if (childDirs > 0) return 'series';
-    if (readable > 1) return 'series';
-    if (readable > 0) return 'volume';
-  } catch {}
-  return 'empty';
+    return classifyFolderCounts(countFolderContents(dir));
+  } catch {
+    return 'empty';
+  }
 }
 
 /**
@@ -203,20 +300,7 @@ function inspectFolder(dir: Directory): FolderShape {
  * A numeric/Volume-named majority is a fast path, avoiding an extra listing
  * for large 100+ volume series such as Detective Conan.
  */
-export async function scanLibrary(
-  rootUri: string,
-  rootName: string,
-  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
-  onUpdate?: (series: Series[]) => void
-): Promise<Series[]> {
-  const top = readLevel(rootUri);
-  if (!top || top.dirs.length === 0) {
-    const single = await scanSeries(rootUri, rootName, (done, total) => onProgress?.(rootName, done, total));
-    const tagged = { ...single, sourceRootUri: rootUri };
-    onUpdate?.(tagged.volumes.length ? [tagged] : []);
-    return tagged.volumes.length ? [tagged] : [];
-  }
-
+function computeVolumeMajority(top: Level): { numericMajority: boolean } {
   const namedVolumes = top.dirs.filter((dir) => isVolumeName(dir.name) || readableAtLevel(top, dir.name));
   const stemCounts = new Map<string, number>();
   for (const dir of namedVolumes) {
@@ -225,58 +309,86 @@ export async function scanLibrary(
   }
   const dominantStemCount = Math.max(0, ...stemCounts.values());
   const numericMajority = dominantStemCount >= Math.max(2, Math.ceil(top.dirs.length * 0.6));
+  return { numericMajority };
+}
 
-  let seriesFolders: Directory[] = [];
-  let directVolumeFolders: Directory[] = namedVolumes;
-  if (!numericMajority) {
-    directVolumeFolders = [];
-    for (let index = 0; index < top.dirs.length; index++) {
-      const dir = top.dirs[index];
-      const shape = inspectFolder(dir);
-      if (shape === 'series') seriesFolders.push(dir);
-      else if (shape === 'volume' || readableAtLevel(top, dir.name) || isVolumeName(dir.name)) directVolumeFolders.push(dir);
-      if ((index + 1) % 8 === 0) {
-        onProgress?.(rootName, index + 1, top.dirs.length);
-        await yieldToUI();
-      }
+function isDirectVolumeFolder(top: Level, dir: Directory): boolean {
+  return readableAtLevel(top, dir.name) || isVolumeName(dir.name);
+}
+
+async function partitionShelfDirs(
+  top: Level,
+  rootName: string,
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void
+): Promise<{ seriesFolders: Directory[]; directVolumeFolders: Directory[] }> {
+  const seriesFolders: Directory[] = [];
+  const directVolumeFolders: Directory[] = [];
+  for (let index = 0; index < top.dirs.length; index++) {
+    const dir = top.dirs[index];
+    const shape = inspectFolder(dir);
+    if (shape === 'series') {
+      seriesFolders.push(dir);
+    } else if (shape === 'volume' || isDirectVolumeFolder(top, dir)) {
+      directVolumeFolders.push(dir);
+    }
+    if ((index + 1) % 8 === 0) {
+      onProgress?.(rootName, index + 1, top.dirs.length);
+      await yieldToUI();
     }
   }
+  return { seriesFolders, directVolumeFolders };
+}
 
-  // A normal series root contains volume-like children only.
-  if (numericMajority || seriesFolders.length === 0) {
-    const single = await scanSeries(
-      rootUri,
-      rootName,
-      (done, total) => onProgress?.(rootName, done, total),
-      (shell) => onUpdate?.([{ ...shell, sourceRootUri: rootUri }])
-    );
-    const tagged = { ...single, sourceRootUri: rootUri };
-    onUpdate?.(tagged.volumes.length ? [tagged] : []);
-    return tagged.volumes.length ? [tagged] : [];
-  }
+async function scanSingleSeriesRoot(
+  rootUri: string,
+  rootName: string,
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
+  onUpdate?: (series: Series[]) => void
+): Promise<Series[]> {
+  const single = await scanSeries(
+    rootUri,
+    rootName,
+    (done, total) => onProgress?.(rootName, done, total),
+    (shell) => onUpdate?.([{ ...shell, sourceRootUri: rootUri }])
+  );
+  const tagged = { ...single, sourceRootUri: rootUri };
+  onUpdate?.(tagged.volumes.length ? [tagged] : []);
+  return tagged.volumes.length ? [tagged] : [];
+}
 
-  const results: Series[] = [];
-  const publish = (draft?: Series) => {
-    const all = draft ? [...results, draft] : [...results];
-    onUpdate?.(all.filter((item) => item.volumes.length > 0));
-  };
-
+async function scanShelfLooseVolumes(
+  rootUri: string,
+  rootName: string,
+  directVolumeFolders: Directory[],
+  results: Series[],
+  publish: (draft?: Series) => void,
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void
+): Promise<void> {
   // Mixed shelves may contain loose volumes alongside series folders. Keep
   // those loose volumes together under the selected root's name.
-  if (directVolumeFolders.length > 0) {
-    const direct = await scanSeries(
-      rootUri,
-      rootName,
-      (done, total) => onProgress?.(rootName, done, total),
-      undefined,
-      new Set(directVolumeFolders.map((folder) => folder.uri))
-    );
-    if (direct.volumes.length) {
-      results.push({ ...direct, sourceRootUri: rootUri });
-      publish();
-    }
+  if (directVolumeFolders.length === 0) {
+    return;
   }
+  const direct = await scanSeries(
+    rootUri,
+    rootName,
+    (done, total) => onProgress?.(rootName, done, total),
+    undefined,
+    new Set(directVolumeFolders.map((folder) => folder.uri))
+  );
+  if (direct.volumes.length) {
+    results.push({ ...direct, sourceRootUri: rootUri });
+    publish();
+  }
+}
 
+async function scanShelfSeriesFolders(
+  rootUri: string,
+  seriesFolders: Directory[],
+  results: Series[],
+  publish: (draft?: Series) => void,
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void
+): Promise<void> {
   for (const folder of seriesFolders) {
     const name = decodedName(folder.name);
     const scanned = await scanSeries(
@@ -291,8 +403,267 @@ export async function scanLibrary(
     }
     await yieldToUI();
   }
+}
+
+export async function scanLibrary(
+  rootUri: string,
+  rootName: string,
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
+  onUpdate?: (series: Series[]) => void
+): Promise<Series[]> {
+  const top = readLevel(rootUri);
+  if (!top || top.dirs.length === 0) {
+    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate);
+  }
+
+  const { numericMajority } = computeVolumeMajority(top);
+  if (numericMajority) {
+    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate);
+  }
+
+  const { seriesFolders, directVolumeFolders } = await partitionShelfDirs(top, rootName, onProgress);
+
+  // A normal series root contains volume-like children only.
+  if (seriesFolders.length === 0) {
+    return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate);
+  }
+
+  const results: Series[] = [];
+  const publish = (draft?: Series) => {
+    const all = draft ? [...results, draft] : [...results];
+    onUpdate?.(all.filter((item) => item.volumes.length > 0));
+  };
+
+  await scanShelfLooseVolumes(rootUri, rootName, directVolumeFolders, results, publish, onProgress);
+  await scanShelfSeriesFolders(rootUri, seriesFolders, results, publish, onProgress);
 
   return results;
+}
+
+function findRootCoverName(sortedNames: string[]): string {
+  const byCover = sortedNames.find((n) => n.toLowerCase().includes('cover'));
+  if (byCover) {
+    return byCover;
+  }
+  const byFirstPage = sortedNames.find((n) => n.toLowerCase().includes('page0001'));
+  if (byFirstPage) {
+    return byFirstPage;
+  }
+  return sortedNames[0];
+}
+
+function buildSingleImageVolume(
+  top: Level,
+  rootUri: string,
+  seriesName: string,
+  rootImages: string[]
+): Series {
+  const sorted = rootImages.toSorted((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const coverName = findRootCoverName(sorted);
+  const volumes: Volume[] = [
+    {
+      id: rootUri,
+      series: seriesName,
+      title: seriesName,
+      uri: rootUri,
+      htmlUri: top.files.get(`${seriesName}.mobile.html`) ?? top.files.get(`${seriesName}.html`),
+      mokuroUri: top.files.get(`${seriesName}.mokuro`),
+      ocrUri: undefined,
+      pageCount: rootImages.length,
+      coverUri: top.files.get(coverName),
+    },
+  ];
+  return { name: seriesName, rootUri, volumes, totalPages: rootImages.length };
+}
+
+function standaloneTitleForFile(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.mobile.html')) {
+    return name.slice(0, -'.mobile.html'.length);
+  }
+  if (lower.endsWith('.html')) {
+    return name.slice(0, -'.html'.length);
+  }
+  if (lower.endsWith('.mokuro')) {
+    return name.slice(0, -'.mokuro'.length);
+  }
+  return '';
+}
+
+function collectStandaloneReadable(top: Level): Map<string, { htmlUri?: string; mokuroUri?: string }> {
+  const standalone = new Map<string, { htmlUri?: string; mokuroUri?: string }>();
+  for (const [name, uri] of top.files) {
+    const title = standaloneTitleForFile(name);
+    if (!title) {
+      continue;
+    }
+    const entry = standalone.get(title) ?? {};
+    const lower = name.toLowerCase();
+    if (lower.endsWith('.mokuro')) {
+      entry.mokuroUri = uri;
+    } else if (lower.endsWith('.mobile.html') || !entry.htmlUri) {
+      entry.htmlUri = uri;
+    }
+    standalone.set(title, entry);
+  }
+  return standalone;
+}
+
+function buildStandaloneSeries(
+  rootUri: string,
+  seriesName: string,
+  standalone: Map<string, { htmlUri?: string; mokuroUri?: string }>
+): Series | null {
+  if (standalone.size === 0) {
+    return null;
+  }
+  const volumes: Volume[] = [];
+  for (const [title, readable] of standalone) {
+    volumes.push({
+      id: `${rootUri}#${title}`,
+      series: seriesName,
+      title,
+      uri: rootUri,
+      progressKey: `${rootUri}#${title}`,
+      ...readable,
+      pageCount: 0,
+    });
+  }
+  volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
+  return { name: seriesName, rootUri, volumes, totalPages: 0 };
+}
+
+function scanBareRoot(
+  top: Level,
+  rootUri: string,
+  seriesName: string
+): Series | null {
+  // Single-volume pick: user chose "Meitantei Konan 006" itself
+  // (images directly in root, no subdirs). Treat root as one volume.
+  if (top.dirs.length !== 0) {
+    return null;
+  }
+  const rootImages = [...top.files.keys()].filter((n) => isImageName(n));
+  if (rootImages.length > 0) {
+    return buildSingleImageVolume(top, rootUri, seriesName, rootImages);
+  }
+  return buildStandaloneSeries(rootUri, seriesName, collectStandaloneReadable(top));
+}
+
+type SeriesScanState = {
+  rootUri: string;
+  seriesName: string;
+  volumes: Volume[];
+  total: { pages: number };
+  onProgress?: (done: number, totalDirs: number) => void;
+  onShell?: (shell: Series) => void;
+  topDirectoryUris?: Set<string>;
+};
+
+function snapshotSeries(state: SeriesScanState): Series {
+  return {
+    name: state.seriesName,
+    rootUri: state.rootUri,
+    volumes: [...state.volumes].sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true })),
+    totalPages: state.total.pages,
+  };
+}
+
+async function fillSeriesLevel(level: Level, state: SeriesScanState): Promise<void> {
+  const ocrMap = buildOcrMap(level.ocrDir);
+  const shells = shellsForLevel(level, state.seriesName, ocrMap).filter(
+    (shell) => level.uri !== state.rootUri || !state.topDirectoryUris || state.topDirectoryUris.has(shell.uri)
+  );
+  // Instant UI: names + html links after just 1 listing…
+  state.onShell?.({ name: state.seriesName, rootUri: state.rootUri, volumes: shells, totalPages: 0 });
+  // …then counts/covers stream in every 10 volumes.
+  await fillDetails(level, shells, state.volumes, state.total, state.onProgress, () =>
+    state.onShell?.(snapshotSeries(state))
+  );
+}
+
+type NestedCandidate = { dir: Directory; subdirs: number };
+
+function countNestedDir(dir: Directory): NestedCandidate | null {
+  try {
+    const items = dir.list();
+    let images = 0;
+    let subdirs = 0;
+    for (const it of items) {
+      if (it instanceof Directory) {
+        if ((it as Directory).name !== '_ocr') {
+          subdirs++;
+        }
+      } else if (isImageName(it.name)) {
+        images++;
+      }
+    }
+    // A nested series root has many subdirs and ~0 images itself.
+    if (images === 0 && subdirs > 0) {
+      return { dir, subdirs };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function collectNestedCandidates(current: Level, depth: number): NestedCandidate[] {
+  const candidates: NestedCandidate[] = [];
+  for (const dir of current.dirs.slice(0, 20)) {
+    const candidate = countNestedDir(dir);
+    if (candidate) {
+      candidates.push(candidate);
+    }
+    if (depth === 0 && candidates.length >= 3) {
+      break;
+    }
+  }
+  candidates.sort((a, b) => b.subdirs - a.subdirs);
+  return candidates;
+}
+
+async function attemptNestedDescents(
+  candidates: NestedCandidate[],
+  state: SeriesScanState
+): Promise<{ descended: boolean; next: Level | null }> {
+  for (const candidate of candidates.slice(0, 3)) {
+    const nested = readLevel(candidate.dir.uri);
+    if (!nested) {
+      continue;
+    }
+    const before = state.volumes.length;
+    await fillSeriesLevel(nested, state);
+    if (state.volumes.length > before) {
+      return { descended: true, next: null };
+    }
+    // This candidate was empty too — try descending THROUGH it next round.
+    return { descended: true, next: nested };
+  }
+  return { descended: false, next: null };
+}
+
+async function descendNestedLevels(top: Level, state: SeriesScanState): Promise<void> {
+  // Nested case: e.g. mokuro/Detective Conan/Detective Conan/volumes
+  // (double nesting from unzip/file manager). Descend while the current
+  // level yields 0 volumes but contains a subfolder that itself looks like
+  // a series root (many subdirs, ~0 images). Max 3 levels deep.
+  let current: Level | null = top;
+  for (let depth = 0; depth < 3 && state.volumes.length === 0 && current && current.dirs.length > 0; depth++) {
+    const candidates = collectNestedCandidates(current, depth);
+    const outcome = await attemptNestedDescents(candidates, state);
+    if (!outcome.descended) {
+      break;
+    }
+    if (outcome.next) {
+      current = outcome.next;
+    }
+    // If we descended through an empty middle folder without finding volumes,
+    // loop again to go one level deeper. Otherwise volumes.length > 0 exits.
+    if (state.volumes.length > 0) {
+      break;
+    }
+  }
 }
 
 export async function scanSeries(
@@ -307,129 +678,26 @@ export async function scanSeries(
   const top = readLevel(rootUri);
   if (!top) return { name: seriesName, rootUri, volumes: [], totalPages: 0 };
 
-  const volumes: Volume[] = [];
-  const total = { pages: 0 };
-
-  // Single-volume pick: user chose "Meitantei Konan 006" itself
-  // (images directly in root, no subdirs). Treat root as one volume.
-  if (top.dirs.length === 0) {
-    const rootImages = [...top.files.keys()].filter((n) => isImageName(n));
-    if (rootImages.length > 0) {
-      const sorted = rootImages.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      const coverName =
-        sorted.find((n) => n.toLowerCase().includes('cover')) ??
-        sorted.find((n) => n.toLowerCase().includes('page0001')) ??
-        sorted[0];
-      volumes.push({
-        id: rootUri,
-        series: seriesName,
-        title: seriesName,
-        uri: rootUri,
-        htmlUri: top.files.get(`${seriesName}.mobile.html`) ?? top.files.get(`${seriesName}.html`),
-        mokuroUri: top.files.get(`${seriesName}.mokuro`),
-        ocrUri: undefined,
-        pageCount: rootImages.length,
-        coverUri: top.files.get(coverName),
-      });
-      return { name: seriesName, rootUri, volumes, totalPages: rootImages.length };
-    }
-
-    const standalone = new Map<string, { htmlUri?: string; mokuroUri?: string }>();
-    for (const [name, uri] of top.files) {
-      const lower = name.toLowerCase();
-      let title = '';
-      if (lower.endsWith('.mobile.html')) title = name.slice(0, -'.mobile.html'.length);
-      else if (lower.endsWith('.html')) title = name.slice(0, -'.html'.length);
-      else if (lower.endsWith('.mokuro')) title = name.slice(0, -'.mokuro'.length);
-      if (!title) continue;
-      const entry = standalone.get(title) ?? {};
-      if (lower.endsWith('.mokuro')) entry.mokuroUri = uri;
-      else if (lower.endsWith('.mobile.html') || !entry.htmlUri) entry.htmlUri = uri;
-      standalone.set(title, entry);
-    }
-    if (standalone.size) {
-      for (const [title, readable] of standalone) {
-        volumes.push({
-          id: `${rootUri}#${title}`,
-          series: seriesName,
-          title,
-          uri: rootUri,
-          progressKey: `${rootUri}#${title}`,
-          ...readable,
-          pageCount: 0,
-        });
-      }
-      volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
-      return { name: seriesName, rootUri, volumes, totalPages: 0 };
-    }
+  const bare = scanBareRoot(top, rootUri, seriesName);
+  if (bare) {
+    return bare;
   }
 
-  const snapshot = (): Series => ({
-    name: seriesName,
+  const state: SeriesScanState = {
     rootUri,
-    volumes: [...volumes].sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true })),
-    totalPages: total.pages,
-  });
-
-  const fillLevel = async (level: Level) => {
-    const ocrMap = buildOcrMap(level.ocrDir);
-    const shells = shellsForLevel(level, seriesName, ocrMap).filter(
-      (shell) => level.uri !== rootUri || !topDirectoryUris || topDirectoryUris.has(shell.uri)
-    );
-    // Instant UI: names + html links after just 1 listing…
-    onShell?.({ name: seriesName, rootUri, volumes: shells, totalPages: 0 });
-    // …then counts/covers stream in every 10 volumes.
-    await fillDetails(level, shells, volumes, total, onProgress, () => onShell?.(snapshot()));
+    seriesName,
+    volumes: [],
+    total: { pages: 0 },
+    onProgress,
+    onShell,
+    topDirectoryUris,
   };
 
-  await fillLevel(top);
+  await fillSeriesLevel(top, state);
+  await descendNestedLevels(top, state);
 
-  // Nested case: e.g. mokuro/Detective Conan/Detective Conan/volumes
-  // (double nesting from unzip/file manager). Descend while the current
-  // level yields 0 volumes but contains a subfolder that itself looks like
-  // a series root (many subdirs, ~0 images). Max 3 levels deep.
-  let current: Level | null = top;
-  for (let depth = 0; depth < 3 && volumes.length === 0 && current && current.dirs.length > 0; depth++) {
-    const candidates: { dir: Directory; subdirs: number }[] = [];
-    for (const dir of current.dirs.slice(0, 20)) {
-      try {
-        const items = dir.list();
-        let images = 0;
-        let subdirs = 0;
-        for (const it of items) {
-          if (it instanceof Directory) {
-            if ((it as Directory).name !== '_ocr') subdirs++;
-          } else if (isImageName(it.name)) images++;
-        }
-        // A nested series root has many subdirs and ~0 images itself.
-        if (images === 0 && subdirs > 0) candidates.push({ dir, subdirs });
-      } catch {}
-      if (depth === 0 && candidates.length >= 3) break;
-    }
-    candidates.sort((a, b) => b.subdirs - a.subdirs);
-    let descended = false;
-    for (const c of candidates.slice(0, 3)) {
-      const nested = readLevel(c.dir.uri);
-      if (!nested) continue;
-      const before = volumes.length;
-      await fillLevel(nested);
-      if (volumes.length > before) {
-        descended = true;
-        break;
-      }
-      // This candidate was empty too — try descending THROUGH it next round.
-      current = nested;
-      descended = true;
-      break;
-    }
-    if (!descended) break;
-    // If we descended through an empty middle folder without finding volumes,
-    // loop again to go one level deeper. Otherwise volumes.length > 0 exits.
-    if (volumes.length > 0) break;
-  }
-
-  volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
-  return { name: seriesName, rootUri, volumes, totalPages: total.pages };
+  state.volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
+  return { name: seriesName, rootUri, volumes: state.volumes, totalPages: state.total.pages };
 }
 
 // Also handle _ocr folder structure: .../Detective Conan/_ocr/Meitantei Konan 096/page0003.json
@@ -442,7 +710,7 @@ export async function listOcrPages(ocrRoot: string, volumeId: string): Promise<s
       const out = items
         .filter((i) => !(i instanceof Directory) && i.name.endsWith('.json'))
         .map((i) => i.uri)
-        .sort();
+        .sort((a, b) => a.localeCompare(b));
       return out.length ? out : null;
     } catch {
       return null;

@@ -9,7 +9,7 @@ const LEFT_STACK = 'M172 298C292 270 420 304 496 362L496 730C420 672 292 640 172
 const RIGHT_STACK = 'M852 298C732 270 604 304 528 362L528 730C604 672 732 640 852 666C861 550 861 414 852 298Z';
 const RIBBON = 'M488 600L536 600L536 772L512 734L488 772Z';
 
-export function Logo({ size = 96, badge = true }: { size?: number; badge?: boolean }) {
+export function Logo({ size = 96, badge = true }: { readonly size?: number; readonly badge?: boolean }) {
   return (
     <Svg width={size} height={size} viewBox="0 0 1024 1024">
       {badge ? (

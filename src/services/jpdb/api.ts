@@ -97,6 +97,31 @@ async function sessionText(
   }
 }
 
+function backoffDelay(attempt: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal as any });
+    clearTimeout(timeout);
+    return res;
+  } catch (e) {
+    clearTimeout(timeout);
+    throw e;
+  }
+}
+
+function shouldRetryResponse(safeToRetry: boolean, status: number, attempt: number, retries: number): boolean {
+  return safeToRetry && isRetryableStatus(status) && attempt < retries;
+}
+
+function shouldRetryFailure(safeToRetry: boolean, attempt: number, retries: number): boolean {
+  return safeToRetry && attempt < retries;
+}
+
 async function requestWithRetry(
   url: string,
   init: RequestInit,
@@ -105,31 +130,27 @@ async function requestWithRetry(
   const { timeoutMs = 10000, retries = 1, safeToRetry = init.method === 'GET' } = opts;
   let attempt = 0;
   while (true) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal as any });
-      clearTimeout(timeout);
-      if (!res.ok) {
-        // decide retry
-        if (safeToRetry && isRetryableStatus(res.status) && attempt < retries) {
-          attempt++;
-          await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
-          continue;
-        }
-        return res;
-      }
-      return res;
+      res = await fetchWithTimeout(url, init, timeoutMs);
     } catch (e: any) {
-      clearTimeout(timeout);
       if (e?.name === 'AbortError') throw new JpdbError(`Timeout after ${timeoutMs}ms for ${url}`, undefined, true);
-      if (safeToRetry && attempt < retries) {
+      if (shouldRetryFailure(safeToRetry, attempt, retries)) {
         attempt++;
-        await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
+        await backoffDelay(attempt);
         continue;
       }
       throw new JpdbError(e?.message ?? `Network error for ${url}`, undefined, true);
     }
+    if (!res.ok) {
+      if (shouldRetryResponse(safeToRetry, res.status, attempt, retries)) {
+        attempt++;
+        await backoffDelay(attempt);
+        continue;
+      }
+      return res;
+    }
+    return res;
   }
 }
 
@@ -338,7 +359,7 @@ export const jpdbApi = {
       // already contain data-audio (the /login link in the nav is a
       // red herring). Only review/FORQ scraping truly requires login.
       const html = await jpdbApi.fetchVocabularyPage({ vid, spelling });
-      const m = html.match(/data-audio="([^"]+)"/);
+      const m = /data-audio="([^"]+)"/.exec(html);
       return m?.[1] ?? null;
     } catch (e: any) {
       if (e.status === 404) return null;
@@ -348,8 +369,8 @@ export const jpdbApi = {
         const { lastSessionJobError } = await import('./session');
         const bridgeErr = lastSessionJobError();
         if (bridgeErr) throw new JpdbError(`${e?.message ?? e} [bridge: ${bridgeErr}]`, (e as JpdbError)?.status);
-      } catch (inner: any) {
-        if (inner instanceof JpdbError) throw inner;
+      } catch (error_: any) {
+        if (error_ instanceof JpdbError) throw error_;
       }
       throw e;
     }
@@ -434,9 +455,9 @@ export const jpdbApi = {
     const grade = REVIEW_GRADES[rating];
     if (!grade) throw new JpdbError(`unknown rating ${rating}`);
     const html = await jpdbApi.fetchReviewPage({ vid, sid });
-    const m = html.match(/name="r"\s+value="(\d+)"/i) || html.match(/value="(\d+)"\s+name="r"/i);
+    const m = /name="r"\s+value="(\d+)"/i.exec(html) || /value="(\d+)"\s+name="r"/i.exec(html);
     if (!m) throw new JpdbError('Could not find review number');
-    const reviewNo = parseInt(m[1], 10);
+    const reviewNo = Number.parseInt(m[1], 10);
     return jpdbApi.submitReview({ vid, sid, reviewNo, grade });
   },
 
@@ -545,7 +566,7 @@ export const jpdbApi = {
     forq?: boolean;
     reviewRating?: 'nothing' | 'something' | 'hard' | 'good' | 'easy';
   }) {
-    const { getDeckId, loadConfig } = await import('./config');
+    const { loadConfig } = await import('./config');
     const cfg = await loadConfig();
     const miningDeckId = cfg.miningDeckId;
     if (!miningDeckId) throw new JpdbError('No mining deck ID set, check Settings');
@@ -600,6 +621,43 @@ export const kanjiApi = {
   },
 };
 
+function extractGeminiText(data: any): string {
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) return '';
+  return parts.map((p: any) => p?.text ?? '').join('').trim();
+}
+
+function geminiEmptyResponseError(data: any): JpdbError {
+  // 200 with no text = safety block or empty candidate. Surface why.
+  const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason;
+  return new JpdbError(reason ? `Gemini returned no text (${reason})` : 'Gemini returned an empty response', 200);
+}
+
+function buildGeminiRequest(key: string, prompt: string, signal?: AbortSignal): RequestInit {
+  return {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key } as any,
+    body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] }),
+    signal: signal as any,
+  };
+}
+
+async function fetchGeminiModelText(name: string, key: string, prompt: string, signal?: AbortSignal): Promise<string> {
+  const res = await requestWithRetry(
+    `https://generativelanguage.googleapis.com/v1beta/models/${name}:generateContent`,
+    buildGeminiRequest(key, prompt, signal),
+    { timeoutMs: 45000, safeToRetry: true, retries: 2 }
+  );
+  if (res.ok) {
+    const data = await res.json().catch(() => null as any);
+    const text = extractGeminiText(data);
+    if (text) return text;
+    throw geminiEmptyResponseError(data);
+  }
+  const body = await res.text().catch(() => '');
+  throw new JpdbError(`Gemini: ${geminiErrorMessage(body, res.status)}`, res.status);
+}
+
 export const geminiApi = {
   // Ordered fallbacks. The first is a moving alias that always resolves to a
   // current model, so the feature keeps working as Google retires versions.
@@ -613,34 +671,17 @@ export const geminiApi = {
     let lastError: JpdbError | null = null;
 
     for (const name of tried) {
-      const res = await requestWithRetry(
-        `https://generativelanguage.googleapis.com/v1beta/models/${name}:generateContent`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key } as any,
-          body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] }),
-          signal: signal as any,
-        },
-        { timeoutMs: 45000, safeToRetry: true, retries: 2 }
-      );
-
-      if (res.ok) {
-        const data = await res.json().catch(() => null as any);
-        const parts = data?.candidates?.[0]?.content?.parts;
-        const text = Array.isArray(parts) ? parts.map((p: any) => p?.text ?? '').join('').trim() : '';
-        if (text) return text;
-        // 200 with no text = safety block or empty candidate. Surface why.
-        const reason = data?.promptFeedback?.blockReason || data?.candidates?.[0]?.finishReason;
-        throw new JpdbError(reason ? `Gemini returned no text (${reason})` : 'Gemini returned an empty response', 200);
+      try {
+        return await fetchGeminiModelText(name, key, prompt, signal);
+      } catch (e: any) {
+        const err = e instanceof JpdbError ? e : new JpdbError(String(e?.message ?? e));
+        lastError = err;
+        // A 404 means this model id is gone; try the next candidate. Every other
+        // status (bad key 400/401/403, rate limit 429, server 5xx) would repeat
+        // identically for every model, so fail fast instead of looping.
+        if (err.status === 404) continue;
+        throw err;
       }
-
-      const body = await res.text().catch(() => '');
-      lastError = new JpdbError(`Gemini: ${geminiErrorMessage(body, res.status)}`, res.status);
-      // A 404 means this model id is gone; try the next candidate. Every other
-      // status (bad key 400/401/403, rate limit 429, server 5xx) would repeat
-      // identically for every model, so fail fast instead of looping.
-      if (res.status === 404) continue;
-      throw lastError;
     }
     throw lastError ?? new JpdbError('Gemini request failed');
   },

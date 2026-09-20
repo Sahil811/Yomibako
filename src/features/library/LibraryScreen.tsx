@@ -68,13 +68,18 @@ const compareTitle = (a: { title: string }, b: { title: string }) => titleCollat
 // Deterministic muted tint so volumes without cover art still read as distinct books.
 function tintFor(seed: string, isDark: boolean): string {
   let hash = 0;
-  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) | 0;
+  for (let i = 0; i < seed.length; i++) hash = Math.trunc(hash * 31 + (seed.codePointAt(i) ?? 0));
   const hue = Math.abs(hash) % 360;
-  return isDark ? `hsl(${hue}, 26%, 24%)` : `hsl(${hue}, 46%, 87%)`;
+  if (isDark) {
+    return `hsl(${hue}, 26%, 24%)`;
+  }
+  return `hsl(${hue}, 46%, 87%)`;
 }
 
+const TRAILING_NUMBER_RE = /(\d{1,4})\s*$/;
+
 function coverInitial(title: string): string {
-  const trailingNumber = title.match(/(\d{1,4})\s*$/);
+  const trailingNumber = TRAILING_NUMBER_RE.exec(title);
   if (trailingNumber) return String(Number(trailingNumber[1]));
   return title.trim().slice(0, 2) || '本';
 }
@@ -155,19 +160,80 @@ function volumeCardEqual(prev: VolumeCardProps, next: VolumeCardProps): boolean 
   );
 }
 
-const VolumeCard = React.memo(function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPress, onLongPress, onMenu }: VolumeCardProps) {
-  const progress = volume.progress ?? 0;
-  const pct = Math.round(progress * 100);
-  const meta = volume.pageCount
-    ? `${volume.pageCount} pages${progress > 0 ? ` · ${pct}%` : ''}`
-    : progress > 0
-      ? `${pct}%`
-      : 'Not started';
-  // NOTE: no Reanimated shared values here on purpose. The old per-card scale
-  // animation kept 100+ animated nodes alive and remounted them on every scroll
-  // frame — the main source of the "large list slow to update" warning.
-  // Pressable opacity feedback is free by comparison.
-  const press = {
+function volumeMetaText(pageCount: number, progress: number, pct: number): string {
+  if (pageCount > 0) {
+    if (progress > 0) {
+      const suffix = ` · ${pct}%`;
+      return `${pageCount} pages${suffix}`;
+    }
+    return `${pageCount} pages`;
+  }
+  if (progress > 0) {
+    return `${pct}%`;
+  }
+  return 'Not started';
+}
+
+function filterOptionLabel(option: Filter): string {
+  if (option === 'all') {
+    return 'All';
+  }
+  if (option === 'reading') {
+    return 'Reading';
+  }
+  return 'Unread';
+}
+
+function headerTitleFor(libraryLength: number, seriesName: string | undefined): string {
+  if (libraryLength > 1) {
+    return 'Library';
+  }
+  if (seriesName) {
+    return seriesName;
+  }
+  return 'Library';
+}
+
+function headerSubFor(args: {
+  hasSeries: boolean;
+  libraryLength: number;
+  libraryVolumeCount: number;
+  volumeCount: number;
+  totalPages: number;
+}): string {
+  if (!args.hasSeries) {
+    return 'Scanning…';
+  }
+  if (args.libraryLength > 1) {
+    return `${args.libraryLength} series · ${args.libraryVolumeCount} volumes`;
+  }
+  return `${args.volumeCount} volumes · ${args.totalPages.toLocaleString()} pages`;
+}
+
+function emptyListMessage(query: string, filter: Filter): string {
+  if (query.trim()) {
+    return `No volumes match “${query.trim()}”`;
+  }
+  if (filter === 'reading') {
+    return 'Nothing in progress yet';
+  }
+  if (filter === 'unread') {
+    return 'Every volume has been started';
+  }
+  return 'No volumes here';
+}
+
+type PressConfig = {
+  onPress: () => void;
+  onLongPress: () => void;
+  delayLongPress: number;
+  accessibilityRole: 'button';
+  accessibilityLabel: string;
+  accessibilityState: { selected: boolean };
+};
+
+function makeVolumePress(volume: Volume, selected: boolean, onPress: (v: Volume) => void, onLongPress: (v: Volume) => void): PressConfig {
+  return {
     onPress: () => onPress(volume),
     onLongPress: () => onLongPress(volume),
     delayLongPress: 260,
@@ -175,72 +241,154 @@ const VolumeCard = React.memo(function VolumeCard({ volume, colors, isDark, layo
     accessibilityLabel: volume.title,
     accessibilityState: { selected },
   };
+}
+
+const VolumeCard = React.memo(function VolumeCard({ volume, colors, isDark, layout, selecting, selected, onPress, onLongPress, onMenu }: VolumeCardProps) {
+  const progress = volume.progress ?? 0;
+  const pct = Math.round(progress * 100);
+  const meta = volumeMetaText(volume.pageCount, progress, pct);
+  // NOTE: no Reanimated shared values here on purpose. The old per-card scale
+  // animation kept 100+ animated nodes alive and remounted them on every scroll
+  // frame — the main source of the "large list slow to update" warning.
+  // Pressable opacity feedback is free by comparison.
+  const press = makeVolumePress(volume, selected, onPress, onLongPress);
 
   if (layout === 'list') {
     return (
-      <Pressable {...press} style={({ pressed }) => [{ flex: 1, opacity: pressed ? 0.7 : 1 }]}>
-        <View style={[s.listRow, { backgroundColor: selected ? colors.primaryContainer : colors.secondaryGroupedBackground }]}>
-          <View style={[s.listCover, { backgroundColor: colors.tertiarySystemFill }]}>
-            <CoverArt volume={volume} isDark={isDark} radius={8} />
-          </View>
-          <View style={{ flex: 1, gap: 3 }}>
-            <Text numberOfLines={1} style={[s.listTitle, { color: colors.onSurface }]}>{volume.title}</Text>
-            <Text style={[s.listSub, { color: colors.secondaryLabel }]}>{meta}</Text>
-            {progress > 0 ? (
-              <View style={[s.track, { backgroundColor: colors.quaternarySystemFill, marginTop: 5 }]}>
-                <View style={[s.fill, { backgroundColor: colors.primary, width: `${Math.max(3, pct)}%` }]} />
-              </View>
-            ) : null}
-          </View>
-          {selecting ? (
-            <Icon name={selected ? 'checkCircle' : 'circle'} size={24} color={selected ? colors.primary : colors.tertiaryLabel} strokeWidth={1.8} />
-          ) : (
-            <IconButton icon="more" onPress={() => onMenu(volume)} tint={colors.secondaryLabel} label={`Options for ${volume.title}`} />
-          )}
-        </View>
-      </Pressable>
+      <VolumeListCard
+        volume={volume}
+        colors={colors}
+        isDark={isDark}
+        selecting={selecting}
+        selected={selected}
+        progress={progress}
+        pct={pct}
+        meta={meta}
+        press={press}
+        onMenu={onMenu}
+      />
     );
   }
 
   return (
-    <Pressable {...press} style={({ pressed }) => [{ flex: 1, opacity: pressed ? 0.86 : 1 }]}>
-      <View style={{ flex: 1 }}>
-        <View style={[s.cover, { backgroundColor: colors.surfaceContainer, borderColor: selected ? colors.primary : colors.separator, borderWidth: selected ? 2 : StyleSheet.hairlineWidth }]}>
-          <CoverArt volume={volume} isDark={isDark} radius={13} />
-          {volume.pageCount ? (
-            <View style={s.pageBadge}>
-              <Text style={s.pageBadgeText}>{volume.pageCount}</Text>
-            </View>
-          ) : null}
-          {selecting ? (
-            <View style={[StyleSheet.absoluteFill as any, { backgroundColor: selected ? 'rgba(0,0,0,0.26)' : 'transparent' }]}>
-              <View style={s.cornerSlot}>
-                <Icon name={selected ? 'checkCircle' : 'circle'} size={24} color={selected ? colors.primary : 'rgba(255,255,255,0.92)'} strokeWidth={1.8} />
-              </View>
-            </View>
-          ) : (
-            <Pressable
-              onPress={() => onMenu(volume)}
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityLabel={`Options for ${volume.title}`}
-              style={({ pressed }) => [s.cardMenu, { opacity: pressed ? 0.7 : 1 }]}
-            >
-              <Icon name="more" size={16} color="#FFFFFF" strokeWidth={2} />
-            </Pressable>
-          )}
+    <VolumeGridCard
+      volume={volume}
+      colors={colors}
+      isDark={isDark}
+      selecting={selecting}
+      selected={selected}
+      progress={progress}
+      pct={pct}
+      meta={meta}
+      press={press}
+      onMenu={onMenu}
+    />
+  );
+}, volumeCardEqual);
+
+function VolumeListCard({ volume, colors, isDark, selecting, selected, progress, pct, meta, press, onMenu }: {
+  readonly volume: Volume;
+  readonly colors: any;
+  readonly isDark: boolean;
+  readonly selecting: boolean;
+  readonly selected: boolean;
+  readonly progress: number;
+  readonly pct: number;
+  readonly meta: string;
+  readonly press: PressConfig;
+  readonly onMenu: (volume: Volume) => void;
+}) {
+  return (
+    <Pressable {...press} style={({ pressed }) => [{ flex: 1, opacity: pressed ? 0.7 : 1 }]}>
+      <View style={[s.listRow, { backgroundColor: selected ? colors.primaryContainer : colors.secondaryGroupedBackground }]}>
+        <View style={[s.listCover, { backgroundColor: colors.tertiarySystemFill }]}>
+          <CoverArt volume={volume} isDark={isDark} radius={8} />
+        </View>
+        <View style={{ flex: 1, gap: 3 }}>
+          <Text numberOfLines={1} style={[s.listTitle, { color: colors.onSurface }]}>{volume.title}</Text>
+          <Text style={[s.listSub, { color: colors.secondaryLabel }]}>{meta}</Text>
           {progress > 0 ? (
-            <View style={s.coverProgress}>
-              <View style={{ height: 3, backgroundColor: colors.primary, width: `${Math.max(3, pct)}%` }} />
+            <View style={[s.track, { backgroundColor: colors.quaternarySystemFill, marginTop: 5 }]}>
+              <View style={[s.fill, { backgroundColor: colors.primary, width: `${Math.max(3, pct)}%` }]} />
             </View>
           ) : null}
         </View>
+        {selecting ? (
+          <Icon name={selected ? 'checkCircle' : 'circle'} size={24} color={selected ? colors.primary : colors.tertiaryLabel} strokeWidth={1.8} />
+        ) : (
+          <IconButton icon="more" onPress={() => onMenu(volume)} tint={colors.secondaryLabel} label={`Options for ${volume.title}`} />
+        )}
+      </View>
+    </Pressable>
+  );
+}
+
+function VolumeGridCard({ volume, colors, isDark, selecting, selected, progress, pct, meta, press, onMenu }: {
+  readonly volume: Volume;
+  readonly colors: any;
+  readonly isDark: boolean;
+  readonly selecting: boolean;
+  readonly selected: boolean;
+  readonly progress: number;
+  readonly pct: number;
+  readonly meta: string;
+  readonly press: PressConfig;
+  readonly onMenu: (volume: Volume) => void;
+}) {
+  return (
+    <Pressable {...press} style={({ pressed }) => [{ flex: 1, opacity: pressed ? 0.86 : 1 }]}>
+      <View style={{ flex: 1 }}>
+        <VolumeGridCover volume={volume} colors={colors} isDark={isDark} selecting={selecting} selected={selected} progress={progress} pct={pct} onMenu={onMenu} />
         <Text numberOfLines={1} style={[s.cardTitle, { color: colors.onSurface }]}>{volume.title}</Text>
         <Text numberOfLines={1} style={[s.cardSub, { color: colors.secondaryLabel }]}>{meta}</Text>
       </View>
     </Pressable>
   );
-}, volumeCardEqual);
+}
+
+function VolumeGridCover({ volume, colors, isDark, selecting, selected, progress, pct, onMenu }: {
+  readonly volume: Volume;
+  readonly colors: any;
+  readonly isDark: boolean;
+  readonly selecting: boolean;
+  readonly selected: boolean;
+  readonly progress: number;
+  readonly pct: number;
+  readonly onMenu: (volume: Volume) => void;
+}) {
+  return (
+    <View style={[s.cover, { backgroundColor: colors.surfaceContainer, borderColor: selected ? colors.primary : colors.separator, borderWidth: selected ? 2 : StyleSheet.hairlineWidth }]}>
+      <CoverArt volume={volume} isDark={isDark} radius={13} />
+      {volume.pageCount ? (
+        <View style={s.pageBadge}>
+          <Text style={s.pageBadgeText}>{volume.pageCount}</Text>
+        </View>
+      ) : null}
+      {selecting ? (
+        <View style={[StyleSheet.absoluteFill as any, { backgroundColor: selected ? 'rgba(0,0,0,0.26)' : 'transparent' }]}>
+          <View style={s.cornerSlot}>
+            <Icon name={selected ? 'checkCircle' : 'circle'} size={24} color={selected ? colors.primary : 'rgba(255,255,255,0.92)'} strokeWidth={1.8} />
+          </View>
+        </View>
+      ) : (
+        <Pressable
+          onPress={() => onMenu(volume)}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel={`Options for ${volume.title}`}
+          style={({ pressed }) => [s.cardMenu, { opacity: pressed ? 0.7 : 1 }]}
+        >
+          <Icon name="more" size={16} color="#FFFFFF" strokeWidth={2} />
+        </Pressable>
+      )}
+      {progress > 0 ? (
+        <View style={s.coverProgress}>
+          <View style={{ height: 3, backgroundColor: colors.primary, width: `${Math.max(3, pct)}%` }} />
+        </View>
+      ) : null}
+    </View>
+  );
+}
 
 const SkeletonGrid = React.memo(function SkeletonGrid({ colors }: { colors: any }) {
   const pulse = useSharedValue(0.45);
@@ -277,7 +425,7 @@ const ScanBar = React.memo(function ScanBar({ colors }: { colors: any }) {
 
 // Android: BlurView over a scrolling list forces a full-screen blur re-composite
 // every scroll frame. A solid surface is visually near-identical here and far cheaper.
-function AppBar({ colors, isDark, topPad, children }: { colors: any; isDark: boolean; topPad: number; children: React.ReactNode }) {
+function AppBar({ colors, isDark, topPad, children }: { readonly colors: any; readonly isDark: boolean; readonly topPad: number; readonly children: React.ReactNode }) {
   if (Platform.OS === 'android') {
     return (
       <View style={[s.appBar, { paddingTop: topPad, borderBottomColor: colors.separator, backgroundColor: colors.secondaryGroupedBackground }]}>
@@ -357,6 +505,391 @@ function recount(series: Series, volumes: Volume[]): Series {
   return { ...series, volumes, totalPages: volumes.reduce((count, volume) => count + volume.pageCount, 0) };
 }
 
+function filterHydratedToLive(latest: Series[], hydrated: Series[]): Series[] {
+  const live = new Set(latest.map(seriesKey));
+  return hydrated.filter((item) => live.has(seriesKey(item)));
+}
+
+function mergeHydratedIntoLibrary(latest: Series[], hydrated: Series[]): Series[] {
+  return mergeSeries(latest, filterHydratedToLive(latest, hydrated));
+}
+
+function refreshLibraryOnFocus(
+  libraryRef: React.RefObject<Series[]>,
+  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>
+): void {
+  const current = libraryRef.current;
+  if (!current.length) {
+    return;
+  }
+  void withSavedProgress(current).then((hydrated) => {
+    setLibrary((latest) => mergeHydratedIntoLibrary(latest, hydrated));
+  });
+}
+
+function applyProgressFilter(list: Volume[], filter: Filter): Volume[] {
+  if (filter === 'reading') {
+    return list.filter((v) => (v.progress ?? 0) > 0 && (v.progress ?? 0) < 1);
+  }
+  if (filter === 'unread') {
+    return list.filter((v) => !(v.progress ?? 0));
+  }
+  return list;
+}
+
+function applyQueryFilter(list: Volume[], deferredQuery: string): Volume[] {
+  const q = deferredQuery.trim().toLowerCase();
+  if (!q) {
+    return list;
+  }
+  return list.filter((v) => v.title.toLowerCase().includes(q));
+}
+
+function sortVolumeList(list: Volume[], sort: Sort): Volume[] {
+  if (sort === 'progress') {
+    list.sort((a, b) => (b.progress ?? 0) - (a.progress ?? 0));
+    return list;
+  }
+  if (sort === 'recent') {
+    list.sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0));
+    return list;
+  }
+  list.sort(compareTitle);
+  return list;
+}
+
+function getFilteredVolumes(series: Series | null, deferredQuery: string, filter: Filter, sort: Sort): Volume[] {
+  if (!series) {
+    return [];
+  }
+  const base = [...series.volumes];
+  const byState = applyProgressFilter(base, filter);
+  const byQuery = applyQueryFilter(byState, deferredQuery);
+  return sortVolumeList(byQuery, sort);
+}
+
+function getContinueReading(series: Series | null): Volume[] {
+  if (!series) {
+    return [];
+  }
+  return [...series.volumes]
+    .filter((v) => (v.progress ?? 0) > 0 && (v.progress ?? 0) < 1)
+    .sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0))
+    .slice(0, 8);
+}
+
+function getLibraryVolumeCount(library: Series[]): number {
+  return library.reduce((count, item) => count + item.volumes.length, 0);
+}
+
+function getSelectedVolumes(series: Series | null, selectionSet: Set<string>): Volume[] {
+  if (!series) {
+    return [];
+  }
+  return series.volumes.filter((volume) => selectionSet.has(volume.id));
+}
+
+function selectionTitle(selectionLength: number): string {
+  if (selectionLength > 0) {
+    return `${selectionLength} selected`;
+  }
+  return 'Select volumes';
+}
+
+function searchPlaceholder(seriesName: string | undefined): string {
+  if (seriesName) {
+    return `Search ${seriesName}`;
+  }
+  return 'Search';
+}
+
+function toggleIdInSelection(current: string[], id: string): string[] {
+  if (current.includes(id)) {
+    return current.filter((item) => item !== id);
+  }
+  return [...current, id];
+}
+
+function removeVolumesFromLibrary(current: Series[], idSet: Set<string>): Series[] {
+  return current
+    .map((item) =>
+      item.volumes.some((volume) => idSet.has(volume.id))
+        ? recount(item, item.volumes.filter((volume) => !idSet.has(volume.id)))
+        : item
+    )
+    .filter((item) => item.volumes.length > 0);
+}
+
+function removeSnackText(volumes: Volume[]): string {
+  if (volumes.length === 1) {
+    return `Removed “${volumes[0].title}”`;
+  }
+  return `Removed ${volumes.length} volumes`;
+}
+
+function decodeRootName(raw: string, fallback: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+async function resolveRootDisplayName(uri: string, fallback: string): Promise<string> {
+  let name = fallback;
+  try {
+    name = new Directory(uri).name || name;
+  } catch {
+    // Keep fallback.
+  }
+  return decodeRootName(name, fallback);
+}
+
+type ScanRefs = {
+  goneRef: React.RefObject<boolean>;
+  libraryRef: React.RefObject<Series[]>;
+  removedRef: React.RefObject<Set<string>>;
+};
+
+async function scanOneRoot(
+  uri: string,
+  refs: ScanRefs,
+  setScanProgress: (v: string) => void,
+  setLoading: (v: boolean) => void,
+  absorb: (incoming: Series[]) => void
+): Promise<void> {
+  if (refs.goneRef.current) {
+    return;
+  }
+  const name = await resolveRootDisplayName(uri, 'Manga');
+  try {
+    const found = await scanLibrary(
+      uri,
+      name,
+      (seriesName, done, total) => {
+        if (!refs.goneRef.current) {
+          setScanProgress(`${seriesName} · ${done}/${total} folders`);
+        }
+      },
+      (draft) => {
+        if (refs.goneRef.current) {
+          return;
+        }
+        absorb(draft);
+        if (draft.length) {
+          setLoading(false);
+        }
+      }
+    );
+    const hydrated = await withSavedProgress(found);
+    if (!refs.goneRef.current) {
+      absorb(hydrated);
+    }
+  } catch (error) {
+    console.warn('[Library] scan root failed', uri, error);
+  }
+}
+
+function buildOverflowActions(args: {
+  series: Series;
+  sort: Sort;
+  removedCount: number;
+  onAdd: () => void;
+  onSelect: () => void;
+  onRescan: () => void;
+  onRestore: () => void;
+  onSort: (s: Sort) => void;
+  onRemove: (s: Series) => void;
+}): SheetAction[] {
+  const { series, sort, removedCount, onAdd, onSelect, onRescan, onRestore, onSort, onRemove } = args;
+  const actions: SheetAction[] = [
+    { key: 'add', label: 'Add folder…', icon: 'plus', onPress: onAdd },
+    { key: 'select', label: 'Select volumes', icon: 'check', onPress: onSelect },
+    { key: 'rescan', label: 'Rescan folders', icon: 'reload', onPress: onRescan },
+  ];
+  if (removedCount > 0) {
+    actions.push({ key: 'restore', label: 'Restore removed manga', icon: 'repeat' as IconName, onPress: onRestore });
+  }
+  actions.push(
+    { key: 'sort-title', label: 'Sort by name', icon: 'sort', selected: sort === 'title', dividerBefore: true, onPress: () => onSort('title') },
+    { key: 'sort-progress', label: 'Sort by progress', icon: 'sort', selected: sort === 'progress', onPress: () => onSort('progress') },
+    { key: 'sort-recent', label: 'Sort by recently read', icon: 'sort', selected: sort === 'recent', onPress: () => onSort('recent') },
+    { key: 'remove', label: `Remove “${series.name}”`, icon: 'trash', destructive: true, dividerBefore: true, onPress: () => onRemove(series) }
+  );
+  return actions;
+}
+
+function menuVolumeActions(volume: Volume, openVolume: (v: Volume) => void, onSelectVolume: (v: Volume) => void, onRemoveVolumes: (v: Volume[]) => void): SheetAction[] {
+  let openLabel = 'Open';
+  if ((volume.progress ?? 0) > 0) {
+    openLabel = 'Continue reading';
+  }
+  return [
+    { key: 'open', label: openLabel, icon: 'bookOpen', onPress: () => openVolume(volume) },
+    { key: 'select', label: 'Select volumes', icon: 'check', onPress: () => onSelectVolume(volume) },
+    { key: 'remove', label: 'Remove from library', icon: 'trash', destructive: true, dividerBefore: true, onPress: () => { onRemoveVolumes([volume]); } },
+  ];
+}
+
+const PICK_CANCEL_RE = /cancelled|canceled|abort|dismiss/i;
+
+async function pickDirectoryOrNull(): Promise<{ uri: string; name?: string | null } | null> {
+  try {
+    // Expo SDK 57+: system folder picker (SAF on Android, UIDocumentPicker on iOS).
+    // Throws when the user dismisses — treat that as a silent cancel.
+    const dir = await Directory.pickDirectoryAsync();
+    if (!dir?.uri) {
+      return null;
+    }
+    return dir;
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    if (PICK_CANCEL_RE.test(msg)) {
+      return null;
+    }
+    console.warn('pickFolder pick', e);
+    Alert.alert('Could not open picker', msg);
+    return null;
+  }
+}
+
+function pickScanProgressText(activeName: string, done: number, totalDirs: number): string {
+  if (totalDirs > 0) {
+    return `${activeName} · ${done}/${totalDirs} folders`;
+  }
+  return activeName;
+}
+
+async function persistPickedRoot(uri: string, removedRef: React.RefObject<Set<string>>, setRemoved: (n: Set<string>) => void): Promise<void> {
+  try {
+    await saveRoot(uri);
+  } catch {
+    // Best effort.
+  }
+  // Re-adding a folder is an explicit undo of a previous removal.
+  setRemoved(await restoreRemoved([uri]).catch(() => removedRef.current));
+}
+
+async function scanPickedDirectory(
+  uri: string,
+  seriesName: string,
+  absorb: (incoming: Series[]) => void,
+  setScanProgress: (v: string) => void,
+  setLoading: (v: boolean) => void
+): Promise<Series[]> {
+  return scanLibrary(
+    uri,
+    seriesName,
+    (activeName, done, totalDirs) => {
+      setScanProgress(pickScanProgressText(activeName, done, totalDirs));
+    },
+    (detected) => {
+      // Instant UI: shells (all pageCount 0) show names right after the
+      // 1 root listing; snapshots (counts > 0) stream in behind.
+      // Either way, stop showing the spinner — the library is visible.
+      absorb(detected);
+      setLoading(false);
+    }
+  );
+}
+
+function markVolumeOpened(series: Series, volumeId: string): Series {
+  return recount(
+    series,
+    series.volumes.map((item) => (item.id === volumeId ? { ...item, lastOpened: Date.now() } : item))
+  );
+}
+
+type PickFolderDeps = {
+  removedRef: React.RefObject<Set<string>>;
+  setLoading: (v: boolean) => void;
+  setScanProgress: (v: string) => void;
+  setRemoved: (n: Set<string>) => void;
+  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>;
+  setActiveSeriesUri: (v: string | null) => void;
+  absorb: (incoming: Series[]) => void;
+};
+
+async function runPickFolderFlow(deps: PickFolderDeps): Promise<void> {
+  await Haptics.selectionAsync();
+  // 1) Pick — only THIS block treats cancel as silent.
+  const dir = await pickDirectoryOrNull();
+  if (!dir) {
+    return;
+  }
+  await scanPickedRoot(dir, deps);
+}
+
+async function scanPickedRoot(dir: { uri: string; name?: string | null }, deps: PickFolderDeps): Promise<void> {
+  console.log('[Library] picked', dir.uri, dir.name);
+  // 2) Scan — NEVER silent. Any failure must surface, otherwise the user
+  // is stuck on the empty box with zero feedback (the current bug).
+  deps.setLoading(true);
+  deps.setScanProgress('');
+  // list() is sync native and blocks — let the spinner paint first.
+  await new Promise((r) => setTimeout(r, 60));
+  try {
+    await persistPickedRoot(dir.uri, deps.removedRef, deps.setRemoved);
+    const seriesName = decodeRootName(dir.name ?? 'Library', 'Library');
+    const found = await scanPickedDirectory(dir.uri, seriesName, deps.absorb, deps.setScanProgress, deps.setLoading);
+    await finishPickedScan(found, deps);
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    console.warn('pickFolder scan', e);
+    Alert.alert('Scan failed', msg);
+  } finally {
+    deps.setLoading(false);
+    deps.setScanProgress('');
+  }
+}
+
+async function finishPickedScan(found: Series[], deps: PickFolderDeps): Promise<void> {
+  const volumeCount = found.reduce((count, item) => count + item.volumes.length, 0);
+  console.log('[Library] scan', found.length, 'series', volumeCount, 'volumes');
+  if (volumeCount === 0) {
+    Alert.alert(
+      'No readable manga here',
+      'Choose either a manga series folder containing its volumes, or a shelf folder containing several series.'
+    );
+    return;
+  }
+  const hydrated = await withSavedProgress(found);
+  const visible = withoutRemoved(hydrated, deps.removedRef.current);
+  deps.setLibrary((current) => mergeSeries(current, visible));
+  deps.setActiveSeriesUri(visible[0]?.rootUri ?? null);
+  await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+}
+
+async function rescanAllRoots(
+  refs: ScanRefs & { scanningRef: React.RefObject<boolean> },
+  setLoading: (v: boolean) => void,
+  setScanProgress: (v: string) => void,
+  absorb: (incoming: Series[]) => void
+): Promise<void> {
+  if (refs.scanningRef.current) {
+    return;
+  }
+  refs.scanningRef.current = true;
+  setLoading(true);
+  try {
+    const roots = await getRoots().catch(() => [] as string[]);
+    for (const uri of roots) {
+      if (refs.goneRef.current) {
+        break;
+      }
+      await scanOneRoot(uri, refs, setScanProgress, setLoading, absorb);
+    }
+    // Snapshot the finished scan so the next cold start paints instantly.
+    if (!refs.goneRef.current) {
+      saveLibraryIndex(refs.libraryRef.current, roots);
+    }
+  } finally {
+    refs.scanningRef.current = false;
+    setLoading(false);
+    setScanProgress('');
+  }
+}
+
 async function withSavedProgress(items: Series[]): Promise<Series[]> {
   return Promise.all(items.map(async (series) => {
     const volumes = await Promise.all(series.volumes.map(async (volume) => {
@@ -373,6 +906,452 @@ async function withSavedProgress(items: Series[]): Promise<Series[]> {
     }));
     return recount(series, volumes);
   }));
+}
+
+function SelectionAppBar({ colors, selectionLength, filteredIds, selectedVolumes, onExit, onSelectAll, onRemove }: {
+  readonly colors: any;
+  readonly selectionLength: number;
+  readonly filteredIds: string[];
+  readonly selectedVolumes: Volume[];
+  readonly onExit: () => void;
+  readonly onSelectAll: (ids: string[]) => void;
+  readonly onRemove: (volumes: Volume[]) => void;
+}) {
+  return (
+    <View style={s.barRow}>
+      <IconButton icon="close" onPress={onExit} tint={colors.onSurface} label="Leave selection mode" />
+      <Text style={[s.barTitle, { color: colors.onSurface }]}>{selectionTitle(selectionLength)}</Text>
+      <IconButton
+        icon="check"
+        onPress={() => {
+          Haptics.selectionAsync();
+          onSelectAll(filteredIds);
+        }}
+        tint={colors.primary}
+        label="Select all"
+      />
+      <IconButton
+        icon="trash"
+        onPress={() => { onRemove(selectedVolumes); }}
+        tint={selectionLength ? colors.error : colors.tertiaryLabel}
+        label="Remove selected"
+      />
+    </View>
+  );
+}
+
+function SearchAppBar({ colors, query, seriesName, onClose, onQuery, onClear }: {
+  readonly colors: any;
+  readonly query: string;
+  readonly seriesName: string | undefined;
+  readonly onClose: () => void;
+  readonly onQuery: (q: string) => void;
+  readonly onClear: () => void;
+}) {
+  return (
+    <View style={s.barRow}>
+      <IconButton icon="chevronLeft" onPress={onClose} tint={colors.onSurface} label="Close search" />
+      <TextInput
+        value={query}
+        onChangeText={onQuery}
+        autoFocus
+        placeholder={searchPlaceholder(seriesName)}
+        placeholderTextColor={colors.tertiaryLabel}
+        style={[s.searchInput, { color: colors.onSurface }]}
+        returnKeyType="search"
+        autoCorrect={false}
+        autoCapitalize="none"
+      />
+      {query.length ? <IconButton icon="close" onPress={onClear} tint={colors.secondaryLabel} label="Clear search" /> : null}
+    </View>
+  );
+}
+
+function TitleAppBar({ colors, headerTitle, headerSub, layout, onSearch, onToggleLayout, onOverflow }: {
+  readonly colors: any;
+  readonly headerTitle: string;
+  readonly headerSub: string;
+  readonly layout: 'grid' | 'list';
+  readonly onSearch: () => void;
+  readonly onToggleLayout: () => void;
+  readonly onOverflow: () => void;
+}) {
+  let layoutIcon: IconName = 'grid';
+  if (layout === 'grid') {
+    layoutIcon = 'list';
+  }
+  let layoutLabel = 'Switch to grid';
+  if (layout === 'grid') {
+    layoutLabel = 'Switch to list';
+  }
+  return (
+    <View style={s.barRow}>
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text numberOfLines={1} style={[s.title, { color: colors.onSurface }]}>{headerTitle}</Text>
+        <Text numberOfLines={1} style={[s.subtitle, { color: colors.secondaryLabel }]}>{headerSub}</Text>
+      </View>
+      <IconButton icon="search" onPress={onSearch} tint={colors.onSurface} label="Search library" />
+      <IconButton icon={layoutIcon} onPress={onToggleLayout} tint={colors.onSurface} label={layoutLabel} />
+      <IconButton icon="more" onPress={onOverflow} tint={colors.onSurface} label="Library options" />
+    </View>
+  );
+}
+
+function LibraryAppBarContent(args: {
+  readonly selecting: boolean;
+  readonly searching: boolean;
+  readonly colors: any;
+  readonly selection: string[];
+  readonly filtered: Volume[];
+  readonly selectedVolumes: Volume[];
+  readonly query: string;
+  readonly seriesName: string | undefined;
+  readonly headerTitle: string;
+  readonly headerSub: string;
+  readonly layout: 'grid' | 'list';
+  readonly onExitSelection: () => void;
+  readonly onToggleSelectAll: (allSelected: boolean, filtered: Volume[]) => void;
+  readonly onRemoveVolumes: (v: Volume[]) => void;
+  readonly onCloseSearch: () => void;
+  readonly onQuery: (q: string) => void;
+  readonly onClearQuery: () => void;
+  readonly onSearch: () => void;
+  readonly onToggleLayout: () => void;
+  readonly onOverflow: () => void;
+}): React.ReactElement {
+  if (args.selecting) {
+    return (
+      <SelectionAppBar
+        colors={args.colors}
+        selectionLength={args.selection.length}
+        filteredIds={args.filtered.map((volume) => volume.id)}
+        selectedVolumes={args.selectedVolumes}
+        onExit={args.onExitSelection}
+        onSelectAll={() => args.onToggleSelectAll(args.selection.length === args.filtered.length, args.filtered)}
+        onRemove={args.onRemoveVolumes}
+      />
+    );
+  }
+  if (args.searching) {
+    return (
+      <SearchAppBar
+        colors={args.colors}
+        query={args.query}
+        seriesName={args.seriesName}
+        onClose={args.onCloseSearch}
+        onQuery={args.onQuery}
+        onClear={args.onClearQuery}
+      />
+    );
+  }
+  return (
+    <TitleAppBar
+      colors={args.colors}
+      headerTitle={args.headerTitle}
+      headerSub={args.headerSub}
+      layout={args.layout}
+      onSearch={args.onSearch}
+      onToggleLayout={args.onToggleLayout}
+      onOverflow={args.onOverflow}
+    />
+  );
+}
+
+function ShelvesSection({ library, series, colors, onSelectSeries, onMenuSeries }: {
+  readonly library: Series[];
+  readonly series: Series;
+  readonly colors: any;
+  readonly onSelectSeries: (item: Series) => void;
+  readonly onMenuSeries: (item: Series) => void;
+}) {
+  if (library.length <= 1) {
+    return null;
+  }
+  return (
+    <View style={{ marginBottom: 18 }}>
+      <Text style={[s.sectionTitle, { color: colors.onSurface }]}>Shelves</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.shelfRail}>
+        {library.map((item) => (
+          <ShelfChip key={seriesKey(item)} item={item} active={seriesKey(item) === seriesKey(series)} colors={colors} onSelect={onSelectSeries} onMenu={onMenuSeries} />
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+function ShelfChip({ item, active, colors, onSelect, onMenu }: {
+  readonly item: Series;
+  readonly active: boolean;
+  readonly colors: any;
+  readonly onSelect: (item: Series) => void;
+  readonly onMenu: (item: Series) => void;
+}) {
+  const cover = item.volumes.find((volume) => volume.coverUri)?.coverUri;
+  return (
+    <Pressable
+      key={seriesKey(item)}
+      onPress={() => onSelect(item)}
+      onLongPress={() => onMenu(item)}
+      delayLongPress={260}
+      accessibilityRole="tab"
+      accessibilityState={{ selected: active }}
+      style={({ pressed }) => [
+        s.shelfChip,
+        {
+          backgroundColor: active ? colors.primaryContainer : colors.secondaryGroupedBackground,
+          borderColor: active ? colors.primary : colors.separator,
+          opacity: pressed ? 0.85 : 1,
+        },
+      ]}
+    >
+      <View style={[s.shelfCover, { backgroundColor: colors.tertiarySystemFill }]}>
+        {cover ? (
+          <Image source={{ uri: cover }} style={StyleSheet.absoluteFill as any} contentFit="cover" cachePolicy="memory-disk" transition={0} />
+        ) : (
+          <Icon name="book" size={14} color={colors.secondaryLabel} strokeWidth={1.7} />
+        )}
+      </View>
+      <View style={{ minWidth: 0, flexShrink: 1 }}>
+        <Text numberOfLines={1} style={[s.shelfName, { color: active ? colors.primary : colors.onSurface }]}>{item.name}</Text>
+        <Text style={[s.shelfMeta, { color: colors.secondaryLabel }]}>{item.volumes.length} volumes</Text>
+      </View>
+    </Pressable>
+  );
+}
+
+function ContinueReadingSection({ volumes, colors, isDark, query, selecting, onOpen, onMenu }: {
+  readonly volumes: Volume[];
+  readonly colors: any;
+  readonly isDark: boolean;
+  readonly query: string;
+  readonly selecting: boolean;
+  readonly onOpen: (v: Volume) => void;
+  readonly onMenu: (v: Volume) => void;
+}) {
+  if (volumes.length === 0 || query || selecting) {
+    return null;
+  }
+  return (
+    <View style={{ marginBottom: 18 }}>
+      <Text style={[s.sectionTitle, { color: colors.onSurface }]}>Continue reading</Text>
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 14, paddingRight: 16 }} snapToInterval={134} decelerationRate="fast">
+        {volumes.map((volume) => (
+          <ContinueReadingCard key={volume.id} volume={volume} colors={colors} isDark={isDark} onOpen={onOpen} onMenu={onMenu} />
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+function ContinueReadingCard({ volume, colors, isDark, onOpen, onMenu }: {
+  readonly volume: Volume;
+  readonly colors: any;
+  readonly isDark: boolean;
+  readonly onOpen: (v: Volume) => void;
+  readonly onMenu: (v: Volume) => void;
+}) {
+  return (
+    <Pressable
+      key={volume.id}
+      onPress={() => onOpen(volume)}
+      onLongPress={() => onMenu(volume)}
+      delayLongPress={260}
+      style={({ pressed }) => [{ width: 120, opacity: pressed ? 0.86 : 1 }]}
+    >
+      <View style={[s.continueCover, { backgroundColor: colors.surfaceContainer, borderColor: colors.separator }]}>
+        <CoverArt volume={volume} isDark={isDark} radius={11} />
+        <View style={s.coverProgress}>
+          <View style={{ height: 3, backgroundColor: colors.primary, width: `${Math.max(3, Math.round((volume.progress ?? 0) * 100))}%` }} />
+        </View>
+      </View>
+      <Text numberOfLines={1} style={[s.cardTitle, { color: colors.onSurface }]}>{volume.title}</Text>
+      <Text numberOfLines={1} style={[s.cardSub, { color: colors.secondaryLabel }]}>{Math.round((volume.progress ?? 0) * 100)}% read</Text>
+    </Pressable>
+  );
+}
+
+function FilterSection({ volumeCount, filter, colors, filteredLength, onFilter }: {
+  readonly volumeCount: number;
+  readonly filter: Filter;
+  readonly colors: any;
+  readonly filteredLength: number;
+  readonly onFilter: (f: Filter) => void;
+}) {
+  if (volumeCount <= 2) {
+    return null;
+  }
+  return (
+    <View style={s.filterRow}>
+      <View style={[s.segmented, { backgroundColor: colors.secondarySystemFill }]}>
+        {(['all', 'reading', 'unread'] as Filter[]).map((option) => (
+          <FilterChip key={option} option={option} active={filter === option} colors={colors} onFilter={onFilter} />
+        ))}
+      </View>
+      <Text style={[s.countText, { color: colors.tertiaryLabel }]}>{filteredLength}</Text>
+    </View>
+  );
+}
+
+function FilterChip({ option, active, colors, onFilter }: {
+  readonly option: Filter;
+  readonly active: boolean;
+  readonly colors: any;
+  readonly onFilter: (f: Filter) => void;
+}) {
+  return (
+    <Pressable
+      key={option}
+      onPress={() => onFilter(option)}
+      style={[s.segItem, active && { backgroundColor: colors.secondaryGroupedBackground }]}
+      accessibilityRole="button"
+      accessibilityState={{ selected: active }}
+    >
+      <Text style={[s.segText, { color: active ? colors.onSurface : colors.secondaryLabel }]}>
+        {filterOptionLabel(option)}
+      </Text>
+    </Pressable>
+  );
+}
+
+function EmptyVolumesView({ query, filter, colors }: {
+  readonly query: string;
+  readonly filter: Filter;
+  readonly colors: any;
+}) {
+  return (
+    <View style={s.listEmpty}>
+      <Icon name="search" size={26} color={colors.tertiaryLabel} strokeWidth={1.7} />
+      <Text style={[s.listEmptyText, { color: colors.secondaryLabel }]}>
+        {emptyListMessage(query, filter)}
+      </Text>
+    </View>
+  );
+}
+
+function removeSeriesDetail(target: Series): string {
+  if (target.volumes.length === 1) {
+    return `${target.volumes.length} volume will leave your library. Nothing is deleted from this device.`;
+  }
+  return `${target.volumes.length} volumes will leave your library. Nothing is deleted from this device.`;
+}
+
+function buildOverflowActionsOrEmpty(
+  series: Series | null,
+  sort: Sort,
+  removedCount: number,
+  callbacks: {
+    onAdd: () => void;
+    onSelect: () => void;
+    onRescan: () => void;
+    onRestore: () => void;
+    onSort: (s: Sort) => void;
+    onRemove: (s: Series) => void;
+  }
+): SheetAction[] {
+  if (!series) {
+    return [];
+  }
+  return buildOverflowActions({ series, sort, removedCount, ...callbacks });
+}
+
+function toggleLayoutValue(current: 'grid' | 'list'): 'grid' | 'list' {
+  if (current === 'grid') {
+    return 'list';
+  }
+  return 'grid';
+}
+
+function shouldShowOnboarding(series: Series | null, loading: boolean): boolean {
+  if (!series && !loading) {
+    return true;
+  }
+  return false;
+}
+
+type RemoveSeriesDeps = {
+  libraryRef: React.RefObject<Series[]>;
+  activeSeriesUri: string | null;
+  exitSelection: () => void;
+  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>;
+  setActiveSeriesUri: (v: string | null) => void;
+  setRemoved: (n: Set<string>) => void;
+  setSnack: (s: SnackState) => void;
+  showSnack: (text: string, undo?: () => void) => void;
+};
+
+async function performRemoveSeries(target: Series, deps: RemoveSeriesDeps): Promise<void> {
+  const snapshot = deps.libraryRef.current;
+  const previousActive = deps.activeSeriesUri;
+  const rest = snapshot.filter((item) => seriesKey(item) !== seriesKey(target));
+  const sourceRoot = target.sourceRootUri ?? target.rootUri;
+  // Only forget the granted folder when no other shelf still needs it.
+  const rootStillUsed = rest.some((item) => (item.sourceRootUri ?? item.rootUri) === sourceRoot);
+  deps.exitSelection();
+  deps.setLibrary(rest);
+  if (rest.length) {
+    deps.setActiveSeriesUri(seriesKey(rest[0]));
+  } else {
+    deps.setActiveSeriesUri(null);
+  }
+  deps.setRemoved(await markRemoved([target.rootUri]));
+  if (!rootStillUsed) {
+    await removeRoot(sourceRoot).catch(() => {});
+  }
+  void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+  deps.showSnack(`Removed “${target.name}”`, () => {
+    void restoreRemoved([target.rootUri]).then(deps.setRemoved);
+    if (!rootStillUsed) {
+      void saveRoot(sourceRoot).catch(() => {});
+    }
+    deps.setLibrary(snapshot);
+    deps.setActiveSeriesUri(previousActive);
+    deps.setSnack(null);
+  });
+}
+
+function confirmRemoveSeries(target: Series, deps: RemoveSeriesDeps): void {
+  Alert.alert(`Remove “${target.name}”?`, removeSeriesDetail(target), [
+    { text: 'Cancel', style: 'cancel' },
+    {
+      text: 'Remove',
+      style: 'destructive',
+      onPress: () => void performRemoveSeries(target, deps),
+    },
+  ]);
+}
+
+function OnboardingView({ colors, topPad, onPick }: {
+  readonly colors: any;
+  readonly topPad: number;
+  readonly onPick: () => void;
+}) {
+  return (
+    <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
+      <AppBar colors={colors} isDark={false} topPad={topPad}>
+        <View style={s.barRow}>
+          <Text style={[s.title, { color: colors.onSurface }]}>Library</Text>
+        </View>
+      </AppBar>
+      <ScrollView contentContainerStyle={s.empty} showsVerticalScrollIndicator={false}>
+        <View style={s.heroIcon}>
+          <Logo size={96} />
+        </View>
+        <Text style={[s.emptyTitle, { color: colors.onSurface }]}>Add your manga folder</Text>
+        <Text style={[s.emptyBody, { color: colors.secondaryLabel }]}>
+          Pick a single series, or a shelf holding several. Yomibako reads them in place — nothing is copied or moved.
+        </Text>
+        <Pressable
+          onPress={onPick}
+          android_ripple={{ color: 'rgba(255,255,255,0.22)' }}
+          style={({ pressed }) => [s.primaryBtn, { backgroundColor: colors.primary, opacity: pressed ? 0.88 : 1 }]}
+        >
+          <Icon name="plus" size={18} color="#FFFFFF" strokeWidth={2.4} />
+          <Text style={s.primaryBtnText}>Choose folder</Text>
+        </Pressable>
+        <Text style={[s.emptyHint, { color: colors.tertiaryLabel }]}>.mobile.html · .html · .mokuro + _ocr</Text>
+      </ScrollView>
+    </View>
+  );
 }
 
 export default function LibraryScreen() {
@@ -456,145 +1435,42 @@ export default function LibraryScreen() {
   // Walks every granted root. Also used by "Rescan folders", so volumes added
   // on the device show up without restarting the app.
   const rescan = useCallback(async () => {
-    if (scanningRef.current) return;
-    scanningRef.current = true;
-    setLoading(true);
-    try {
-      const roots = await getRoots().catch(() => [] as string[]);
-      for (const uri of roots) {
-        if (goneRef.current) break;
-        let name = 'Manga';
-        try { name = new Directory(uri).name || name; } catch {}
-        try { name = decodeURIComponent(name); } catch {}
-        try {
-          const found = await scanLibrary(
-            uri,
-            name,
-            (seriesName, done, total) => !goneRef.current && setScanProgress(`${seriesName} · ${done}/${total} folders`),
-            (draft) => {
-              if (goneRef.current) return;
-              absorb(draft);
-              if (draft.length) setLoading(false);
-            }
-          );
-          const hydrated = await withSavedProgress(found);
-          if (!goneRef.current) absorb(hydrated);
-        } catch (error) {
-          console.warn('[Library] scan root failed', uri, error);
-        }
-      }
-      // Snapshot the finished scan so the next cold start paints instantly.
-      if (!goneRef.current) saveLibraryIndex(libraryRef.current, roots);
-    } finally {
-      scanningRef.current = false;
-      setLoading(false);
-      setScanProgress('');
-    }
+    await rescanAllRoots({ goneRef, libraryRef, removedRef, scanningRef }, setLoading, setScanProgress, absorb);
   }, [absorb]);
 
-  useEffect(() => {
-    if (restored.current) return;
-    restored.current = true;
-    void (async () => {
-      setRemoved(await loadRemoved().catch(() => new Set<string>()));
-      // Show the last known shelf first — covers and page counts included —
-      // then let the live scan below reconcile. absorb() still applies the
-      // removal set, so hidden series cannot return from the cache.
-      const roots = await getRoots().catch(() => [] as string[]);
-      if (roots.length && !goneRef.current) {
-        const cached = await loadLibraryIndex(roots);
-        if (cached.length && !goneRef.current) absorb(await withSavedProgress(cached));
+  const restoreCachedLibrary = useCallback(async () => {
+    setRemoved(await loadRemoved().catch(() => new Set<string>()));
+    // Show the last known shelf first — covers and page counts included —
+    // then let the live scan below reconcile. absorb() still applies the
+    // removal set, so hidden series cannot return from the cache.
+    const roots = await getRoots().catch(() => [] as string[]);
+    if (roots.length && !goneRef.current) {
+      const cached = await loadLibraryIndex(roots);
+      if (cached.length && !goneRef.current) {
+        absorb(await withSavedProgress(cached));
       }
-      await rescan();
-    })();
+    }
+    await rescan();
   }, [absorb, rescan, setRemoved]);
 
-  useEffect(() => nav.addListener('focus', () => {
-    const current = libraryRef.current;
-    if (!current.length) return;
-    void withSavedProgress(current).then((hydrated) => {
-      setLibrary((latest) => {
-        const live = new Set(latest.map(seriesKey));
-        return mergeSeries(latest, hydrated.filter((item) => live.has(seriesKey(item))));
-      });
-    });
-  }), [nav]);
-
-  const pickFolder = useCallback(async () => {
-    await Haptics.selectionAsync();
-    // 1) Pick — only THIS block treats cancel as silent.
-    let dir;
-    try {
-      // Expo SDK 57+: system folder picker (SAF on Android, UIDocumentPicker on iOS).
-      // Throws when the user dismisses — treat that as a silent cancel.
-      dir = await Directory.pickDirectoryAsync();
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
-      if (/cancelled|canceled|abort|dismiss/i.test(msg)) return;
-      console.warn('pickFolder pick', e);
-      Alert.alert('Could not open picker', msg);
+  useEffect(() => {
+    if (restored.current) {
       return;
     }
-    if (!dir?.uri) return;
-    console.log('[Library] picked', dir.uri, dir.name);
-    // 2) Scan — NEVER silent. Any failure must surface, otherwise the user
-    // is stuck on the empty box with zero feedback (the current bug).
-    setLoading(true);
-    setScanProgress('');
-    // list() is sync native and blocks — let the spinner paint first.
-    await new Promise((r) => setTimeout(r, 60));
-    try {
-      try {
-        await saveRoot(dir.uri);
-      } catch {}
-      // Re-adding a folder is an explicit undo of a previous removal.
-      setRemoved(await restoreRemoved([dir.uri]).catch(() => removedRef.current));
-      let seriesName = dir.name ?? 'Library';
-      try {
-        seriesName = decodeURIComponent(seriesName);
-      } catch {}
-      const found = await scanLibrary(
-        dir.uri,
-        seriesName,
-        (activeName, done, totalDirs) => {
-          setScanProgress(totalDirs > 0 ? `${activeName} · ${done}/${totalDirs} folders` : activeName);
-        },
-        (detected) => {
-          // Instant UI: shells (all pageCount 0) show names right after the
-          // 1 root listing; snapshots (counts > 0) stream in behind.
-          // Either way, stop showing the spinner — the library is visible.
-          absorb(detected);
-          setLoading(false);
-        }
-      );
-      const volumeCount = found.reduce((count, item) => count + item.volumes.length, 0);
-      console.log('[Library] scan', found.length, 'series', volumeCount, 'volumes');
-      if (volumeCount === 0) {
-        Alert.alert(
-          'No readable manga here',
-          'Choose either a manga series folder containing its volumes, or a shelf folder containing several series.'
-        );
-        return;
-      }
-      const hydrated = await withSavedProgress(found);
-      const visible = withoutRemoved(hydrated, removedRef.current);
-      setLibrary((current) => mergeSeries(current, visible));
-      setActiveSeriesUri(visible[0]?.rootUri ?? null);
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    } catch (e: any) {
-      const msg = String(e?.message ?? e);
-      console.warn('pickFolder scan', e);
-      Alert.alert('Scan failed', msg);
-    } finally {
-      setLoading(false);
-      setScanProgress('');
-    }
+    restored.current = true;
+    void restoreCachedLibrary();
+  }, [restoreCachedLibrary]);
+
+  useEffect(() => nav.addListener('focus', () => refreshLibraryOnFocus(libraryRef, setLibrary)), [nav]);
+
+  const pickFolder = useCallback(async () => {
+    await runPickFolderFlow({ removedRef, setLoading, setScanProgress, setRemoved, setLibrary, setActiveSeriesUri, absorb });
   }, [absorb, setRemoved]);
 
   const openVolume = useCallback((volume: Volume) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     if (series) {
-      const next = recount(series, series.volumes.map((item) => (item.id === volume.id ? { ...item, lastOpened: Date.now() } : item)));
+      const next = markVolumeOpened(series, volume.id);
       setLibrary((current) => mergeSeries(current, [next]));
     }
     nav.navigate('Reader', { volume, series });
@@ -607,23 +1483,27 @@ export default function LibraryScreen() {
 
   const toggleSelected = useCallback((id: string) => {
     Haptics.selectionAsync();
-    setSelection((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+    setSelection((current) => toggleIdInSelection(current, id));
   }, []);
 
   // Stable volume-keyed handlers so memoised VolumeCards keep their props
   // identity across list re-renders. Inline closures here would defeat memo.
   const handlePressVolume = useCallback((volume: Volume) => {
-    if (selecting) toggleSelected(volume.id);
-    else openVolume(volume);
+    if (selecting) {
+      toggleSelected(volume.id);
+      return;
+    }
+    openVolume(volume);
   }, [selecting, toggleSelected, openVolume]);
 
   const handleLongPressVolume = useCallback((volume: Volume) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    if (selecting) toggleSelected(volume.id);
-    else {
-      setSelecting(true);
-      setSelection([volume.id]);
+    if (selecting) {
+      toggleSelected(volume.id);
+      return;
     }
+    setSelecting(true);
+    setSelection([volume.id]);
   }, [selecting, toggleSelected]);
 
   const handleMenuVolume = useCallback((volume: Volume) => {
@@ -634,20 +1514,18 @@ export default function LibraryScreen() {
   // Removing never touches the files on disk — it only hides them, and the
   // choice is persisted so the next scan does not bring them back.
   const removeVolumes = useCallback(async (volumes: Volume[]) => {
-    if (!volumes.length) return;
+    if (!volumes.length) {
+      return;
+    }
     const ids = volumes.map((volume) => volume.id);
     const idSet = new Set(ids);
     const snapshot = libraryRef.current;
     const previousActive = activeSeriesUri;
     exitSelection();
-    setLibrary((current) => current
-      .map((item) => (item.volumes.some((volume) => idSet.has(volume.id))
-        ? recount(item, item.volumes.filter((volume) => !idSet.has(volume.id)))
-        : item))
-      .filter((item) => item.volumes.length > 0));
+    setLibrary((current) => removeVolumesFromLibrary(current, idSet));
     setRemoved(await markRemoved(ids));
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    showSnack(volumes.length === 1 ? `Removed “${volumes[0].title}”` : `Removed ${volumes.length} volumes`, () => {
+    showSnack(removeSnackText(volumes), () => {
       void restoreRemoved(ids).then(setRemoved);
       setLibrary(snapshot);
       setActiveSeriesUri(previousActive);
@@ -656,38 +1534,16 @@ export default function LibraryScreen() {
   }, [activeSeriesUri, exitSelection, setRemoved, showSnack]);
 
   const removeSeries = useCallback((target: Series) => {
-    Alert.alert(
-      `Remove “${target.name}”?`,
-      `${target.volumes.length} ${target.volumes.length === 1 ? 'volume' : 'volumes'} will leave your library. Nothing is deleted from this device.`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Remove',
-          style: 'destructive',
-          onPress: async () => {
-            const snapshot = libraryRef.current;
-            const previousActive = activeSeriesUri;
-            const rest = snapshot.filter((item) => seriesKey(item) !== seriesKey(target));
-            const sourceRoot = target.sourceRootUri ?? target.rootUri;
-            // Only forget the granted folder when no other shelf still needs it.
-            const rootStillUsed = rest.some((item) => (item.sourceRootUri ?? item.rootUri) === sourceRoot);
-            exitSelection();
-            setLibrary(rest);
-            setActiveSeriesUri(rest.length ? seriesKey(rest[0]) : null);
-            setRemoved(await markRemoved([target.rootUri]));
-            if (!rootStillUsed) await removeRoot(sourceRoot).catch(() => {});
-            void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-            showSnack(`Removed “${target.name}”`, () => {
-              void restoreRemoved([target.rootUri]).then(setRemoved);
-              if (!rootStillUsed) void saveRoot(sourceRoot).catch(() => {});
-              setLibrary(snapshot);
-              setActiveSeriesUri(previousActive);
-              setSnack(null);
-            });
-          },
-        },
-      ]
-    );
+    confirmRemoveSeries(target, {
+      libraryRef,
+      activeSeriesUri,
+      exitSelection,
+      setLibrary,
+      setActiveSeriesUri,
+      setRemoved,
+      setSnack,
+      showSnack,
+    });
   }, [activeSeriesUri, exitSelection, setRemoved, showSnack]);
 
   const restoreEverything = useCallback(async () => {
@@ -696,38 +1552,13 @@ export default function LibraryScreen() {
     showSnack('Restored removed manga');
   }, [rescan, setRemoved, showSnack]);
 
-  const filtered = useMemo(() => {
-    if (!series) return [];
-    let list = [...series.volumes];
-    if (filter === 'reading') list = list.filter((v) => (v.progress ?? 0) > 0 && (v.progress ?? 0) < 1);
-    if (filter === 'unread') list = list.filter((v) => !(v.progress ?? 0));
-    const q = deferredQuery.trim().toLowerCase();
-    if (q) {
-      list = list.filter((v) => v.title.toLowerCase().includes(q));
-    }
-    if (sort === 'progress') list.sort((a, b) => (b.progress ?? 0) - (a.progress ?? 0));
-    else if (sort === 'recent') list.sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0));
-    else list.sort(compareTitle);
-    return list;
-  }, [series, deferredQuery, filter, sort]);
+  const filtered = useMemo(() => getFilteredVolumes(series, deferredQuery, filter, sort), [series, deferredQuery, filter, sort]);
 
-  const continueReading = useMemo(() => {
-    if (!series) return [];
-    return [...series.volumes]
-      .filter((v) => (v.progress ?? 0) > 0 && (v.progress ?? 0) < 1)
-      .sort((a, b) => (b.lastOpened ?? 0) - (a.lastOpened ?? 0))
-      .slice(0, 8);
-  }, [series]);
+  const continueReading = useMemo(() => getContinueReading(series), [series]);
 
-  const libraryVolumeCount = useMemo(
-    () => library.reduce((count, item) => count + item.volumes.length, 0),
-    [library]
-  );
+  const libraryVolumeCount = useMemo(() => getLibraryVolumeCount(library), [library]);
 
-  const selectedVolumes = useMemo(
-    () => (series ? series.volumes.filter((volume) => selectionSet.has(volume.id)) : []),
-    [series, selectionSet]
-  );
+  const selectedVolumes = useMemo(() => getSelectedVolumes(series, selectionSet), [series, selectionSet]);
 
   const renderVolume = useCallback(({ item }: { item: Volume }) => (
     <VolumeCard
@@ -744,331 +1575,383 @@ export default function LibraryScreen() {
   ), [colors, isDark, layout, selecting, selectionSet, handlePressVolume, handleLongPressVolume, handleMenuVolume]);
 
   // ——— Onboarding: nothing in the library yet ———
-  if (!series && !loading) {
-    return (
-      <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
-        <AppBar colors={colors} isDark={isDark} topPad={insets.top + 10}>
-          <View style={s.barRow}>
-            <Text style={[s.title, { color: colors.onSurface }]}>Library</Text>
-          </View>
-        </AppBar>
-        <ScrollView contentContainerStyle={s.empty} showsVerticalScrollIndicator={false}>
-          <View style={s.heroIcon}>
-            <Logo size={96} />
-          </View>
-          <Text style={[s.emptyTitle, { color: colors.onSurface }]}>Add your manga folder</Text>
-          <Text style={[s.emptyBody, { color: colors.secondaryLabel }]}>
-            Pick a single series, or a shelf holding several. Yomibako reads them in place — nothing is copied or moved.
-          </Text>
-          <Pressable
-            onPress={pickFolder}
-            android_ripple={{ color: 'rgba(255,255,255,0.22)' }}
-            style={({ pressed }) => [s.primaryBtn, { backgroundColor: colors.primary, opacity: pressed ? 0.88 : 1 }]}
-          >
-            <Icon name="plus" size={18} color="#FFFFFF" strokeWidth={2.4} />
-            <Text style={s.primaryBtnText}>Choose folder</Text>
-          </Pressable>
-          <Text style={[s.emptyHint, { color: colors.tertiaryLabel }]}>.mobile.html · .html · .mokuro + _ocr</Text>
-        </ScrollView>
-      </View>
-    );
+  if (shouldShowOnboarding(series, loading)) {
+    return <OnboardingView colors={colors} topPad={insets.top + 10} onPick={pickFolder} />;
   }
 
-  const headerTitle = library.length > 1 ? 'Library' : series?.name ?? 'Library';
-  const headerSub = !series
-    ? 'Scanning…'
-    : library.length > 1
-      ? `${library.length} series · ${libraryVolumeCount} volumes`
-      : `${series.volumes.length} volumes · ${series.totalPages.toLocaleString()} pages`;
+  const headerTitle = headerTitleFor(library.length, series?.name);
+  const headerSub = headerSubFor({
+    hasSeries: !!series,
+    libraryLength: library.length,
+    libraryVolumeCount,
+    volumeCount: series?.volumes.length ?? 0,
+    totalPages: series?.totalPages ?? 0,
+  });
 
-  const overflowActions: SheetAction[] = series ? [
-    { key: 'add', label: 'Add folder…', icon: 'plus', onPress: () => void pickFolder() },
-    { key: 'select', label: 'Select volumes', icon: 'check', onPress: () => setSelecting(true) },
-    { key: 'rescan', label: 'Rescan folders', icon: 'reload', onPress: () => void rescan() },
-    ...(removedCount > 0
-      ? [{ key: 'restore', label: 'Restore removed manga', icon: 'repeat' as IconName, onPress: () => void restoreEverything() }]
-      : []),
-    { key: 'sort-title', label: 'Sort by name', icon: 'sort', selected: sort === 'title', dividerBefore: true, onPress: () => setSort('title') },
-    { key: 'sort-progress', label: 'Sort by progress', icon: 'sort', selected: sort === 'progress', onPress: () => setSort('progress') },
-    { key: 'sort-recent', label: 'Sort by recently read', icon: 'sort', selected: sort === 'recent', onPress: () => setSort('recent') },
-    { key: 'remove', label: `Remove “${series.name}”`, icon: 'trash', destructive: true, dividerBefore: true, onPress: () => removeSeries(series) },
-  ] : [];
+  const overflowActions: SheetAction[] = buildOverflowActionsOrEmpty(series, sort, removedCount, {
+    onAdd: () => void pickFolder(),
+    onSelect: () => setSelecting(true),
+    onRescan: () => void rescan(),
+    onRestore: () => void restoreEverything(),
+    onSort: (next) => setSort(next),
+    onRemove: (target) => removeSeries(target),
+  });
+
+  const handleToggleSelectAll = (allSelected: boolean, list: Volume[]) => {
+    Haptics.selectionAsync();
+    if (allSelected) {
+      setSelection([]);
+    } else {
+      setSelection(list.map((volume) => volume.id));
+    }
+  };
+
+  const handleCloseSearch = () => {
+    setSearching(false);
+    setQuery('');
+  };
+
+  const handleToggleLayout = () => {
+    Haptics.selectionAsync();
+    setLayout((current) => toggleLayoutValue(current));
+  };
+
+  const handleSelectSeries = (item: Series) => {
+    Haptics.selectionAsync();
+    setActiveSeriesUri(seriesKey(item));
+    setQuery('');
+    exitSelection();
+  };
+
+  const handleLongPressSeries = (item: Series) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setMenuSeries(item);
+  };
+
+  const handleSelectVolumeForMenu = (volume: Volume) => {
+    setSelecting(true);
+    setSelection([volume.id]);
+  };
 
   return (
     <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
       <AppBar colors={colors} isDark={isDark} topPad={insets.top + 8}>
-        {selecting ? (
-          <View style={s.barRow}>
-            <IconButton icon="close" onPress={exitSelection} tint={colors.onSurface} label="Leave selection mode" />
-            <Text style={[s.barTitle, { color: colors.onSurface }]}>
-              {selection.length ? `${selection.length} selected` : 'Select volumes'}
-            </Text>
-            <IconButton
-              icon="check"
-              onPress={() => {
-                Haptics.selectionAsync();
-                setSelection(selection.length === filtered.length ? [] : filtered.map((volume) => volume.id));
-              }}
-              tint={colors.primary}
-              label="Select all"
-            />
-            <IconButton
-              icon="trash"
-              onPress={() => void removeVolumes(selectedVolumes)}
-              tint={selection.length ? colors.error : colors.tertiaryLabel}
-              label="Remove selected"
-            />
-          </View>
-        ) : searching ? (
-          <View style={s.barRow}>
-            <IconButton
-              icon="chevronLeft"
-              onPress={() => { setSearching(false); setQuery(''); }}
-              tint={colors.onSurface}
-              label="Close search"
-            />
-            <TextInput
-              value={query}
-              onChangeText={setQuery}
-              autoFocus
-              placeholder={series ? `Search ${series.name}` : 'Search'}
-              placeholderTextColor={colors.tertiaryLabel}
-              style={[s.searchInput, { color: colors.onSurface }]}
-              returnKeyType="search"
-              autoCorrect={false}
-              autoCapitalize="none"
-            />
-            {query.length ? <IconButton icon="close" onPress={() => setQuery('')} tint={colors.secondaryLabel} label="Clear search" /> : null}
-          </View>
-        ) : (
-          <View style={s.barRow}>
-            <View style={{ flex: 1, minWidth: 0 }}>
-              <Text numberOfLines={1} style={[s.title, { color: colors.onSurface }]}>{headerTitle}</Text>
-              <Text numberOfLines={1} style={[s.subtitle, { color: colors.secondaryLabel }]}>{headerSub}</Text>
-            </View>
-            <IconButton icon="search" onPress={() => setSearching(true)} tint={colors.onSurface} label="Search library" />
-            <IconButton
-              icon={layout === 'grid' ? 'list' : 'grid'}
-              onPress={() => { Haptics.selectionAsync(); setLayout((current) => (current === 'grid' ? 'list' : 'grid')); }}
-              tint={colors.onSurface}
-              label={layout === 'grid' ? 'Switch to list' : 'Switch to grid'}
-            />
-            <IconButton icon="more" onPress={() => setOverflowOpen(true)} tint={colors.onSurface} label="Library options" />
-          </View>
-        )}
+        <LibraryAppBarContent
+          selecting={selecting}
+          searching={searching}
+          colors={colors}
+          selection={selection}
+          filtered={filtered}
+          selectedVolumes={selectedVolumes}
+          query={query}
+          seriesName={series?.name}
+          headerTitle={headerTitle}
+          headerSub={headerSub}
+          layout={layout}
+          onExitSelection={exitSelection}
+          onToggleSelectAll={handleToggleSelectAll}
+          onRemoveVolumes={(volumes) => void removeVolumes(volumes)}
+          onCloseSearch={handleCloseSearch}
+          onQuery={setQuery}
+          onClearQuery={() => setQuery('')}
+          onSearch={() => setSearching(true)}
+          onToggleLayout={handleToggleLayout}
+          onOverflow={() => setOverflowOpen(true)}
+        />
       </AppBar>
 
-      {loading ? <ScanBar colors={colors} /> : null}
-      {loading && scanProgress ? (
-        <View style={s.scanRow}>
-          <ActivityIndicator size="small" color={colors.secondaryLabel} />
-          <Text numberOfLines={1} style={[s.scanText, { color: colors.secondaryLabel }]}>{scanProgress}</Text>
-        </View>
-      ) : null}
+      <LibraryScanStatus loading={loading} scanProgress={scanProgress} colors={colors} />
 
-      {!series ? (
-        <SkeletonGrid colors={colors} />
-      ) : (
-        <FlatList
-          data={filtered}
-          key={String(layout)}
-          keyExtractor={(volume) => volume.id}
-          renderItem={renderVolume}
-          numColumns={layout === 'grid' ? 2 : 1}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-          // Fewer simultaneous mounts + longer batch window = no dropped frames
-          // on mid-range Android. removeClippedSubviews recycles off-screen
-          // cells (Android-only; it can blank on iOS).
-          removeClippedSubviews={Platform.OS === 'android'}
-          maxToRenderPerBatch={8}
-          updateCellsBatchingPeriod={80}
-          windowSize={7}
-          initialNumToRender={10}
-          contentContainerStyle={{ padding: 16, paddingBottom: 110, gap: layout === 'grid' ? 20 : 8 }}
-          columnWrapperStyle={layout === 'grid' ? { gap: 16 } : undefined}
-          ListHeaderComponent={
-            <View>
-              {library.length > 1 ? (
-                <View style={{ marginBottom: 18 }}>
-                  <Text style={[s.sectionTitle, { color: colors.onSurface }]}>Shelves</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.shelfRail}>
-                    {library.map((item) => {
-                      const active = seriesKey(item) === seriesKey(series);
-                      const cover = item.volumes.find((volume) => volume.coverUri)?.coverUri;
-                      return (
-                        <Pressable
-                          key={seriesKey(item)}
-                          onPress={() => { Haptics.selectionAsync(); setActiveSeriesUri(seriesKey(item)); setQuery(''); exitSelection(); }}
-                          onLongPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); setMenuSeries(item); }}
-                          delayLongPress={260}
-                          accessibilityRole="tab"
-                          accessibilityState={{ selected: active }}
-                          style={({ pressed }) => [
-                            s.shelfChip,
-                            {
-                              backgroundColor: active ? colors.primaryContainer : colors.secondaryGroupedBackground,
-                              borderColor: active ? colors.primary : colors.separator,
-                              opacity: pressed ? 0.85 : 1,
-                            },
-                          ]}
-                        >
-                          <View style={[s.shelfCover, { backgroundColor: colors.tertiarySystemFill }]}>
-                            {cover ? (
-                              <Image source={{ uri: cover }} style={StyleSheet.absoluteFill as any} contentFit="cover" cachePolicy="memory-disk" transition={0} />
-                            ) : (
-                              <Icon name="book" size={14} color={colors.secondaryLabel} strokeWidth={1.7} />
-                            )}
-                          </View>
-                          <View style={{ minWidth: 0, flexShrink: 1 }}>
-                            <Text numberOfLines={1} style={[s.shelfName, { color: active ? colors.primary : colors.onSurface }]}>{item.name}</Text>
-                            <Text style={[s.shelfMeta, { color: colors.secondaryLabel }]}>{item.volumes.length} volumes</Text>
-                          </View>
-                        </Pressable>
-                      );
-                    })}
-                  </ScrollView>
-                </View>
-              ) : null}
+      <LibraryMainContent
+        series={series}
+        filtered={filtered}
+        layout={layout}
+        colors={colors}
+        isDark={isDark}
+        library={library}
+        continueReading={continueReading}
+        query={query}
+        selecting={selecting}
+        filter={filter}
+        openVolume={openVolume}
+        renderVolume={renderVolume}
+        onSelectSeries={handleSelectSeries}
+        onMenuSeries={handleLongPressSeries}
+        onMenuVolume={setMenuVolume}
+        onFilter={(next) => {
+          Haptics.selectionAsync();
+          setFilter(next);
+        }}
+      />
 
-              {continueReading.length > 0 && !query && !selecting ? (
-                <View style={{ marginBottom: 18 }}>
-                  <Text style={[s.sectionTitle, { color: colors.onSurface }]}>Continue reading</Text>
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 14, paddingRight: 16 }} snapToInterval={134} decelerationRate="fast">
-                    {continueReading.map((volume) => (
-                      <Pressable
-                        key={volume.id}
-                        onPress={() => openVolume(volume)}
-                        onLongPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); setMenuVolume(volume); }}
-                        delayLongPress={260}
-                        style={({ pressed }) => [{ width: 120, opacity: pressed ? 0.86 : 1 }]}
-                      >
-                        <View style={[s.continueCover, { backgroundColor: colors.surfaceContainer, borderColor: colors.separator }]}>
-                          <CoverArt volume={volume} isDark={isDark} radius={11} />
-                          <View style={s.coverProgress}>
-                            <View style={{ height: 3, backgroundColor: colors.primary, width: `${Math.max(3, Math.round((volume.progress ?? 0) * 100))}%` }} />
-                          </View>
-                        </View>
-                        <Text numberOfLines={1} style={[s.cardTitle, { color: colors.onSurface }]}>{volume.title}</Text>
-                        <Text numberOfLines={1} style={[s.cardSub, { color: colors.secondaryLabel }]}>{Math.round((volume.progress ?? 0) * 100)}% read</Text>
-                      </Pressable>
-                    ))}
-                  </ScrollView>
-                </View>
-              ) : null}
+      <LibraryFab selecting={selecting} searching={searching} colors={colors} snackVisible={!!snack} onPick={pickFolder} />
 
-              {series.volumes.length > 2 ? (
-                <View style={s.filterRow}>
-                  <View style={[s.segmented, { backgroundColor: colors.secondarySystemFill }]}>
-                    {(['all', 'reading', 'unread'] as Filter[]).map((option) => {
-                      const active = filter === option;
-                      return (
-                        <Pressable
-                          key={option}
-                          onPress={() => { Haptics.selectionAsync(); setFilter(option); }}
-                          style={[s.segItem, active && { backgroundColor: colors.secondaryGroupedBackground }]}
-                          accessibilityRole="button"
-                          accessibilityState={{ selected: active }}
-                        >
-                          <Text style={[s.segText, { color: active ? colors.onSurface : colors.secondaryLabel }]}>
-                            {option === 'all' ? 'All' : option === 'reading' ? 'Reading' : 'Unread'}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                  <Text style={[s.countText, { color: colors.tertiaryLabel }]}>{filtered.length}</Text>
-                </View>
-              ) : null}
-            </View>
-          }
-          ListEmptyComponent={
-            <View style={s.listEmpty}>
-              <Icon name="search" size={26} color={colors.tertiaryLabel} strokeWidth={1.7} />
-              <Text style={[s.listEmptyText, { color: colors.secondaryLabel }]}>
-                {query.trim()
-                  ? `No volumes match “${query.trim()}”`
-                  : filter === 'reading'
-                    ? 'Nothing in progress yet'
-                    : filter === 'unread'
-                      ? 'Every volume has been started'
-                      : 'No volumes here'}
-              </Text>
-            </View>
-          }
-        />
-      )}
+      <LibrarySnack snack={snack} colors={colors} />
 
-      {!selecting && !searching ? (
-        <Pressable
-          onPress={pickFolder}
-          accessibilityRole="button"
-          accessibilityLabel="Add folder"
-          android_ripple={{ color: 'rgba(255,255,255,0.24)' }}
-          style={({ pressed }) => [
-            s.fab,
-            { backgroundColor: colors.primary, bottom: snack ? 84 : 20, transform: [{ scale: pressed ? 0.94 : 1 }] },
-          ]}
-        >
-          <Icon name="plus" size={24} color="#FFFFFF" strokeWidth={2.4} />
+      <LibraryDialogs
+        menuVolume={menuVolume}
+        menuSeries={menuSeries}
+        overflowOpen={overflowOpen}
+        series={series}
+        sort={sort}
+        colors={colors}
+        bottomInset={insets.bottom}
+        overflowActions={overflowActions}
+        onCloseMenuVolume={() => setMenuVolume(null)}
+        onCloseMenuSeries={() => setMenuSeries(null)}
+        onCloseOverflow={() => setOverflowOpen(false)}
+        openVolume={openVolume}
+        onSelectVolumeForMenu={handleSelectVolumeForMenu}
+        onRemoveVolumes={(volumes) => void removeVolumes(volumes)}
+        onShowShelf={(target) => {
+          setActiveSeriesUri(seriesKey(target));
+          setQuery('');
+        }}
+        onRemoveSeries={(target) => removeSeries(target)}
+      />
+    </View>
+  );
+}
+
+function LibraryDialogs({ menuVolume, menuSeries, overflowOpen, series, sort, colors, bottomInset, overflowActions, onCloseMenuVolume, onCloseMenuSeries, onCloseOverflow, openVolume, onSelectVolumeForMenu, onRemoveVolumes, onShowShelf, onRemoveSeries }: {
+  readonly menuVolume: Volume | null;
+  readonly menuSeries: Series | null;
+  readonly overflowOpen: boolean;
+  readonly series: Series | null;
+  readonly sort: Sort;
+  readonly colors: any;
+  readonly bottomInset: number;
+  readonly overflowActions: SheetAction[];
+  readonly onCloseMenuVolume: () => void;
+  readonly onCloseMenuSeries: () => void;
+  readonly onCloseOverflow: () => void;
+  readonly openVolume: (v: Volume) => void;
+  readonly onSelectVolumeForMenu: (v: Volume) => void;
+  readonly onRemoveVolumes: (v: Volume[]) => void;
+  readonly onShowShelf: (s: Series) => void;
+  readonly onRemoveSeries: (s: Series) => void;
+}): React.ReactElement {
+  return (
+    <>
+      <VolumeDialog menuVolume={menuVolume} colors={colors} bottomInset={bottomInset} onClose={onCloseMenuVolume} openVolume={openVolume} onSelectVolume={onSelectVolumeForMenu} onRemoveVolumes={onRemoveVolumes} />
+      <SeriesDialog menuSeries={menuSeries} colors={colors} bottomInset={bottomInset} onClose={onCloseMenuSeries} onShowShelf={onShowShelf} onRemoveSeries={onRemoveSeries} />
+      <OverflowDialog overflowOpen={overflowOpen} series={series} sort={sort} colors={colors} bottomInset={bottomInset} onClose={onCloseOverflow} overflowActions={overflowActions} />
+    </>
+  );
+}
+
+function VolumeDialog({ menuVolume, colors, bottomInset, onClose, openVolume, onSelectVolume, onRemoveVolumes }: {
+  readonly menuVolume: Volume | null;
+  readonly colors: any;
+  readonly bottomInset: number;
+  readonly onClose: () => void;
+  readonly openVolume: (v: Volume) => void;
+  readonly onSelectVolume: (v: Volume) => void;
+  readonly onRemoveVolumes: (v: Volume[]) => void;
+}): React.ReactElement | null {
+  if (!menuVolume) {
+    return null;
+  }
+  return (
+    <ActionSheet
+      title={menuVolume.title}
+      subtitle={menuVolume.pageCount ? `${menuVolume.pageCount} pages` : undefined}
+      colors={colors}
+      insetBottom={bottomInset}
+      onClose={onClose}
+      actions={menuVolumeActions(menuVolume, openVolume, onSelectVolume, (volumes) => { onRemoveVolumes(volumes); })}
+    />
+  );
+}
+
+function SeriesDialog({ menuSeries, colors, bottomInset, onClose, onShowShelf, onRemoveSeries }: {
+  readonly menuSeries: Series | null;
+  readonly colors: any;
+  readonly bottomInset: number;
+  readonly onClose: () => void;
+  readonly onShowShelf: (s: Series) => void;
+  readonly onRemoveSeries: (s: Series) => void;
+}): React.ReactElement | null {
+  if (!menuSeries) {
+    return null;
+  }
+  return (
+    <ActionSheet
+      title={menuSeries.name}
+      subtitle={`${menuSeries.volumes.length} volumes`}
+      colors={colors}
+      insetBottom={bottomInset}
+      onClose={onClose}
+      actions={[
+        { key: 'show', label: 'Show this shelf', icon: 'library', onPress: () => onShowShelf(menuSeries) },
+        { key: 'remove', label: 'Remove from library', icon: 'trash', destructive: true, dividerBefore: true, onPress: () => onRemoveSeries(menuSeries) },
+      ]}
+    />
+  );
+}
+
+function OverflowDialog({ overflowOpen, series, sort, colors, bottomInset, onClose, overflowActions }: {
+  readonly overflowOpen: boolean;
+  readonly series: Series | null;
+  readonly sort: Sort;
+  readonly colors: any;
+  readonly bottomInset: number;
+  readonly onClose: () => void;
+  readonly overflowActions: SheetAction[];
+}): React.ReactElement | null {
+  if (!overflowOpen || !series) {
+    return null;
+  }
+  return (
+    <ActionSheet
+      title={series.name}
+      subtitle={`${series.volumes.length} volumes · sorted by ${SORT_LABEL[sort]}`}
+      colors={colors}
+      insetBottom={bottomInset}
+      onClose={onClose}
+      actions={overflowActions}
+    />
+  );
+}
+
+function LibraryFab({ selecting, searching, colors, snackVisible, onPick }: {
+  readonly selecting: boolean;
+  readonly searching: boolean;
+  readonly colors: any;
+  readonly snackVisible: boolean;
+  readonly onPick: () => void;
+}) {
+  if (selecting || searching) {
+    return null;
+  }
+  return (
+    <Pressable
+      onPress={onPick}
+      accessibilityRole="button"
+      accessibilityLabel="Add folder"
+      android_ripple={{ color: 'rgba(255,255,255,0.24)' }}
+      style={({ pressed }) => [
+        s.fab,
+        { backgroundColor: colors.primary, bottom: snackVisible ? 84 : 20, transform: [{ scale: pressed ? 0.94 : 1 }] },
+      ]}
+    >
+      <Icon name="plus" size={24} color="#FFFFFF" strokeWidth={2.4} />
+    </Pressable>
+  );
+}
+
+function LibrarySnack({ snack, colors }: {
+  readonly snack: SnackState;
+  readonly colors: any;
+}) {
+  if (!snack) {
+    return null;
+  }
+  return (
+    <Animated.View
+      key={snack.id}
+      entering={SlideInDown.springify().damping(24).stiffness(240)}
+      style={[s.snack, { backgroundColor: colors.inverseSurface }]}
+    >
+      <Text numberOfLines={2} style={[s.snackText, { color: colors.inverseOnSurface }]}>{snack.text}</Text>
+      {snack.undo ? (
+        <Pressable onPress={() => { Haptics.selectionAsync(); snack.undo?.(); }} hitSlop={12}>
+          <Text style={[s.snackAction, { color: colors.primary }]}>Undo</Text>
         </Pressable>
       ) : null}
+    </Animated.View>
+  );
+}
 
-      {snack ? (
-        <Animated.View
-          key={snack.id}
-          entering={SlideInDown.springify().damping(24).stiffness(240)}
-          style={[s.snack, { backgroundColor: colors.inverseSurface }]}
-        >
-          <Text numberOfLines={2} style={[s.snackText, { color: colors.inverseOnSurface }]}>{snack.text}</Text>
-          {snack.undo ? (
-            <Pressable onPress={() => { Haptics.selectionAsync(); snack.undo?.(); }} hitSlop={12}>
-              <Text style={[s.snackAction, { color: colors.primary }]}>Undo</Text>
-            </Pressable>
-          ) : null}
-        </Animated.View>
-      ) : null}
+function LibraryScanStatus({ loading, scanProgress, colors }: {
+  readonly loading: boolean;
+  readonly scanProgress: string;
+  readonly colors: any;
+}): React.ReactElement | null {
+  if (!loading) {
+    return null;
+  }
+  if (!scanProgress) {
+    return <ScanBar colors={colors} />;
+  }
+  return (
+    <>
+      <ScanBar colors={colors} />
+      <View style={s.scanRow}>
+        <ActivityIndicator size="small" color={colors.secondaryLabel} />
+        <Text numberOfLines={1} style={[s.scanText, { color: colors.secondaryLabel }]}>{scanProgress}</Text>
+      </View>
+    </>
+  );
+}
 
-      {menuVolume ? (
-        <ActionSheet
-          title={menuVolume.title}
-          subtitle={menuVolume.pageCount ? `${menuVolume.pageCount} pages` : undefined}
-          colors={colors}
-          insetBottom={insets.bottom}
-          onClose={() => setMenuVolume(null)}
-          actions={[
-            { key: 'open', label: (menuVolume.progress ?? 0) > 0 ? 'Continue reading' : 'Open', icon: 'bookOpen', onPress: () => openVolume(menuVolume) },
-            { key: 'select', label: 'Select volumes', icon: 'check', onPress: () => { setSelecting(true); setSelection([menuVolume.id]); } },
-            { key: 'remove', label: 'Remove from library', icon: 'trash', destructive: true, dividerBefore: true, onPress: () => void removeVolumes([menuVolume]) },
-          ]}
-        />
-      ) : null}
+function numColumnsForLayout(layout: 'grid' | 'list'): number {
+  if (layout === 'grid') {
+    return 2;
+  }
+  return 1;
+}
 
-      {menuSeries ? (
-        <ActionSheet
-          title={menuSeries.name}
-          subtitle={`${menuSeries.volumes.length} volumes`}
-          colors={colors}
-          insetBottom={insets.bottom}
-          onClose={() => setMenuSeries(null)}
-          actions={[
-            { key: 'show', label: 'Show this shelf', icon: 'library', onPress: () => { setActiveSeriesUri(seriesKey(menuSeries)); setQuery(''); } },
-            { key: 'remove', label: 'Remove from library', icon: 'trash', destructive: true, dividerBefore: true, onPress: () => removeSeries(menuSeries) },
-          ]}
-        />
-      ) : null}
+function contentGapForLayout(layout: 'grid' | 'list'): number {
+  if (layout === 'grid') {
+    return 20;
+  }
+  return 8;
+}
 
-      {overflowOpen && series ? (
-        <ActionSheet
-          title={series.name}
-          subtitle={`${series.volumes.length} volumes · sorted by ${SORT_LABEL[sort]}`}
-          colors={colors}
-          insetBottom={insets.bottom}
-          onClose={() => setOverflowOpen(false)}
-          actions={overflowActions}
-        />
-      ) : null}
-    </View>
+function columnStyleForLayout(layout: 'grid' | 'list'): { gap: number } | undefined {
+  if (layout === 'grid') {
+    return { gap: 16 };
+  }
+  return undefined;
+}
+
+function LibraryMainContent({ series, filtered, layout, colors, isDark, library, continueReading, query, selecting, filter, openVolume, renderVolume, onSelectSeries, onMenuSeries, onMenuVolume, onFilter }: {
+  readonly series: Series | null;
+  readonly filtered: Volume[];
+  readonly layout: 'grid' | 'list';
+  readonly colors: any;
+  readonly isDark: boolean;
+  readonly library: Series[];
+  readonly continueReading: Volume[];
+  readonly query: string;
+  readonly selecting: boolean;
+  readonly filter: Filter;
+  readonly openVolume: (v: Volume) => void;
+  readonly renderVolume: ({ item }: { item: Volume }) => React.ReactElement;
+  readonly onSelectSeries: (item: Series) => void;
+  readonly onMenuSeries: (item: Series) => void;
+  readonly onMenuVolume: (v: Volume) => void;
+  readonly onFilter: (f: Filter) => void;
+}): React.ReactElement {
+  if (!series) {
+    return <SkeletonGrid colors={colors} />;
+  }
+  return (
+    <FlatList
+      data={filtered}
+      key={String(layout)}
+      keyExtractor={(volume) => volume.id}
+      renderItem={renderVolume}
+      numColumns={numColumnsForLayout(layout)}
+      keyboardShouldPersistTaps="handled"
+      showsVerticalScrollIndicator={false}
+      removeClippedSubviews={Platform.OS === 'android'}
+      maxToRenderPerBatch={8}
+      updateCellsBatchingPeriod={80}
+      windowSize={7}
+      initialNumToRender={10}
+      contentContainerStyle={{ padding: 16, paddingBottom: 110, gap: contentGapForLayout(layout) }}
+      columnWrapperStyle={columnStyleForLayout(layout)}
+      ListHeaderComponent={
+        <View>
+          <ShelvesSection library={library} series={series} colors={colors} onSelectSeries={onSelectSeries} onMenuSeries={onMenuSeries} />
+          <ContinueReadingSection volumes={continueReading} colors={colors} isDark={isDark} query={query} selecting={selecting} onOpen={openVolume} onMenu={onMenuVolume} />
+          <FilterSection volumeCount={series.volumes.length} filter={filter} colors={colors} filteredLength={filtered.length} onFilter={onFilter} />
+        </View>
+      }
+      ListEmptyComponent={<EmptyVolumesView query={query} filter={filter} colors={colors} />}
+    />
   );
 }
 
