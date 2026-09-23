@@ -99,3 +99,8 @@ test('a named theme ignores the system scheme', () => {
   assert.equal(resolvePopupPalette('sakura', true), POPUP_THEMES.sakura);
   assert.equal(resolvePopupPalette('sakura', false), POPUP_THEMES.sakura);
 });
+
+test('an unknown theme id falls back to the system scheme', () => {
+  assert.equal(resolvePopupPalette('nonsense' as any, false), POPUP_THEMES.light);
+  assert.equal(resolvePopupPalette(undefined, false), POPUP_THEMES.light);
+});

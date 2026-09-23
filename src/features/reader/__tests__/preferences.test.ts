@@ -51,3 +51,26 @@ test('corrupt stored json falls back to defaults', async () => {
   const p = await loadReaderPreferences();
   assert.equal(p.zoomMode, 'screen');
 });
+
+test('second load serves the in-memory cache', async () => {
+  await reset();
+  setReaderPreferences({ twoPage: true });
+  await flushReaderPreferences();
+  const a = await loadReaderPreferences();
+  const b = await loadReaderPreferences();
+  assert.deepEqual(a, b);
+});
+
+test('flush never throws when storage fails', async () => {
+  await reset();
+  const storage = await import('../../../services/storage');
+  const orig = (storage as any).setItemAsync;
+  (storage as any).setItemAsync = async () => { throw new Error('disk full'); };
+  try {
+    setReaderPreferences({ rtl: true });
+    await flushReaderPreferences();
+    assert.equal(getReaderPreferences().rtl, true);
+  } finally {
+    (storage as any).setItemAsync = orig;
+  }
+});

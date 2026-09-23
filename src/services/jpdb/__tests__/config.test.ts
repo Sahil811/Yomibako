@@ -83,6 +83,23 @@ test('save/load roundtrips and mirrors legacy keys', async () => {
   assert.equal(await getDeckId('miningDeckId'), 42);
 });
 
+test('save failures are swallowed after publishing', async () => {
+  await reset();
+  const base = await loadConfig();
+  const storage = await import('../../storage');
+  const origSet = (storage as any).setItemAsync;
+  const origDel = (storage as any).deleteItemAsync;
+  (storage as any).setItemAsync = async () => { throw new Error('disk full'); };
+  (storage as any).deleteItemAsync = async () => { throw new Error('disk full'); };
+  try {
+    await saveConfig({ ...base, apiToken: 'tok-fail' } as any);
+    assert.equal(getConfig().apiToken, 'tok-fail');
+  } finally {
+    (storage as any).setItemAsync = origSet;
+    (storage as any).deleteItemAsync = origDel;
+  }
+});
+
 test('getConfig/stageConfig expose snapshots', async () => {
   await reset();
   assert.equal(getConfig().schemaVersion, CURRENT_SCHEMA_VERSION);

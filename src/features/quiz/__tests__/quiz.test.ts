@@ -164,3 +164,13 @@ test('secureRandomIndex works without WebCrypto', () => {
     if (desc) Object.defineProperty(globalThis, 'crypto', desc);
   }
 });
+
+test('normalizeQuizWords drops meanings without usable glosses', () => {
+  assert.deepEqual(
+    normalizeQuizWords([{ vid: 1, sid: 2, spelling: '猫', meanings: [42, null, { foo: 1 }, { glosses: 'nope' }] } as any]),
+    []
+  );
+  const kept = normalizeQuizWords([{ vid: 1, sid: 2, spelling: '猫', meanings: [{ glosses: ['cat'] }] } as any]);
+  assert.equal(kept.length, 1);
+  assert.deepEqual(kept[0].meanings, ['cat']);
+});

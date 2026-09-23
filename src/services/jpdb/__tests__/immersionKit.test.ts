@@ -92,3 +92,71 @@ test('metadata failure still maps with slug titles', async () => {
     __resetImmersionForTests();
   }
 });
+
+test('word without particles and empty direct search returns []', async () => {
+  __resetImmersionForTests();
+  const origMeta = immersionKitApi.fetchMetadata;
+  const origSearch = immersionKitApi.search;
+  (immersionKitApi as any).fetchMetadata = async () => ({ data: {} });
+  (immersionKitApi as any).search = async () => ({ examples: [] });
+  try {
+    assert.deepEqual(await fetchImmersionExamples('hello'), []);
+  } finally {
+    (immersionKitApi as any).fetchMetadata = origMeta;
+    (immersionKitApi as any).search = origSearch;
+    __resetImmersionForTests();
+  }
+});
+
+test('particle word with no matches anywhere returns []', async () => {
+  __resetImmersionForTests();
+  const origMeta = immersionKitApi.fetchMetadata;
+  const origSearch = immersionKitApi.search;
+  (immersionKitApi as any).fetchMetadata = async () => ({ data: {} });
+  (immersionKitApi as any).search = async () => ({ examples: [] });
+  try {
+    assert.deepEqual(await fetchImmersionExamples('猫を'), []);
+  } finally {
+    (immersionKitApi as any).fetchMetadata = origMeta;
+    (immersionKitApi as any).search = origSearch;
+    __resetImmersionForTests();
+  }
+});
+
+test('repeat fetch hits the in-memory cache', async () => {
+  __resetImmersionForTests();
+  const origMeta = immersionKitApi.fetchMetadata;
+  const origSearch = immersionKitApi.search;
+  let searches = 0;
+  (immersionKitApi as any).fetchMetadata = async () => ({ data: {} });
+  (immersionKitApi as any).search = async () => {
+    searches++;
+    return { examples: [{ id: 'x_1', title: 't', sentence: 's', translation: '' }] };
+  };
+  try {
+    const first = await fetchImmersionExamples('cacheme');
+    const second = await fetchImmersionExamples('cacheme');
+    assert.deepEqual(second, first);
+    assert.equal(searches, 1);
+  } finally {
+    (immersionKitApi as any).fetchMetadata = origMeta;
+    (immersionKitApi as any).search = origSearch;
+    __resetImmersionForTests();
+  }
+});
+
+test('search failure rejects and clears the cache entry', async () => {
+  __resetImmersionForTests();
+  const origMeta = immersionKitApi.fetchMetadata;
+  const origSearch = immersionKitApi.search;
+  (immersionKitApi as any).fetchMetadata = async () => ({ data: {} });
+  (immersionKitApi as any).search = async () => { throw new Error('net down'); };
+  try {
+    await assert.rejects(() => fetchImmersionExamples('broken'), /net down/);
+    await assert.rejects(() => fetchImmersionExamples('broken'), /net down/);
+  } finally {
+    (immersionKitApi as any).fetchMetadata = origMeta;
+    (immersionKitApi as any).search = origSearch;
+    __resetImmersionForTests();
+  }
+});

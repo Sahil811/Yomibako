@@ -44,3 +44,19 @@ test('listDirectory maps files and dirs, swallows errors', async () => {
   assert.equal(file.isDirectory, false);
   assert.deepEqual(await listDirectory('file:///missing'), []);
 });
+
+test('listDirectory tolerates size failures', async () => {
+  __resetFS();
+  __putDir('file:///lib2');
+  __putFile('file:///lib2/a.html', '<html>');
+  const fs = (await import('expo-file-system')) as any;
+  const desc = Object.getOwnPropertyDescriptor(fs.File.prototype, 'size');
+  Object.defineProperty(fs.File.prototype, 'size', { get() { throw new Error('no size'); }, configurable: true });
+  try {
+    const entries = await listDirectory('file:///lib2');
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].size, undefined);
+  } finally {
+    if (desc) Object.defineProperty(fs.File.prototype, 'size', desc);
+  }
+});

@@ -5,12 +5,16 @@ import { kanjiApi } from '../api';
 
 test('isKanjiChar matches Han script except 。', () => {
   assert.equal(isKanjiChar('漢'), true);
-  assert.equal(isKanjiChar('字'), true);
+  assert.equal(isKanjiChar('猫'), true);
   assert.equal(isKanjiChar('あ'), false);
   assert.equal(isKanjiChar('ア'), false);
   assert.equal(isKanjiChar('a'), false);
   assert.equal(isKanjiChar('。'), false);
   assert.equal(isKanjiChar('、'), false);
+});
+
+test('isKanjiChar never throws on hostile input', () => {
+  assert.equal(isKanjiChar(Symbol('x') as any), false);
 });
 
 test('bundled kanji resolve offline without network', async () => {

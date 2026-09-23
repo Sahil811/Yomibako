@@ -68,6 +68,24 @@ test('parse maps vocabulary and tokens with furigana', async () => {
   }
 });
 
+test('parse maps string and ruby furigana parts', async () => {
+  __resetApiForTests();
+  const origSessionFetch = (session as any).sessionFetch;
+  (session as any).sessionFetch = async () => { throw new Error('no bridge'); };
+  const restore = mockFetch(async () => okJson({
+    vocabulary: [[1, 2, 3, '猫が', 'ねこが', 5, ['n'], [['cat']], [['n']], ['new'], ['LHH']]],
+    tokens: [[[0, 0, 2, ['x', ['猫', 'ねこ']]]]],
+  }));
+  try {
+    const out = await jpdbApi.parse({ text: ['猫が'], apiToken: 't' });
+    assert.equal(out.tokens[0][0].rubies.length, 1);
+    assert.equal(out.tokens[0][0].rubies[0].text, 'ねこ');
+  } finally {
+    restore();
+    (session as any).sessionFetch = origSessionFetch;
+  }
+});
+
 test('parse surfaces server error_message', async () => {
   __resetApiForTests();
   const restore = mockFetch(async () => errStatus(400, JSON.stringify({ error_message: 'bad req' })));

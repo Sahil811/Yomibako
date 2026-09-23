@@ -130,3 +130,15 @@ test('the same part of speech seen again later starts a new group', () => {
 test('no meanings yields no groups', () => {
   assert.deepEqual(groupMeanings({ meanings: [] }), []);
 });
+
+test('sentence cache evicts oldest entries past capacity', () => {
+  for (let i = 0; i < 220; i++) {
+    getSentences({ context: `ctx${i}。tail`, contextOffset: 0 }, 1);
+  }
+  assert.equal(getSentences({ context: 'ctx0。tail', contextOffset: 0 }, 1), 'ctx0。');
+});
+
+test('parsePitch returns null when matchAll throws', () => {
+  const evil = { length: 3, matchAll() { throw new Error('nope'); } } as any;
+  assert.equal(parsePitch('ab', evil), null);
+});

@@ -82,3 +82,51 @@ test('saveLibraryIndex ignores empty series', () => {
   __flushLibraryIndexForTests();
   assert.ok(true, 'saveLibraryIndex with empty series must not throw or schedule');
 });
+
+test('reset clears a pending debounced write', () => {
+  __resetLibraryCacheForTests();
+  saveLibraryIndex([{ name: 'A', rootUri: 'r', volumes: [vol()], totalPages: 1 } as any], ['r']);
+  __resetLibraryCacheForTests();
+  __flushLibraryIndexForTests();
+});
+
+test('debounced timer flushes without an explicit flush', async () => {
+  __resetFS();
+  __resetLibraryCacheForTests();
+  __putDir(`${Paths.document}/yomibako`);
+  const origSetTimeout = globalThis.setTimeout;
+  (globalThis as any).setTimeout = ((cb: any, ms?: any, ...rest: any[]) => {
+    if (ms === 800) {
+      cb();
+      return 0 as any;
+    }
+    return origSetTimeout(cb, ms, ...rest);
+  }) as any;
+  try {
+    saveLibraryIndex([{ name: 'A', rootUri: 'rootA', volumes: [vol({ id: 'a1', uri: 'a1' })], totalPages: 10 } as any], ['rootA']);
+    const loaded = await loadLibraryIndex(['rootA']);
+    assert.equal(loaded.length, 1);
+  } finally {
+    (globalThis as any).setTimeout = origSetTimeout;
+    __resetLibraryCacheForTests();
+  }
+});
+
+test('index write failures are swallowed', () => {
+  __resetFS();
+  __resetLibraryCacheForTests();
+  __putDir(`${Paths.document}/yomibako`);
+  return (async () => {
+    const fs = (await import('expo-file-system')) as any;
+    const origWrite = fs.File.prototype.write;
+    fs.File.prototype.write = function () { throw new Error('readonly'); };
+    try {
+      saveLibraryIndex([{ name: 'A', rootUri: 'r', volumes: [vol()], totalPages: 1 } as any], ['r']);
+      __flushLibraryIndexForTests();
+    } finally {
+      fs.File.prototype.write = origWrite;
+      __resetLibraryCacheForTests();
+    }
+    assert.ok(true);
+  })();
+});

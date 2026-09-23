@@ -59,3 +59,7 @@ test('indented heading and deep levels', () => {
   const [h] = parseBlocks('   ### deep') as any[];
   assert.equal(h.level, 3);
 });
+
+test('unclosed *** stays literal instead of crashing', () => {
+  assert.equal(parseInline('***abc').map((s) => s.text).join(''), '***abc');
+});

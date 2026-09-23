@@ -62,3 +62,30 @@ test('corrupt entries are treated as miss', async () => {
   });
   assert.equal(await getSavedPage('content://corrupt'), null);
 });
+
+test('reset clears a pending debounced write', async () => {
+  await reset();
+  savePage('content://pending', 3, 10);
+  __resetProgressForTests();
+  await flush();
+  assert.equal(await getSavedPage('content://pending'), null);
+});
+
+test('debounced timer flushes without an explicit flush()', async () => {
+  await reset();
+  const origSetTimeout = globalThis.setTimeout;
+  (globalThis as any).setTimeout = ((cb: any, ms?: any, ...rest: any[]) => {
+    if (ms === 1200) {
+      cb();
+      return 0 as any;
+    }
+    return origSetTimeout(cb, ms, ...rest);
+  }) as any;
+  try {
+    savePage('content://debounced', 9, 20);
+    assert.equal(await getSavedPage('content://debounced'), 9);
+  } finally {
+    (globalThis as any).setTimeout = origSetTimeout;
+    await reset();
+  }
+});

@@ -164,3 +164,23 @@ test('applyFetchedExamples reports empty and autoplays sound', () => {
   applyFetchedExamples([{ sentence: 't' } as any], true, setters, (e) => { seen.played = e; });
   assert.equal(seen.played, null);
 });
+
+test('safeGroupMeanings returns [] when grouping throws', () => {
+  assert.deepEqual(safeGroupMeanings([null]), []);
+});
+
+test('safeParsePitch returns null when the accessor throws', () => {
+  const evil: any[] = ['x'];
+  Object.defineProperty(evil, '0', { get() { throw new Error('nope'); }, configurable: true });
+  assert.equal(safeParsePitch('あ', evil), null);
+  assert.equal(safeParsePitch('あ', null as any), null);
+  assert.equal(safeParsePitch('あ', [] as any), null);
+});
+
+test('isAnyExamplePlaying covers every combination', () => {
+  assert.equal(isAnyExamplePlaying(false, false, false), false);
+  assert.equal(isAnyExamplePlaying(true, false, false), true);
+  assert.equal(isAnyExamplePlaying(false, true, false), true);
+  assert.equal(isAnyExamplePlaying(false, false, true), true);
+  assert.equal(isAnyExamplePlaying(true, true, true), true);
+});

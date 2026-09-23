@@ -68,3 +68,22 @@ test('corrupt stored json yields empty set', async () => {
   (SecureStore as any).__seedSecureStore({ yomibako_library_removed: 'bad' });
   assert.equal((await loadRemoved()).size, 0);
 });
+
+test('non-array stored json yields empty set', async () => {
+  await reset();
+  (SecureStore as any).__seedSecureStore({ yomibako_library_removed: JSON.stringify({ not: 'an array' }) });
+  assert.equal((await loadRemoved()).size, 0);
+});
+
+test('persist failures never reject', async () => {
+  await reset();
+  const storage = await import('../../../services/storage');
+  const orig = (storage as any).setItemAsync;
+  (storage as any).setItemAsync = async () => { throw new Error('disk full'); };
+  try {
+    const next = await markRemoved(['v1']);
+    assert.ok(next.size >= 1);
+  } finally {
+    (storage as any).setItemAsync = orig;
+  }
+});
