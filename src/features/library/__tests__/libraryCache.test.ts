@@ -83,11 +83,13 @@ test('saveLibraryIndex ignores empty series', () => {
   assert.ok(true, 'saveLibraryIndex with empty series must not throw or schedule');
 });
 
-test('reset clears a pending debounced write', () => {
+test('reset clears a pending debounced write', async () => {
+  __resetFS();
   __resetLibraryCacheForTests();
   saveLibraryIndex([{ name: 'A', rootUri: 'r', volumes: [vol()], totalPages: 1 } as any], ['r']);
   __resetLibraryCacheForTests();
   __flushLibraryIndexForTests();
+  assert.deepEqual(await loadLibraryIndex(['r']), []);
 });
 
 test('debounced timer flushes without an explicit flush', async () => {
