@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BlurView } from 'expo-blur';
@@ -238,6 +238,75 @@ function QuizOverlay({ words, onClose }: { readonly words: any[] | null; readonl
     return null;
   }
   return <QuizModal words={words} onClose={onClose} forceDark />;
+}
+
+// Direct page jump — the scrub bar can't land on an exact page like 80.
+// The footer count opens this; input is 1-based, clamped to 1..total.
+function PageJumpDialog({ visible, total, current, onClose, onGo }: {
+  readonly visible: boolean;
+  readonly total: number;
+  readonly current: number;
+  readonly onClose: () => void;
+  readonly onGo: (pageIndex: number) => void;
+}) {
+  const [text, setText] = useState('');
+  useEffect(() => {
+    if (visible) {
+      setText('');
+    }
+  }, [visible]);
+  if (!visible) {
+    return null;
+  }
+  const submit = () => {
+    const n = Number.parseInt(text.replace(/[^0-9]/g, ''), 10);
+    if (!Number.isFinite(n)) {
+      return;
+    }
+    onGo(Math.max(1, Math.min(total, n)) - 1);
+    onClose();
+  };
+  return (
+    <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
+      <View style={s.jumpOverlay}>
+        <Pressable style={StyleSheet.absoluteFill as any} onPress={onClose} accessibilityLabel="Dismiss go to page" />
+        <View style={s.jumpCard}>
+          <Text style={s.jumpTitle}>Go to page</Text>
+          <Text style={s.jumpSub}>1 – {total} · now on {current}</Text>
+          <TextInput
+            value={text}
+            onChangeText={setText}
+            placeholder={String(current)}
+            placeholderTextColor="rgba(255,255,255,0.35)"
+            keyboardType="number-pad"
+            returnKeyType="go"
+            autoFocus
+            onSubmitEditing={submit}
+            style={s.jumpInput}
+            accessibilityLabel="Page number"
+          />
+          <View style={s.jumpRow}>
+            <Pressable
+              onPress={onClose}
+              style={({ pressed }) => [s.jumpButton, s.jumpCancel, pressed && s.pressed]}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel"
+            >
+              <Text style={s.jumpCancelText}>Cancel</Text>
+            </Pressable>
+            <Pressable
+              onPress={submit}
+              style={({ pressed }) => [s.jumpButton, s.jumpGo, pressed && s.pressed]}
+              accessibilityRole="button"
+              accessibilityLabel="Go to page"
+            >
+              <Text style={s.jumpGoText}>Go</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
 }
 
 function triggerPageToast(
@@ -508,7 +577,15 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
     showChrome();
   }, [showChrome]);
 
-  // Options bar actions — every one keeps the chrome alive so the bar does not
+  // Exact page jump (dialog supplies a 0-based index, clamped here).
+  const jumpToPage = useCallback((pageIndex: number) => {
+    if (total <= 1) {
+      return;
+    }
+    readerRef.current?.goToPage(Math.max(0, Math.min(total - 1, Math.round(pageIndex))));
+    void Haptics.selectionAsync();
+    showChrome();
+  }, [total, showChrome]);  // Options bar actions — every one keeps the chrome alive so the bar does not
   // vanish mid-interaction.
   const act = useCallback((fn: () => void) => {
     void Haptics.selectionAsync();
@@ -568,6 +645,7 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
     onPage,
     onControl,
     step,
+    jumpToPage,
     act,
     toggleOptions,
     startQuiz,
@@ -602,6 +680,7 @@ export default function ReaderScreen() {
   const [zoomMode, setZoomMode] = useState<ZoomMode>(defaultReaderPreferences.zoomMode);
   const [controlError, setControlError] = useState<string | null>(null);
   const [quizWords, setQuizWords] = useState<any[] | null>(null);
+  const [jumpOpen, setJumpOpen] = useState(false);
 
   const interactionRef = useRef({ showPopupOnHover: true, playSoundOnHover: false });
   const wordRef = useRef<any>(null);
@@ -648,6 +727,7 @@ export default function ReaderScreen() {
     onPage,
     onControl,
     step,
+    jumpToPage,
     act,
     toggleOptions,
     startQuiz,
@@ -837,7 +917,16 @@ export default function ReaderScreen() {
           >
             <Icon name="chevronRight" size={18} color="rgba(255,255,255,0.92)" strokeWidth={2.3} />
           </Pressable>
-          <Text style={s.footerCount}>{pageLabel}</Text>
+          <Pressable
+            onPress={() => { void Haptics.selectionAsync(); setJumpOpen(true); }}
+            disabled={!canPage}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Go to page"
+            style={({ pressed }) => [pressed && s.pressed, !canPage && s.stepDisabled]}
+          >
+            <Text style={s.footerCount}>{pageLabel}</Text>
+          </Pressable>
         </BlurView>
       </Animated.View>
 
@@ -864,6 +953,14 @@ export default function ReaderScreen() {
       <WordOverlay word={word} onClose={dismissWord} onStateChange={(vid, sid, state) => readerRef.current?.setCardState(vid, sid, state)} />
 
       <QuizOverlay words={quizWords} onClose={() => setQuizWords(null)} />
+
+      <PageJumpDialog
+        visible={jumpOpen && canPage}
+        total={total}
+        current={Math.min(total, page.index + 1)}
+        onClose={() => setJumpOpen(false)}
+        onGo={jumpToPage}
+      />
     </View>
   );
 }
@@ -937,6 +1034,17 @@ const s = StyleSheet.create({
   footerCount: { minWidth: 48, textAlign: 'right', color: 'rgba(255,255,255,0.72)', fontFamily: 'System', fontSize: 11.5, lineHeight: 16, fontWeight: '600', fontVariant: ['tabular-nums'] as any },
   toast: { position: 'absolute', alignSelf: 'center', paddingHorizontal: 11, paddingVertical: 5, borderRadius: 13, backgroundColor: 'rgba(0,0,0,0.68)', zIndex: 9 },
   toastText: { color: 'rgba(255,255,255,0.92)', fontFamily: 'System', fontSize: 12, fontWeight: '600', fontVariant: ['tabular-nums'] as any },
+  jumpOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center', padding: 32 },
+  jumpCard: { width: '100%', maxWidth: 300, borderRadius: 18, padding: 18, gap: 4, backgroundColor: 'rgba(24,24,27,0.97)', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.13)' },
+  jumpTitle: { color: '#fff', fontFamily: 'System', fontSize: 17, lineHeight: 22, fontWeight: '700' },
+  jumpSub: { color: 'rgba(255,255,255,0.60)', fontFamily: 'System', fontSize: 13, lineHeight: 17, fontVariant: ['tabular-nums'] as any },
+  jumpInput: { marginTop: 10, height: 48, borderRadius: 12, paddingHorizontal: 14, backgroundColor: 'rgba(255,255,255,0.09)', color: '#fff', fontFamily: 'System', fontSize: 20, fontWeight: '600', fontVariant: ['tabular-nums'] as any },
+  jumpRow: { flexDirection: 'row', gap: 8, marginTop: 12 },
+  jumpButton: { flex: 1, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  jumpCancel: { backgroundColor: 'rgba(255,255,255,0.10)' },
+  jumpGo: { backgroundColor: '#0A84FF' },
+  jumpCancelText: { color: '#fff', fontFamily: 'System', fontSize: 15, fontWeight: '600' },
+  jumpGoText: { color: '#fff', fontFamily: 'System', fontSize: 15, fontWeight: '700' },
   fab: { position: 'absolute', zIndex: 11 },
   fabSurface: {
     width: 44,
