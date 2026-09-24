@@ -89,3 +89,12 @@ test('debounced timer flushes without an explicit flush()', async () => {
     await reset();
   }
 });
+
+test('immediate flush after rapid turns persists the latest page (blur contract)', async () => {
+  await reset();
+  savePage('content://blur', 41, 200);
+  savePage('content://blur', 42, 200);
+  // Blur/unmount flushes without waiting for the 1200ms debounce.
+  await flush();
+  assert.equal(await getSavedPage('content://blur'), 42);
+});

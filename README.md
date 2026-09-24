@@ -67,7 +67,7 @@ Library and tap a word. Tap Settings → JPDB Login and sign in for reviews.
 - **Decks** — mining / FORQ / blacklist / never-forget deck IDs.
   `"forq"`, `"blacklist"`, `"never-forget"` are JPDB magic IDs and work
   as-is; numeric IDs target your own decks.
-- Config migrates forward automatically (schema v4); Reset to Defaults
+- Config migrates forward automatically (schema v5); Reset to Defaults
   clears token + decks.
 
 ## Diagnostics

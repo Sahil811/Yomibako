@@ -72,6 +72,50 @@ export function buildFadeInject(disableFade: boolean): string {
 const SINGLE_PAYLOAD_LIMIT = 30000;
 const TOKEN_CHUNK = 20000;
 
+const WORD_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  'lookup',
+  'hover',
+  'anchor',
+  'anchorLost',
+  'textGuard',
+  'tap',
+  'viewReset',
+  'words',
+]);
+const STATUS_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  'applied',
+  'applyError',
+  'parseError',
+  'progress',
+  'page',
+  'control',
+  'layoutError',
+]);
+
+/** Every message type the reader bundle is allowed to send. */
+export function isKnownBridgeType(type: unknown): boolean {
+  return (
+    (typeof type === 'string' && WORD_MESSAGE_TYPES.has(type)) ||
+    (typeof type === 'string' && STATUS_MESSAGE_TYPES.has(type)) ||
+    type === 'bridgeReady' ||
+    type === 'parse' ||
+    type === 'fetchImage'
+  );
+}
+
+export function isWordMessageType(type: unknown): boolean {
+  return typeof type === 'string' && WORD_MESSAGE_TYPES.has(type);
+}
+
+export function isStatusMessageType(type: unknown): boolean {
+  return typeof type === 'string' && STATUS_MESSAGE_TYPES.has(type);
+}
+
+/** Lookup/hover payloads must carry numeric card ids — anything else is malformed or spoofed. */
+export function hasWordIds(msg: any): boolean {
+  return !!msg && typeof msg.vid === 'number' && typeof msg.sid === 'number';
+}
+
 /**
  * Token reply scripts. Giant payloads (100KB+ of JSON) die silently on
  * Android, so large ones are split into ~20KB slices; the bundles reassemble

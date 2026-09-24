@@ -249,7 +249,11 @@ function handleSessionErrorMessage(msg: any): void {
   if (!p) return;
   pending.delete(msg.id);
   clearTimeout(p.timer);
-  p.reject(new Error(String(msg.error ?? 'JPDB request failed')));
+  // Preserve the page's HTTP status when present so callers can fast-path
+  // cases like 404 (audio hash) instead of treating everything as opaque text.
+  const err = new Error(String(msg.error ?? 'JPDB request failed')) as Error & { status?: number };
+  if (typeof msg.status === 'number') err.status = msg.status;
+  p.reject(err);
 }
 
 /** Routed from JpdbSessionWebView.onMessage — do not call elsewhere. */

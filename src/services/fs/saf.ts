@@ -24,8 +24,17 @@ export async function saveRoot(uri: string) {
 }
 
 export async function getRoots(): Promise<string[]> {
-  const raw = await getItemAsync(SAF_ROOT_KEY);
-  return raw ? JSON.parse(raw) : [];
+  try {
+    const raw = await getItemAsync(SAF_ROOT_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    // A corrupt or hand-edited store must not throw into saveRoot/removeRoot
+    // callers — fall back to no roots and let the next save rewrite it.
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is string => typeof v === 'string');
+  } catch {
+    return [];
+  }
 }
 
 // Forget a granted root so restoring the library no longer rescans it.

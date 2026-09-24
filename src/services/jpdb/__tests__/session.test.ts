@@ -100,6 +100,25 @@ test('sessionError rejects the job', async () => {
   assert.ok(lastSessionJobError().length > 0);
 });
 
+test('sessionError carries HTTP status to the caller', async () => {
+  __resetSessionForTests();
+  let captured = '';
+  registerSessionExecutor((code) => { captured = code; });
+  markSessionReady();
+  const p = sessionFetch('https://jpdb.io/vocabulary/1/x');
+  // Do NOT await here — the job only settles after the messages below.
+  const errP = p.then(
+    (): Error & { status?: number } => { throw new Error('expected rejection'); },
+    (e) => e as Error & { status?: number },
+  );
+  await settled();
+  const id = JSON.parse(captured.match(/__yomibakoSessionDo\((.*)\); true;/)![1].split(',')[0].trim());
+  handleSessionMessage({ type: 'sessionError', id, status: 404, error: 'JPDB 404 for https://jpdb.io/vocabulary/1/x' });
+  const err = await errP;
+  assert.match(err.message, /JPDB 404/);
+  assert.equal(err.status, 404);
+});
+
 test('throwing wakers/listeners never break the bridge', () => {
   __resetSessionForTests();
   subscribeSessionWake(() => { throw new Error('wake boom'); });

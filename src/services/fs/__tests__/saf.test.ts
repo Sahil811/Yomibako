@@ -31,6 +31,21 @@ test('roots save/get/remove roundtrip with dedupe', async () => {
   assert.deepEqual(await getRoots(), ['root2']);
 });
 
+test('getRoots returns [] on corrupt or non-array JSON', async () => {
+  (SecureStore as any).__resetSecureStore();
+  (SecureStore as any).__seedSecureStore({ yomibako_saf_roots: '{bad' });
+  assert.deepEqual(await getRoots(), []);
+  (SecureStore as any).__seedSecureStore({ yomibako_saf_roots: JSON.stringify({ not: 'an array' }) });
+  assert.deepEqual(await getRoots(), []);
+  (SecureStore as any).__seedSecureStore({ yomibako_saf_roots: JSON.stringify(['ok', 42, null]) });
+  assert.deepEqual(await getRoots(), ['ok']);
+  // saveRoot still works after corruption (rewrites the key).
+  (SecureStore as any).__resetSecureStore();
+  await saveRoot('fresh');
+  assert.deepEqual(await getRoots(), ['fresh']);
+  (SecureStore as any).__resetSecureStore();
+});
+
 test('listDirectory maps files and dirs, swallows errors', async () => {
   __resetFS();
   __putDir('file:///lib');

@@ -7,6 +7,10 @@ import {
   buildCustomPopupInject,
   buildFadeInject,
   buildTokenScripts,
+  isKnownBridgeType,
+  isWordMessageType,
+  isStatusMessageType,
+  hasWordIds,
 } from '../webViewBridge';
 import * as SecureStore from 'expo-secure-store';
 
@@ -80,4 +84,32 @@ test('buildTokenScripts chunks large payloads losslessly', () => {
     parts[Number(m![1])] = JSON.parse(m![3]);
   }
   assert.deepEqual(JSON.parse(parts.join('')), tokens);
+});
+
+test('bridge type allowlists cover every RN-dispatched type', () => {
+  for (const t of ['lookup', 'hover', 'anchor', 'anchorLost', 'textGuard', 'tap', 'viewReset', 'words']) {
+    assert.equal(isWordMessageType(t), true);
+    assert.equal(isKnownBridgeType(t), true);
+  }
+  for (const t of ['applied', 'applyError', 'parseError', 'progress', 'page', 'control', 'layoutError']) {
+    assert.equal(isStatusMessageType(t), true);
+    assert.equal(isWordMessageType(t), false);
+    assert.equal(isKnownBridgeType(t), true);
+  }
+  for (const t of ['bridgeReady', 'parse', 'fetchImage']) {
+    assert.equal(isKnownBridgeType(t), true);
+  }
+  assert.equal(isKnownBridgeType('nope'), false);
+  assert.equal(isKnownBridgeType(null), false);
+  assert.equal(isKnownBridgeType(undefined), false);
+  assert.equal(isWordMessageType('page'), false);
+  assert.equal(isStatusMessageType('lookup'), false);
+});
+
+test('hasWordIds accepts only numeric card ids', () => {
+  assert.equal(hasWordIds({ vid: 1, sid: 2 }), true);
+  assert.equal(hasWordIds({ vid: '1', sid: 2 }), false);
+  assert.equal(hasWordIds({ vid: 1 }), false);
+  assert.equal(hasWordIds(null), false);
+  assert.equal(hasWordIds(undefined), false);
 });

@@ -1,4 +1,4 @@
-// Ported from D:\Downloads\jpd-breader_13.0\integrations\api.js and background\backend.js
+// Ported from jpd-breader 13.0 integrations/api.js and background/backend.js
 // RN adaptation: uses fetch directly, no browser.runtime. Implements full jpd-breader API minus Anki export.
 // Keeps rate-limit, retry-like handling, and FORQ scrape fallback.
 //
@@ -44,12 +44,23 @@ const TOKEN_FIELDS = ['vocabulary_index', 'position', 'length', 'furigana'] as c
 const API_RATELIMIT_MS = 200; // same as background/backend.js API_RATELIMIT 0.2s
 const SCRAPE_RATELIMIT_MS = 1100; // same as SCRAPE_RATELIMIT 1.1s
 
-let lastCall = 0;
-async function throttle(ms: number) {
+// API calls and page scrapes have different rate limits, so they keep
+// separate clocks — a scrape must not push back the next parse.
+let lastApiCall = 0;
+let lastScrapeCall = 0;
+async function throttleClock(clock: { at: number }, ms: number) {
   const now = Date.now();
-  const wait = lastCall + ms - now;
+  const wait = clock.at + ms - now;
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  lastCall = Date.now();
+  clock.at = Date.now();
+}
+const apiClock = { at: 0 };
+const scrapeClock = { at: 0 };
+async function throttleApi() {
+  await throttleClock(apiClock, API_RATELIMIT_MS);
+}
+async function throttleScrape() {
+  await throttleClock(scrapeClock, SCRAPE_RATELIMIT_MS);
 }
 
 function jpdbHeaders(apiToken: string) {
@@ -77,7 +88,8 @@ export function isRetryableStatus(s: number) {
 
 /** Test-only: reset the rate-limit clock so tests don't wait 200ms/1100ms. */
 export function __resetApiForTests() {
-  lastCall = 0;
+  apiClock.at = 0;
+  scrapeClock.at = 0;
 }
 
 export const LOGIN_HINT = 'Not logged in to JPDB — open Settings → JPDB Login and sign in';
@@ -156,7 +168,7 @@ async function requestWithRetry(
 
 export const jpdbApi = {
   async parse({ text, apiToken }: { text: string[]; apiToken: string }): Promise<{ tokens: ParseToken[][]; cards: any[] }> {
-    await throttle(API_RATELIMIT_MS);
+    await throttleApi();
     const res = await requestWithRetry(
       'https://jpdb.io/api/v1/parse',
       {
@@ -230,7 +242,7 @@ export const jpdbApi = {
     apiToken: string;
   }) {
     if (String(deckId) === 'forq') return jpdbApi.prioritize({ vid: vocabulary[0][0], sid: vocabulary[0][1] });
-    await throttle(API_RATELIMIT_MS);
+    await throttleApi();
     const res = await requestWithRetry(
       'https://jpdb.io/api/v1/deck/add-vocabulary',
       {
@@ -261,7 +273,7 @@ export const jpdbApi = {
     apiToken: string;
   }) {
     if (String(deckId) === 'forq') return jpdbApi.deprioritize({ vid: vocabulary[0][0], sid: vocabulary[0][1] });
-    await throttle(API_RATELIMIT_MS);
+    await throttleApi();
     const res = await requestWithRetry(
       'https://jpdb.io/api/v1/deck/remove-vocabulary',
       {
@@ -276,7 +288,7 @@ export const jpdbApi = {
   },
 
   async lookupVocabulary({ list, apiToken }: { list: [number, number][]; apiToken: string }) {
-    await throttle(API_RATELIMIT_MS);
+    await throttleApi();
     const res = await requestWithRetry(
       'https://jpdb.io/api/v1/lookup-vocabulary',
       {
@@ -303,7 +315,7 @@ export const jpdbApi = {
     translation?: string;
     apiToken: string;
   }) {
-    await throttle(API_RATELIMIT_MS);
+    await throttleApi();
     const body: any = { vid, sid };
     if (sentence) body.sentence = sentence;
     if (translation) body.translation = translation;
@@ -328,7 +340,7 @@ export const jpdbApi = {
   },
 
   async fetchVocabularyPage({ vid, spelling }: { vid: number; spelling: string }) {
-    await throttle(SCRAPE_RATELIMIT_MS);
+    await throttleScrape();
     const url = `https://jpdb.io/vocabulary/${vid}/${encodeURIComponent(spelling)}`;
     const viaSession = await sessionText(url);
     if (viaSession !== null) return viaSession;
@@ -342,7 +354,7 @@ export const jpdbApi = {
   },
 
   async fetchAudioBytes({ hash }: { hash: string }) {
-    await throttle(SCRAPE_RATELIMIT_MS);
+    await throttleScrape();
     const res = await requestWithRetry(
       `https://jpdb.io/static/v/${hash}`,
       { method: 'GET', headers: { 'X-Access': "please don't steal these files" } as any },
@@ -390,7 +402,7 @@ export const jpdbApi = {
   },
 
   async fetchReviewPage({ vid, sid }: { vid: number; sid: number }) {
-    await throttle(SCRAPE_RATELIMIT_MS);
+    await throttleScrape();
     const url = `https://jpdb.io/review?c=vf%2C${vid}%2C${sid}`;
     const viaSession = await sessionText(url);
     if (viaSession !== null) {
@@ -409,7 +421,7 @@ export const jpdbApi = {
   },
 
   async submitReview({ vid, sid, reviewNo, grade }: { vid: number; sid: number; reviewNo: number; grade: string }) {
-    await throttle(SCRAPE_RATELIMIT_MS);
+    await throttleScrape();
     const body = `c=vf%2C${vid}%2C${sid}&r=${reviewNo}&g=${grade}`;
     const viaSession = await sessionText('https://jpdb.io/review', {
       method: 'POST',
@@ -462,7 +474,7 @@ export const jpdbApi = {
   },
 
   async prioritize({ vid, sid }: { vid: number; sid: number }) {
-    await throttle(SCRAPE_RATELIMIT_MS);
+    await throttleScrape();
     const body = `v=${vid}&s=${sid}&origin=/`;
     const viaSession = await sessionText('https://jpdb.io/prioritize', {
       method: 'POST',
@@ -492,7 +504,7 @@ export const jpdbApi = {
   },
 
   async deprioritize({ vid, sid }: { vid: number; sid: number }) {
-    await throttle(SCRAPE_RATELIMIT_MS);
+    await throttleScrape();
     const body = `v=${vid}&s=${sid}&origin=`;
     const viaSession = await sessionText('https://jpdb.io/deprioritize', {
       method: 'POST',

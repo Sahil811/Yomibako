@@ -1,4 +1,4 @@
-// SecureStore backed config for jpdb — mirrors D:\Downloads\jpd-breader_13.0\background\config.js
+// SecureStore backed config for jpdb — mirrors jpd-breader 13.0 background/config.js
 // Full parity minus Anki (no anki export). Supports all 25 keys of jpd-breader 13.0.
 // Web-safe via services/storage (localStorage fallback).
 import { getItemAsync, setItemAsync, deleteItemAsync } from '../storage';
@@ -208,8 +208,11 @@ export async function loadConfig(forceReload = false): Promise<YomibakoConfig> {
     cfg.popupScale = clamp(Number(cfg.popupScale) || 100, 50, 200);
     cfg.contextWidth = clamp(Number(cfg.contextWidth) || 1, 0, 10);
     cfg.popupTheme = validPopupTheme(cfg.popupTheme);
-    if (cfg.schemaVersion !== CURRENT_SCHEMA_VERSION) {
-      // fallback to default but preserve token/deck ids if present
+    if ((cfg.schemaVersion ?? 0) < CURRENT_SCHEMA_VERSION) {
+      // Older than this build and migrateSchema could not bring it forward:
+      // fall back to defaults but preserve token/deck ids if present.
+      // A NEWER schema (written by a newer build) is kept as-is — resetting
+      // it would silently wipe prefs the user set elsewhere.
       const fallback = { ...defaultConfig } as YomibakoConfig;
       fallback.apiToken = cfg.apiToken;
       fallback.miningDeckId = cfg.miningDeckId;

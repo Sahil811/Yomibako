@@ -683,7 +683,9 @@ export default function ReaderScreen() {
     playWordAudio,
   });
 
-  useEffect(() => navigation.addListener('blur', dismissWord), [dismissWord, navigation]);
+  // A page turn only lives in memory until the 1200ms debounce fires — flush
+  // on blur too, so navigating away fast never loses the last position.
+  useEffect(() => navigation.addListener('blur', () => { dismissWord(); void flushProgress(); }), [dismissWord, navigation]);
   useEffect(() => () => {
     clearHideTimer();
     clearToastTimer(toastTimer);

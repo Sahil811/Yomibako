@@ -30,7 +30,7 @@ const SESSION_BRIDGE_JS = `
       }
       const res = await fetch(url, init);
       const text = await res.text();
-      if (!res.ok) { post({type:'sessionError', id, error:'JPDB ' + res.status + ' for ' + url}); return; }
+      if (!res.ok) { post({type:'sessionError', id, status: res.status, error:'JPDB ' + res.status + ' for ' + url}); return; }
       const total = Math.ceil(text.length / ${CHUNK});
       post({type:'sessionMeta', id, chunks: total});
       for (let i = 0; i < total; i++) {

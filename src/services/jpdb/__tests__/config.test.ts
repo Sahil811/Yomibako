@@ -161,7 +161,7 @@ test('corrupt stored json falls back to defaults', async () => {
   assert.equal(c.schemaVersion, CURRENT_SCHEMA_VERSION);
 });
 
-test('future schema falls back but preserves token and decks', async () => {
+test('future schema preserves stored prefs instead of resetting', async () => {
   await reset();
   (SecureStore as any).__seedSecureStore({
     yomibako_config_json: JSON.stringify({
@@ -171,12 +171,16 @@ test('future schema falls back but preserves token and decks', async () => {
       forqDeckId: 'f',
       blacklistDeckId: 'b',
       neverForgetDeckId: 'n',
+      showRtk: false,
+      popupScale: 150,
     }),
   });
   const c = await loadConfig(true);
-  assert.equal(c.schemaVersion, CURRENT_SCHEMA_VERSION);
+  assert.equal(c.schemaVersion, 99);
   assert.equal(c.apiToken, 'keep');
   assert.equal(c.miningDeckId, 5);
+  assert.equal(c.showRtk, false);
+  assert.equal(c.popupScale, 150);
 });
 
 test('save failure is swallowed and unknown deck keys ignored', async () => {

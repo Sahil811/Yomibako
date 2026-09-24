@@ -13,6 +13,9 @@ import {
   buildCustomPopupInject,
   buildFadeInject,
   buildTokenScripts,
+  hasWordIds,
+  isStatusMessageType,
+  isWordMessageType,
   readBridgeCustomization,
 } from '../shared/webViewBridge';
 // Direct stream uses image bridge, no prepareVolume copy needed for content://
@@ -89,26 +92,6 @@ function mimeForExtension(ext: string): string {
   }
   return 'image/jpeg';
 }
-
-const WORD_MESSAGE_TYPES: ReadonlySet<string> = new Set([
-  'lookup',
-  'hover',
-  'anchor',
-  'anchorLost',
-  'textGuard',
-  'tap',
-  'viewReset',
-  'words',
-]);
-const STATUS_MESSAGE_TYPES: ReadonlySet<string> = new Set([
-  'applied',
-  'applyError',
-  'parseError',
-  'progress',
-  'page',
-  'control',
-  'layoutError',
-]);
 
 function isContentVolume(htmlUri: string | undefined, mokuroUri: string | undefined, volumeDir: string): boolean {
   if (htmlUri?.startsWith('content://') ?? false) {
@@ -514,12 +497,22 @@ function MokuroWebView(
 
   const handleWordMessages = useCallback((msg: any) => {
     if (msg.type === 'lookup') {
+      // The bundle always sends numeric ids; anything else is a malformed
+      // or spoofed message — drop it before it reaches authenticated API calls.
+      if (!hasWordIds(msg)) {
+        console.warn('[MokuroWebView] ignoring lookup without vid/sid');
+        return;
+      }
       diag.current.lookups++;
       saveDiag();
       onWordTap?.(msg);
       return;
     }
     if (msg.type === 'hover') {
+      if (!hasWordIds(msg)) {
+        console.warn('[MokuroWebView] ignoring hover without vid/sid');
+        return;
+      }
       onWordHover?.(msg);
       return;
     }
@@ -671,16 +664,17 @@ function MokuroWebView(
         await handleFetchImageMessage(msg);
         return;
       }
-      if (WORD_MESSAGE_TYPES.has(type)) {
+      if (isWordMessageType(type)) {
         handleWordMessages(msg);
         return;
       }
-      if (STATUS_MESSAGE_TYPES.has(type)) {
+      if (isStatusMessageType(type)) {
         handleStatusMessages(msg);
         return;
       }
-      handleWordMessages(msg);
-      handleStatusMessages(msg);
+      // Unknown types used to fall through into BOTH handlers. Reject loudly
+      // so a renamed bundle message surfaces instead of vanishing silently.
+      console.warn('[MokuroWebView] ignoring unknown message type', type);
     } catch (err) { console.warn(err); }
   }, [handleBridgeReady, handleParseMessage, handleWordMessages, handleStatusMessages, handleFetchImageMessage]);
 

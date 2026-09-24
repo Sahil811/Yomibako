@@ -1,5 +1,5 @@
 // Full Yomibako bundle - injects word.css + parse.js applyTokens + mokuro observer
-// Copy of D:\Projects\Yomibako\assets\jpd-breader\content\parse.js + jsx.js adapted for RN WebView (no imports)
+// Copy of assets/jpd-breader/content/parse.js + jsx.js adapted for RN WebView (no imports)
 // Surpasses Google/Apple: calm color-only states, furigana <rt>, tap→RN bridge
 //
 // Chunked pipeline (mirrors browserBundle.ts): each page's textBoxes are split
@@ -549,6 +549,19 @@ export const YOMIBAKO_JS = `
   let seq=0;
   const pending=new Map();
   window.__yomibakoChunkBuf = window.__yomibakoChunkBuf || {};
+  // A slice lost in transit (giant injects die silently on Android) must not
+  // pin its siblings in the JS heap forever — the 15s pending-reject already
+  // retries the chunk, so sweep leftovers here on the next chunked reply.
+  var CHUNK_BUF_TTL = 60000;
+  function sweepChunkBuf(now){
+    try{
+      var buf=window.__yomibakoChunkBuf;
+      for(var k in buf){
+        if(!Object.prototype.hasOwnProperty.call(buf,k)) continue;
+        if(now-(buf[k].at||0) > CHUNK_BUF_TTL){ try{ delete buf[k]; }catch(_){} }
+      }
+    }catch(_){}
+  }
   window.__yomibakoOnTokens = function(id, tokensArray){
     const p=pending.get(id); if(p) { pending.delete(id); try{ p.resolve(tokensArray); }catch(e){ console.warn('[yomibako] resolve failed', e); } }
   };
@@ -557,8 +570,10 @@ export const YOMIBAKO_JS = `
   // injectJavaScript payloads die silently on Android). Reassemble then resolve.
   window.__yomibakoOnTokensChunk = function(id, idx, total, part){
     try{
+      sweepChunkBuf(Date.now());
       let b=window.__yomibakoChunkBuf[id];
-      if(!b){ b=window.__yomibakoChunkBuf[id]={parts:new Array(total), total:total}; }
+      if(!b){ b=window.__yomibakoChunkBuf[id]={parts:new Array(total), total:total, at:Date.now()}; }
+      b.at=Date.now();
       b.parts[idx]=part;
       let got=0; for(let i=0;i<b.total;i++){ if(b.parts[i]!==undefined) got++; }
       if(got>=b.total){

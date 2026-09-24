@@ -588,3 +588,25 @@ test('request retry recovers from 503 then succeeds', async () => {
     restore();
   }
 });
+
+test('scrape throttle does not delay API parse calls', async () => {
+  __resetApiForTests();
+  const restore = mockFetch(async (url) => {
+    if (url.includes('/static/v/')) {
+      return { ok: true, status: 200, arrayBuffer: async () => new ArrayBuffer(8) };
+    }
+    return okJson({
+      vocabulary: [[1, 2, 3, '猫', 'ねこ', 5, ['n'], [['cat']], [['n']], ['new'], ['LHH']]],
+      tokens: [[[0, 0, 1, null]]],
+    });
+  });
+  try {
+    await jpdbApi.fetchAudioBytes({ hash: 'm1/abc' });
+    const start = Date.now();
+    await jpdbApi.parse({ text: ['猫'], apiToken: 't' });
+    // Old shared clock would force ~1100ms here; separate clocks stay near 0.
+    assert.ok(Date.now() - start < 1000, 'parse waited on the scrape clock');
+  } finally {
+    restore();
+  }
+});
