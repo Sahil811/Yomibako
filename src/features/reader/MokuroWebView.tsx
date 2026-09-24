@@ -153,6 +153,11 @@ async function fetchVolumeHtml(
   return { content, baseUrl };
 }
 
+async function readCustomCss(): Promise<{ customWordCSS: string; customPopupCSS: string; disableFade: boolean }> {
+  const { customWordCSS, customPopupCSS, disableFade } = await readBridgeCustomization();
+  return { customWordCSS, customPopupCSS, disableFade };
+}
+
 function MokuroWebView(
   { htmlUri, mokuroUri, volumeDir, title, series, initialPage, initialPreferences, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onProgress, onPage, onControl, onWords, onOpenSettings, onTapBackground, onViewReset }: Props,
   ref: React.Ref<MokuroWebViewHandle>
@@ -420,11 +425,6 @@ function MokuroWebView(
     const popupRule = buildCustomPopupInject(customPopupCSS);
     const fadeRule = buildFadeInject(disableFade);
     return `(function(){ ${baseRule} ${wordRule} ${popupRule} ${fadeRule} true;})();`;
-  }
-
-  async function readCustomCss(): Promise<{ customWordCSS: string; customPopupCSS: string; disableFade: boolean }> {
-    const { customWordCSS, customPopupCSS, disableFade } = await readBridgeCustomization();
-    return { customWordCSS, customPopupCSS, disableFade };
   }
 
   const handleBridgeReady = useCallback(async (msg: any) => {
