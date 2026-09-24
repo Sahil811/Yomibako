@@ -11,6 +11,14 @@ import { getItemAsync } from '../../services/storage';
 import { jpdbApi } from '../../services/jpdb/api';
 import { loadConfig } from '../../services/jpdb/config';
 import { useWordAudio } from '../shared/useWordAudio';
+import {
+  buildCustomWordInject,
+  buildCustomPopupInject,
+  buildFadeInject,
+  buildTokenScripts,
+  readBridgeCustomization,
+  type BridgeCustomization,
+} from '../shared/webViewBridge';
 import { BROWSER_CSS, BROWSER_JS } from './browserBundle';
 import WordSheet from '../reader/WordSheet';
 import QuizModal from '../quiz/QuizModal';
@@ -135,27 +143,6 @@ function normalizeNavigateUrl(next: string): string | null {
   return 'https://' + trimmed;
 }
 
-function buildCustomWordInject(customWordCSS: string): string {
-  if (!customWordCSS) {
-    return '';
-  }
-  return `let cw=document.getElementById('yomibako-custom-word'); if(!cw){ cw=document.createElement('style'); cw.id='yomibako-custom-word'; cw.textContent=${JSON.stringify(customWordCSS)}; document.head.appendChild(cw); }`;
-}
-
-function buildCustomPopupInject(customPopupCSS: string): string {
-  if (!customPopupCSS) {
-    return '';
-  }
-  return `let cp=document.getElementById('yomibako-custom-popup'); if(!cp){ cp=document.createElement('style'); cp.id='yomibako-custom-popup'; cp.textContent=${JSON.stringify(customPopupCSS)}; document.head.appendChild(cp); }`;
-}
-
-function buildFadeInject(disableFade: boolean): string {
-  if (!disableFade) {
-    return '';
-  }
-  return `document.documentElement.style.setProperty('--jpdb-fade-duration','0s');`;
-}
-
 function buildBridgeCssInject(customWordCSS: string, customPopupCSS: string, disableFade: boolean): string {
   const wordInject = buildCustomWordInject(customWordCSS);
   const popupInject = buildCustomPopupInject(customPopupCSS);
@@ -168,27 +155,13 @@ function buildBridgeCssInject(customWordCSS: string, customPopupCSS: string, dis
           true;})();`;
 }
 
-type BridgeCustomization = { customWordCSS: string; customPopupCSS: string; disableFade: boolean };
-
 async function loadBridgeCustomization(interactionRef: React.RefObject<{ showPopupOnHover: boolean; playSoundOnHover: boolean }>): Promise<BridgeCustomization> {
-  const result: BridgeCustomization = { customWordCSS: '', customPopupCSS: '', disableFade: false };
-  const cfgRaw = await getItemAsync('yomibako_config_json');
-  if (!cfgRaw) {
-    return result;
-  }
-  try {
-    const cfg = JSON.parse(cfgRaw);
-    result.customWordCSS = cfg.customWordCSS || '';
-    result.customPopupCSS = cfg.customPopupCSS || '';
-    result.disableFade = !!cfg.disableFadeAnimation;
-    interactionRef.current = {
-      showPopupOnHover: cfg.showPopupOnHover !== false,
-      playSoundOnHover: !!cfg.playSoundOnHover,
-    };
-  } catch {
-    // Keep defaults.
-  }
-  return result;
+  const parsed = await readBridgeCustomization();
+  interactionRef.current = {
+    showPopupOnHover: parsed.showPopupOnHover,
+    playSoundOnHover: parsed.playSoundOnHover,
+  };
+  return parsed;
 }
 
 async function resolveParseApiToken(): Promise<string | null> {
@@ -289,18 +262,8 @@ async function handleParseMessage(msg: any, ctx: BrowserMessageContext): Promise
 // silently on Android. Split into ~20KB slices like MokuroWebView; the
 // browser bundle reassembles via __yomibakoOnTokensChunk.
 function injectBrowserTokens(webRef: React.RefObject<WebView | null>, id: string, tokens: unknown): void {
-  const payload = JSON.stringify(tokens);
-  if (payload.length <= 30000) {
-    webRef.current?.injectJavaScript(`window.__yomibakoOnTokens(${JSON.stringify(id)}, ${payload}); true;`);
-    return;
-  }
-  const CHUNK = 20000;
-  const total = Math.ceil(payload.length / CHUNK);
-  for (let i = 0; i < total; i++) {
-    const part = payload.slice(i * CHUNK, (i + 1) * CHUNK);
-    webRef.current?.injectJavaScript(
-      `window.__yomibakoOnTokensChunk(${JSON.stringify(id)}, ${i}, ${total}, ${JSON.stringify(part)}); true;`
-    );
+  for (const script of buildTokenScripts(id, tokens)) {
+    webRef.current?.injectJavaScript(script);
   }
 }
 

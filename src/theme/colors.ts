@@ -1,134 +1,80 @@
 // Yomibako — Apple-caliber Design System
 // Built on iOS Human Interface Guidelines: Semantic colors, vibrancy, blur, systematic elevation.
 // Inspired by Apple Books / Files / Safari — calm paper, not flat web gray.
-
-export const lightColors = {
+//
+// Both schemes share the same keys; each entry is a [light, dark] pair so the
+// two palettes cannot drift apart (or be duplicated) unnoticed.
+const COLOR_PAIRS = {
   // iOS semantic system
-  background: '#FFFFFF', // systemBackground
-  surface: '#FFFFFF', // systemBackground
-  surfaceContainer: '#F2F2F7', // secondarySystemBackground — cards, search
-  surfaceContainerHigh: '#EFEFF4', // tertiarySystemBackground
-  surfaceContainerHighest: '#E5E5EA', // systemGray5
-  surfaceDim: '#F2F2F7',
-  surfaceBright: '#FFFFFF',
-
+  background: ['#FFFFFF', '#000000'],
+  surface: ['#FFFFFF', '#1C1C1E'],
+  surfaceContainer: ['#F2F2F7', '#2C2C2E'],
+  surfaceContainerHigh: ['#EFEFF4', '#3A3A3C'],
+  surfaceContainerHighest: ['#E5E5EA', '#48484A'],
+  surfaceDim: ['#F2F2F7', '#000000'],
+  surfaceBright: ['#FFFFFF', '#2C2C2E'],
   // Tint — Apple systemBlue, precisely #007AFF
-  primary: '#007AFF',
-  onPrimary: '#FFFFFF',
-  primaryContainer: '#E5F0FF',
-  onPrimaryContainer: '#001D3D',
-
-  secondary: '#5856D6', // systemPurple secondary action hint
-  secondaryContainer: '#E9E9FF',
-  onSecondaryContainer: '#1C1C1E',
-
-  tertiary: '#FF3B30', // systemRed for destructive subtle
-  tertiaryContainer: '#FFE9E8',
-  onTertiaryContainer: '#410002',
-
+  primary: ['#007AFF', '#0A84FF'],
+  onPrimary: ['#FFFFFF', '#FFFFFF'],
+  primaryContainer: ['#E5F0FF', '#00376B'],
+  onPrimaryContainer: ['#001D3D', '#D1E4FF'],
+  secondary: ['#5856D6', '#5E5CE6'],
+  secondaryContainer: ['#E9E9FF', '#2C2C6C'],
+  onSecondaryContainer: ['#1C1C1E', '#E9E9FF'],
+  tertiary: ['#FF3B30', '#FF453A'],
+  tertiaryContainer: ['#FFE9E8', '#4A0D0A'],
+  onTertiaryContainer: ['#410002', '#FFDAD6'],
   // Neutrals — Apple label hierarchy
-  onSurface: '#000000', // label
-  onSurfaceVariant: '#3C3C43', // secondaryLabel 60% — rendered as #8E8E93 for opacity-safe
-  secondaryLabel: 'rgba(60,60,67,0.60)',
-  tertiaryLabel: 'rgba(60,60,67,0.30)',
-  quaternaryLabel: 'rgba(60,60,67,0.18)',
-
-  outline: 'rgba(60,60,67,0.29)', // separator  — #C6C6C8 @29%
-  outlineVariant: 'rgba(60,60,67,0.12)', // separator non-opaque lighter
-  separator: 'rgba(60,60,67,0.29)',
-  separatorOpaque: '#C6C6C8',
-  hairline: 'rgba(60,60,67,0.12)',
-
+  onSurface: ['#000000', '#FFFFFF'],
+  onSurfaceVariant: ['#3C3C43', '#EBEBF5'],
+  secondaryLabel: ['rgba(60,60,67,0.60)', 'rgba(235,235,245,0.60)'],
+  tertiaryLabel: ['rgba(60,60,67,0.30)', 'rgba(235,235,245,0.30)'],
+  quaternaryLabel: ['rgba(60,60,67,0.18)', 'rgba(235,235,245,0.18)'],
+  outline: ['rgba(60,60,67,0.29)', 'rgba(84,84,88,0.60)'],
+  outlineVariant: ['rgba(60,60,67,0.12)', 'rgba(84,84,88,0.30)'],
+  separator: ['rgba(60,60,67,0.29)', 'rgba(84,84,88,0.60)'],
+  separatorOpaque: ['#C6C6C8', '#38383A'],
+  hairline: ['rgba(60,60,67,0.12)', 'rgba(84,84,88,0.30)'],
   // System fills
-  systemFill: 'rgba(120,120,128,0.20)',
-  secondarySystemFill: 'rgba(120,120,128,0.16)',
-  tertiarySystemFill: 'rgba(120,120,128,0.12)',
-  quaternarySystemFill: 'rgba(120,120,128,0.08)',
-
+  systemFill: ['rgba(120,120,128,0.20)', 'rgba(120,120,128,0.36)'],
+  secondarySystemFill: ['rgba(120,120,128,0.16)', 'rgba(120,120,128,0.32)'],
+  tertiarySystemFill: ['rgba(120,120,128,0.12)', 'rgba(120,120,128,0.24)'],
+  quaternarySystemFill: ['rgba(120,120,128,0.08)', 'rgba(120,120,128,0.18)'],
   // Grouped
-  groupedBackground: '#F2F2F7',
-  secondaryGroupedBackground: '#FFFFFF',
-  tertiaryGroupedBackground: '#F2F2F7',
-
+  groupedBackground: ['#F2F2F7', '#000000'],
+  secondaryGroupedBackground: ['#FFFFFF', '#1C1C1E'],
+  tertiaryGroupedBackground: ['#F2F2F7', '#2C2C2E'],
   // Fixed
-  inverseSurface: '#1C1C1E',
-  inverseOnSurface: '#F2F2F7',
-  error: '#FF3B30',
-  errorContainer: '#FFDAD6',
-  onErrorContainer: '#410002',
-  success: '#34C759',
-  warning: '#FF9500',
-
+  inverseSurface: ['#1C1C1E', '#F2F2F7'],
+  inverseOnSurface: ['#F2F2F7', '#1C1C1E'],
+  error: ['#FF3B30', '#FF453A'],
+  errorContainer: ['#FFDAD6', '#93000A'],
+  onErrorContainer: ['#410002', '#FFDAD6'],
+  success: ['#34C759', '#30D158'],
+  warning: ['#FF9500', '#FF9F0A'],
   // Blur & scrims — Apple vibrancy
-  scrim: 'rgba(0,0,0,0.28)',
-  scrimStrong: 'rgba(0,0,0,0.44)',
-  shadow: 'rgba(0,0,0,0.08)',
-  shadowStrong: 'rgba(0,0,0,0.12)',
-  blurTint: 'rgba(255,255,255,0.72)',
-  blurTintStrong: 'rgba(255,255,255,0.84)',
+  scrim: ['rgba(0,0,0,0.28)', 'rgba(0,0,0,0.52)'],
+  scrimStrong: ['rgba(0,0,0,0.44)', 'rgba(0,0,0,0.68)'],
+  shadow: ['rgba(0,0,0,0.08)', 'rgba(0,0,0,0.40)'],
+  shadowStrong: ['rgba(0,0,0,0.12)', 'rgba(0,0,0,0.56)'],
+  blurTint: ['rgba(255,255,255,0.72)', 'rgba(28,28,30,0.72)'],
+  blurTintStrong: ['rgba(255,255,255,0.84)', 'rgba(44,44,46,0.84)'],
   // Card shadow
-  cardShadow: 'rgba(0,0,0,0.06)',
+  cardShadow: ['rgba(0,0,0,0.06)', 'rgba(0,0,0,0.36)'],
 } as const;
 
-export const darkColors = {
-  background: '#000000', // systemBackground dark
-  surface: '#1C1C1E', // secondarySystemBackground dark
-  surfaceContainer: '#2C2C2E', // tertiarySystemBackground
-  surfaceContainerHigh: '#3A3A3C', // systemGray4
-  surfaceContainerHighest: '#48484A',
-  surfaceDim: '#000000',
-  surfaceBright: '#2C2C2E',
+type ColorKey = keyof typeof COLOR_PAIRS;
 
-  primary: '#0A84FF', // systemBlue dark
-  onPrimary: '#FFFFFF',
-  primaryContainer: '#00376B',
-  onPrimaryContainer: '#D1E4FF',
+function buildPalette(scheme: 0 | 1): { [K in ColorKey]: string } {
+  const palette = {} as { [K in ColorKey]: string };
+  for (const [key, pair] of Object.entries(COLOR_PAIRS) as [ColorKey, readonly [string, string]][]) {
+    palette[key] = pair[scheme];
+  }
+  return palette;
+}
 
-  secondary: '#5E5CE6',
-  secondaryContainer: '#2C2C6C',
-  onSecondaryContainer: '#E9E9FF',
-
-  tertiary: '#FF453A',
-  tertiaryContainer: '#4A0D0A',
-  onTertiaryContainer: '#FFDAD6',
-
-  onSurface: '#FFFFFF',
-  onSurfaceVariant: '#EBEBF5',
-  secondaryLabel: 'rgba(235,235,245,0.60)',
-  tertiaryLabel: 'rgba(235,235,245,0.30)',
-  quaternaryLabel: 'rgba(235,235,245,0.18)',
-
-  outline: 'rgba(84,84,88,0.60)', // separator dark
-  outlineVariant: 'rgba(84,84,88,0.30)',
-  separator: 'rgba(84,84,88,0.60)',
-  separatorOpaque: '#38383A',
-  hairline: 'rgba(84,84,88,0.30)',
-
-  systemFill: 'rgba(120,120,128,0.36)',
-  secondarySystemFill: 'rgba(120,120,128,0.32)',
-  tertiarySystemFill: 'rgba(120,120,128,0.24)',
-  quaternarySystemFill: 'rgba(120,120,128,0.18)',
-
-  groupedBackground: '#000000',
-  secondaryGroupedBackground: '#1C1C1E',
-  tertiaryGroupedBackground: '#2C2C2E',
-
-  inverseSurface: '#F2F2F7',
-  inverseOnSurface: '#1C1C1E',
-  error: '#FF453A',
-  errorContainer: '#93000A',
-  onErrorContainer: '#FFDAD6',
-  success: '#30D158',
-  warning: '#FF9F0A',
-
-  scrim: 'rgba(0,0,0,0.52)',
-  scrimStrong: 'rgba(0,0,0,0.68)',
-  shadow: 'rgba(0,0,0,0.40)',
-  shadowStrong: 'rgba(0,0,0,0.56)',
-  blurTint: 'rgba(28,28,30,0.72)',
-  blurTintStrong: 'rgba(44,44,46,0.84)',
-  cardShadow: 'rgba(0,0,0,0.36)',
-} as const;
+export const lightColors = buildPalette(0);
+export const darkColors = buildPalette(1);
 
 export type AppColors = typeof lightColors | typeof darkColors;
 

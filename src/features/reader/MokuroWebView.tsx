@@ -8,6 +8,13 @@ import { YOMIBAKO_BUNDLE_VERSION, YOMIBAKO_CSS, YOMIBAKO_JS } from './yomibakoBu
 import { jpdbApi } from '../../services/jpdb/api';
 import { Icon } from '../../components/ui/Icon';
 import type { ReaderPreferences, ZoomMode } from './preferences';
+import {
+  buildCustomWordInject,
+  buildCustomPopupInject,
+  buildFadeInject,
+  buildTokenScripts,
+  readBridgeCustomization,
+} from '../shared/webViewBridge';
 // Direct stream uses image bridge, no prepareVolume copy needed for content://
 // import { prepareVolumeForWebView } from '../../services/fs/httpServer';
 
@@ -388,53 +395,22 @@ function MokuroWebView(
   // die silently on Android. Split into ~20KB slices; the bundle
   // reassembles via __yomibakoOnTokensChunk then resolves the pending parse.
   const injectTokens = useCallback((id: string, tokens: unknown) => {
-    const payload = JSON.stringify(tokens);
-    const CHUNK = 20000;
-    if (payload.length <= 30000) {
-      webRef.current?.injectJavaScript(`window.__yomibakoOnTokens(${JSON.stringify(id)}, ${payload}); true;`);
-      return;
-    }
-    const total = Math.ceil(payload.length / CHUNK);
-    for (let i = 0; i < total; i++) {
-      const part = payload.slice(i * CHUNK, (i + 1) * CHUNK);
-      webRef.current?.injectJavaScript(
-        `window.__yomibakoOnTokensChunk(${JSON.stringify(id)}, ${i}, ${total}, ${JSON.stringify(part)}); true;`
-      );
+    for (const script of buildTokenScripts(id, tokens)) {
+      webRef.current?.injectJavaScript(script);
     }
   }, []);
 
   function buildCssInject(customWordCSS: string, customPopupCSS: string, disableFade: boolean): string {
     const baseRule = `let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${JSON.stringify(YOMIBAKO_CSS)}; document.head.appendChild(s);}`;
-    let wordRule = '';
-    if (customWordCSS) {
-      wordRule = `let cw=document.getElementById('yomibako-custom-word'); if(!cw){ cw=document.createElement('style'); cw.id='yomibako-custom-word'; cw.textContent=${JSON.stringify(customWordCSS)}; document.head.appendChild(cw); }`;
-    }
-    let popupRule = '';
-    if (customPopupCSS) {
-      popupRule = `let cp=document.getElementById('yomibako-custom-popup'); if(!cp){ cp=document.createElement('style'); cp.id='yomibako-custom-popup'; cp.textContent=${JSON.stringify(customPopupCSS)}; document.head.appendChild(cp); }`;
-    }
-    let fadeRule = '';
-    if (disableFade) {
-      fadeRule = `document.documentElement.style.setProperty('--jpdb-fade-duration','0s');`;
-    }
+    const wordRule = buildCustomWordInject(customWordCSS);
+    const popupRule = buildCustomPopupInject(customPopupCSS);
+    const fadeRule = buildFadeInject(disableFade);
     return `(function(){ ${baseRule} ${wordRule} ${popupRule} ${fadeRule} true;})();`;
   }
 
   async function readCustomCss(): Promise<{ customWordCSS: string; customPopupCSS: string; disableFade: boolean }> {
-    const cfgRaw = await getItemAsync('yomibako_config_json');
-    if (!cfgRaw) {
-      return { customWordCSS: '', customPopupCSS: '', disableFade: false };
-    }
-    try {
-      const cfg = JSON.parse(cfgRaw);
-      return {
-        customWordCSS: cfg.customWordCSS || '',
-        customPopupCSS: cfg.customPopupCSS || '',
-        disableFade: !!cfg.disableFadeAnimation,
-      };
-    } catch {
-      return { customWordCSS: '', customPopupCSS: '', disableFade: false };
-    }
+    const { customWordCSS, customPopupCSS, disableFade } = await readBridgeCustomization();
+    return { customWordCSS, customPopupCSS, disableFade };
   }
 
   const handleBridgeReady = useCallback(async (msg: any) => {
