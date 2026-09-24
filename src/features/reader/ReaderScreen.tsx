@@ -1,13 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Modal, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Modal, PanResponder, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BlurView } from 'expo-blur';
 import { StatusBar } from 'expo-status-bar';
 import * as ScreenOrientation from 'expo-screen-orientation';
-import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
-import { runOnJS } from 'react-native-worklets';
 import * as Haptics from 'expo-haptics';
 import { darkColors } from '../../theme/colors';
 import { Icon } from '../../components/ui/Icon';
@@ -145,7 +143,26 @@ function useScrubController(
   seekTo: (value: number) => void,
 ) {
   const [scrubTo, setScrubTo] = useState<number | null>(null);
-  const trackW = useSharedValue(1);
+  // Plain ref: the scrub bar no longer uses the native gesture handler
+  // (Gesture.Pan hard-crashed the app on touch on some devices). Touch
+  // coordinates are plain numbers, so no shared value is needed here.
+  // scrubValue/scrubbing stay shared because the fill/thumb styles animate
+  // on the UI thread — shared values can be set from plain JS handlers.
+  // Absolute track geometry: locationX goes unreliable when the finger moves
+  // fast or leaves the track (it swings out of range, the clamp then pins
+  // every preview to page 1 / last page). pageX is screen-absolute, so
+  // subtract the measured track origin instead.
+  const trackW = useRef(1);
+  const trackView = useRef<any>(null);
+  const trackLeft = useRef(0);
+  const measureTrack = useCallback(() => {
+    try {
+      trackView.current?.measureInWindow((x: number, _y: number, w: number, _h: number) => {
+        trackLeft.current = x;
+        trackW.current = Math.max(1, w);
+      });
+    } catch {}
+  }, []);
   const scrubbing = useSharedValue(0);
   const scrubValue = useSharedValue(0);
   useEffect(() => {
@@ -164,6 +181,26 @@ function useScrubController(
     }
   }, [total]);
 
+  // The fill bar tracks the finger live on the UI thread, but pushing every
+  // micro-jitter into React state makes the page number chatter at page
+  // boundaries. Gate label commits to ~8/s; the bar stays exact and release
+  // still lands on the true finger position.
+  const lastPreviewCommit = useRef(0);
+  const previewAtSettled = useCallback((value: number) => {
+    if (total <= 1) {
+      previewAt(value);
+      return;
+    }
+    const next = Math.round(clamp01(value) * (total - 1));
+    setScrubTo((prev) => {
+      if (prev === next) return prev;
+      const now = Date.now();
+      if (now - lastPreviewCommit.current < 120) return prev;
+      lastPreviewCommit.current = now;
+      return next;
+    });
+  }, [total, previewAt]);
+
   const endScrub = useCallback((value: number) => {
     setScrubTo(null);
     seekTo(value);
@@ -171,22 +208,35 @@ function useScrubController(
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [seekTo, showChrome]);
 
-  const scrub = useMemo(() => Gesture.Pan()
-    .minDistance(0)
-    .shouldCancelWhenOutside(false)
-    .onBegin((event) => {
+  // PanResponder (React Native core) instead of Gesture.Pan: same tap-to-seek
+  // and drag-to-preview behavior, with no native gesture/worklet activation.
+  const valueAtPageX = useCallback((pageX: number) => clamp01((pageX - trackLeft.current) / Math.max(1, trackW.current)), []);
+  const scrubResponder = useMemo(() => PanResponder.create({
+    onStartShouldSetPanResponder: () => total > 1,
+    onMoveShouldSetPanResponder: () => total > 1,
+    onPanResponderGrant: (event) => {
+      measureTrack();
       scrubbing.value = 1;
-      const value = clamp01(event.x / Math.max(1, trackW.value));
+      lastPreviewCommit.current = 0; // first preview lands instantly
+      const value = valueAtPageX(event.nativeEvent.pageX);
       scrubValue.value = value;
-      runOnJS(previewAt)(value);
-    })
-    .onUpdate((event) => {
-      const value = clamp01(event.x / Math.max(1, trackW.value));
+      previewAtSettled(value);
+    },
+    onPanResponderMove: (event) => {
+      const value = valueAtPageX(event.nativeEvent.pageX);
       scrubValue.value = value;
-      runOnJS(previewAt)(value);
-    })
-    .onEnd((event) => runOnJS(endScrub)(clamp01(event.x / Math.max(1, trackW.value))))
-    .onFinalize(() => { scrubbing.value = 0; }), [endScrub, previewAt, scrubValue, scrubbing, trackW]);
+      previewAtSettled(value);
+    },
+    onPanResponderRelease: (event) => {
+      scrubbing.value = 0;
+      endScrub(valueAtPageX(event.nativeEvent.pageX));
+    },
+    onPanResponderTerminate: () => {
+      scrubbing.value = 0;
+      setScrubTo(null);
+      showChrome();
+    },
+  }), [total, valueAtPageX, previewAtSettled, endScrub, showChrome, measureTrack, scrubValue, scrubbing]);
 
   const fillStyle = useAnimatedStyle(() => ({ width: `${scrubValue.value * 100}%` }));
   // No withSpring here: this style re-evaluates every gesture frame, and
@@ -197,7 +247,7 @@ function useScrubController(
     transform: [{ scale: scrubbing.value ? 1.35 : 1 }],
   }));
 
-  return { scrubTo, setScrubTo, trackW, scrubbing, scrubValue, previewAt, endScrub, scrub, fillStyle, thumbStyle };
+  return { scrubTo, setScrubTo, trackW, trackView, measureTrack, scrubbing, scrubValue, previewAt, endScrub, scrubResponder, fillStyle, thumbStyle };
 }
 
 function ControlErrorText({ message }: { readonly message: string | null }) {
@@ -782,7 +832,7 @@ export default function ReaderScreen() {
   }, [hideChrome, hasWord]);
 
   const scrubController = useScrubController(total, progress, showChrome, seekTo);
-  const { scrubTo, trackW, scrub, fillStyle, thumbStyle } = scrubController;
+  const { scrubTo, trackView, measureTrack, scrubResponder, fillStyle, thumbStyle } = scrubController;
   const currentIndex = currentIndexFor(scrubTo, page.index);
   const pageLabel = formatPageLabel(canPage, total, currentIndex, progress);
 
@@ -900,14 +950,19 @@ export default function ReaderScreen() {
           >
             <Icon name="chevronLeft" size={18} color="rgba(255,255,255,0.92)" strokeWidth={2.3} />
           </Pressable>
-          <GestureDetector gesture={scrub}>
-            <View style={s.scrubHit} onLayout={(event) => { trackW.value = Math.max(1, event.nativeEvent.layout.width); }}>
-              <View style={s.scrubTrack}>
-                <Animated.View style={[s.scrubFill, fillStyle]} />
-                <Animated.View style={[s.scrubThumb, thumbStyle]} />
-              </View>
+          <View
+            ref={trackView}
+            {...scrubResponder.panHandlers}
+            style={s.scrubHit}
+            onLayout={measureTrack}
+            accessibilityRole="adjustable"
+            accessibilityLabel="Seek through pages"
+          >
+            <View style={s.scrubTrack}>
+              <Animated.View style={[s.scrubFill, fillStyle]} />
+              <Animated.View style={[s.scrubThumb, thumbStyle]} />
             </View>
-          </GestureDetector>
+          </View>
           <Pressable
             onPress={() => step(1)}
             disabled={!canPage}
