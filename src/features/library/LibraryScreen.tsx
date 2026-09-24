@@ -1434,7 +1434,7 @@ export default function LibraryScreen() {
   const [scanProgress, setScanProgress] = useState('');
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
-  const [layout, setLayout] = useState<'grid' | 'list'>('grid');
+  const [layout, setLayout] = useState<'grid' | 'list'>('list');
   const [filter, setFilter] = useState<Filter>('all');
   const [sort, setSort] = useState<Sort>('title');
   const [selecting, setSelecting] = useState(false);
