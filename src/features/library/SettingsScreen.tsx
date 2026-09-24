@@ -334,7 +334,8 @@ export default function SettingsScreen() {
       if (!text) return;
       try {
         const parsed = JSON.parse(text);
-        const merged = { ...defaultConfig, ...parsed, schemaVersion: 1 } as YomibakoConfig;
+        const importedVersion = typeof parsed?.schemaVersion === 'number' ? parsed.schemaVersion : 1;
+        const merged = { ...defaultConfig, ...parsed, schemaVersion: importedVersion } as YomibakoConfig;
         if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
         pendingConfig.current = null;
         await saveQueue.current.catch(() => {});

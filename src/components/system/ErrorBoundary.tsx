@@ -13,6 +13,8 @@ type Props = {
   readonly resetLabel?: string;
   /** Called after the user asks to retry, to reset any owning state. */
   readonly onReset?: () => void;
+  /** Custom fallback instead of the default card. Pass null for silent failures (hidden views). */
+  readonly fallback?: React.ReactNode;
 };
 
 type State = { readonly error: Error | null };
@@ -36,6 +38,7 @@ export default class ErrorBoundary extends React.Component<Props, State> {
   render() {
     const { error } = this.state;
     if (!error) return this.props.children;
+    if ('fallback' in this.props) return this.props.fallback as React.ReactNode;
     const resetLabel = this.props.resetLabel ?? 'Try again';
     return (
       <View style={styles.root}>

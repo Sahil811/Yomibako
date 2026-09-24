@@ -27,7 +27,11 @@ export default function App() {
         <ErrorBoundary>
           <AppNavigator />
         </ErrorBoundary>
-        {sessionReady ? <JpdbSessionWebView /> : null}
+        {sessionReady ? (
+          <ErrorBoundary label="Session" fallback={null}>
+            <JpdbSessionWebView />
+          </ErrorBoundary>
+        ) : null}
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );

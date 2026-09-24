@@ -688,6 +688,7 @@ function useWordActions(args: {
   }, [geminiLoading, args]);
 
   const mine = useCallback(async (rating?: ReviewRating) => {
+    if (adding) return;
     setAdding(true);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     try {
@@ -703,9 +704,10 @@ function useWordActions(args: {
       Alert.alert('Mine failed', String(e.message));
     }
     setAdding(false);
-  }, [args]);
+  }, [args, adding]);
 
   const toggleFlag = useCallback(async (flag: FlagName, localState: string[]) => {
+    if (flagLoading !== null) return;
     setFlagLoading(flag);
     try {
       const token = args.cfg?.apiToken;
@@ -721,9 +723,10 @@ function useWordActions(args: {
       Alert.alert('Flag failed', String(e?.message ?? e));
     }
     setFlagLoading(null);
-  }, [args]);
+  }, [args, flagLoading]);
 
   const review = useCallback(async (rating: ReviewRating) => {
+    if (reviewLoading !== null) return;
     setReviewLoading(rating);
     try {
       await jpdbApi.review({ vid: args.vid, sid: args.sid, rating });
@@ -737,7 +740,7 @@ function useWordActions(args: {
       Alert.alert('Review failed', String(e.message));
     }
     setReviewLoading(null);
-  }, [args]);
+  }, [args, reviewLoading]);
 
   const play = useCallback(async () => {
     args.setPlaying(true);

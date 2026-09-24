@@ -163,6 +163,7 @@ function MokuroWebView(
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [directFile, setDirectFile] = useState(false);
+  const [rendererCrashed, setRendererCrashed] = useState(false);
   const lastWebViewSize = useRef({ width: 0, height: 0 });
   const webRef = useRef<WebView>(null);
   // basename (lowercased) -> real SAF document URI. SAF tree children are NOT
@@ -346,10 +347,23 @@ function MokuroWebView(
     let cancelled = false;
     bridgeReadyHandled.current = false;
     resumeDone.current = false;
+    // Fresh volume = fresh pipeline counters. Without this, Diagnostics sums
+    // across volumes and the retry/alert budgets from the previous volume leak
+    // into the next one.
+    diag.current = {
+      pages: 0, sel: '', boxes: 0, tokenPresent: false,
+      parseReq: 0, parseOk: 0, parseErr: 0, lastErr: '',
+      lookups: 0, taps: 0, guardedTextTaps: 0, deferredLookups: 0,
+      applied: 0, applyErr: 0,
+    };
+    retriesLeft.current = 4;
+    tokenAlertShown.current = false;
+    parseErrShown.current = false;
     const isCancelled = () => cancelled;
     (async () => {
       try {
         setLoadError(null);
+        setRendererCrashed(false);
         const contentVolume = isContentVolume(htmlUri, mokuroUri, volumeDir);
         if (contentVolume) {
           setStatus('Copying volume…');
@@ -456,8 +470,15 @@ function MokuroWebView(
     // msg.texts: [[seq, text], ...] and id for batch correlation.
     // Chunks are bounded by the bundle (<=4000 chars) so each reply
     // stays small; oversized replies are still chunk-sent below.
-    const texts: string[] = msg.texts.map((t: any) => t[1]);
-    const id = msg.id;
+    const id = msg?.id;
+    if (typeof id !== 'string' || !id || !Array.isArray(msg?.texts)) {
+      console.warn('[MokuroWebView] ignoring malformed parse message');
+      if (typeof id === 'string' && id) {
+        webRef.current?.injectJavaScript(`window.__yomibakoOnError && window.__yomibakoOnError(${JSON.stringify(id)}, 'Malformed parse request'); true;`);
+      }
+      return;
+    }
+    const texts: string[] = msg.texts.map((t: any) => String(t?.[1] ?? ''));
     diag.current.parseReq++;
     saveDiag();
     const token = await getToken();
@@ -728,7 +749,8 @@ function MokuroWebView(
           }
         }}
         onMessage={onMessage}
-        onRenderProcessGone={() => setStatus('Renderer crashed — reopen the volume.')}
+        onRenderProcessGone={() => setRendererCrashed(true)}
+        onContentProcessDidTerminate={() => setRendererCrashed(true)}
         injectedJavaScriptBeforeContentLoaded={`${directFile ? 'window.__yomibakoDirectFile=true;' : ''}\n${YOMIBAKO_JS}`}
         injectedJavaScript={`
           (function(){
@@ -744,6 +766,21 @@ function MokuroWebView(
           })();
         `}
       />
+      {rendererCrashed ? (
+        <View style={[StyleSheet.absoluteFill as any, { backgroundColor: 'rgba(0,0,0,0.92)', justifyContent: 'center', alignItems: 'center', gap: 10, padding: 24 }]}>
+          <Text style={{ color: 'rgba(255,255,255,0.92)', fontFamily: 'System', fontSize: 15, fontWeight: '600', textAlign: 'center' }}>Page renderer crashed</Text>
+          <Text style={{ color: 'rgba(255,255,255,0.60)', fontFamily: 'System', fontSize: 12, textAlign: 'center' }}>Memory pressure killed the page. Your progress is saved — reload to continue.</Text>
+          <Pressable
+            onPress={() => { setRendererCrashed(false); webRef.current?.reload(); }}
+            style={({ pressed }) => [s.retryButton, { opacity: pressed ? 0.75 : 1 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Reload crashed page"
+          >
+            <Icon name="reload" size={15} color="#fff" strokeWidth={2.1} />
+            <Text style={s.retryText}>Reload page</Text>
+          </Pressable>
+        </View>
+      ) : null}
     </View>
   );
 }
