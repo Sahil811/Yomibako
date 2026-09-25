@@ -496,24 +496,20 @@ function MokuroWebView(
   }, [getToken, saveDiag, alertNoToken, injectTokens, scheduleRetry]);
 
   const handleWordMessages = useCallback((msg: any) => {
-    if (msg.type === 'lookup') {
+    if (msg.type === 'lookup' || msg.type === 'hover') {
       // The bundle always sends numeric ids; anything else is a malformed
       // or spoofed message — drop it before it reaches authenticated API calls.
       if (!hasWordIds(msg)) {
-        console.warn('[MokuroWebView] ignoring lookup without vid/sid');
+        console.warn(`[MokuroWebView] ignoring ${msg.type} without vid/sid`);
         return;
       }
-      diag.current.lookups++;
-      saveDiag();
-      onWordTap?.(msg);
-      return;
-    }
-    if (msg.type === 'hover') {
-      if (!hasWordIds(msg)) {
-        console.warn('[MokuroWebView] ignoring hover without vid/sid');
-        return;
+      if (msg.type === 'lookup') {
+        diag.current.lookups++;
+        saveDiag();
+        onWordTap?.(msg);
+      } else {
+        onWordHover?.(msg);
       }
-      onWordHover?.(msg);
       return;
     }
     if (msg.type === 'anchor') {

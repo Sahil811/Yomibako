@@ -309,7 +309,7 @@ function PageJumpDialog({ visible, total, current, onClose, onGo }: {
     return null;
   }
   const submit = () => {
-    const n = Number.parseInt(text.replace(/[^0-9]/g, ''), 10);
+    const n = Number.parseInt(text.replace(/\D/g, ''), 10);
     if (!Number.isFinite(n)) {
       return;
     }
