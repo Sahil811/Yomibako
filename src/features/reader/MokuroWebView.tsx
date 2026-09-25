@@ -495,21 +495,27 @@ function MokuroWebView(
     }
   }, [getToken, saveDiag, alertNoToken, injectTokens, scheduleRetry]);
 
+  // Lookup/hover share the vid/sid validation gate — kept in its own callback
+  // so the main dispatcher stays under the complexity budget.
+  const handleLookupLikeMessage = useCallback((msg: any) => {
+    // The bundle always sends numeric ids; anything else is a malformed
+    // or spoofed message — drop it before it reaches authenticated API calls.
+    if (!hasWordIds(msg)) {
+      console.warn(`[MokuroWebView] ignoring ${msg.type} without vid/sid`);
+      return;
+    }
+    if (msg.type === 'lookup') {
+      diag.current.lookups++;
+      saveDiag();
+      onWordTap?.(msg);
+      return;
+    }
+    onWordHover?.(msg);
+  }, [saveDiag, onWordTap, onWordHover]);
+
   const handleWordMessages = useCallback((msg: any) => {
     if (msg.type === 'lookup' || msg.type === 'hover') {
-      // The bundle always sends numeric ids; anything else is a malformed
-      // or spoofed message — drop it before it reaches authenticated API calls.
-      if (!hasWordIds(msg)) {
-        console.warn(`[MokuroWebView] ignoring ${msg.type} without vid/sid`);
-        return;
-      }
-      if (msg.type === 'lookup') {
-        diag.current.lookups++;
-        saveDiag();
-        onWordTap?.(msg);
-      } else {
-        onWordHover?.(msg);
-      }
+      handleLookupLikeMessage(msg);
       return;
     }
     if (msg.type === 'anchor') {
@@ -541,7 +547,7 @@ function MokuroWebView(
     if (msg.type === 'words') {
       onWords?.(Array.isArray(msg.words) ? msg.words : []);
     }
-  }, [saveDiag, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onTapBackground, onViewReset, onWords]);
+  }, [handleLookupLikeMessage, saveDiag, onWordAnchor, onWordAnchorLost, onTapBackground, onViewReset, onWords]);
 
   const handleStatusMessages = useCallback((msg: any) => {
     if (msg.type === 'applied') {
