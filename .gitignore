@@ -41,6 +41,10 @@ yarn-error.*
 coverage/
 .nyc_output/
 
+# build outputs (local phone APKs from scripts/build-phone-apk.ps1, never commit)
+*.apk
+*.aab
+
 # generated native folders
 /ios
 /android

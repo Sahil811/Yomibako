@@ -46,6 +46,7 @@
     "test": "npx tsc -p tsconfig.test.json && node test/make-shims.cjs && node --test \".test-out/src/**/__tests__/*.test.js\"",
     "test:coverage": "npx tsc -p tsconfig.test.json && node test/make-shims.cjs && npx c8 --reporter=text --reporter=lcov --include=\".test-out/src/**/*.js\" --exclude=\".test-out/src/**/*.test.js\" --exclude=\".test-out/src/**/yomibakoBundle.js\" --exclude=\".test-out/src/**/browserBundle.js\" --exclude=\".test-out/src/features/shared/useWordAudio.js\" --check-coverage --lines 85 --branches 85 --functions 85 node --test \".test-out/src/**/__tests__/*.test.js\"",
     "sonar": "powershell -ExecutionPolicy Bypass -File scripts/sonar-scan.ps1",
+    "build:phone": "powershell -ExecutionPolicy Bypass -File scripts/build-phone-apk.ps1",
     "sonar:coverage": "npm run test:coverage && powershell -ExecutionPolicy Bypass -File scripts/sonar-scan.ps1"
   },
   "private": true
