@@ -9,3 +9,11 @@ export const Platform: { OS: string; select: <T>(o: any) => T } = {
 export function useColorScheme(): 'light' | 'dark' | null {
   return 'dark';
 }
+
+export const AppState: {
+  addEventListener: (type: string, cb: (state: string) => void) => { remove: () => void };
+  currentState: string;
+} = {
+  currentState: 'active',
+  addEventListener: () => ({ remove: () => {} }),
+};

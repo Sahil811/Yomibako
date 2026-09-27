@@ -19,6 +19,10 @@ import {
   isWordMessageType,
   readBridgeCustomization,
 } from '../shared/webViewBridge';
+// F4: JSON.stringify(YOMIBAKO_CSS) was rebuilt on every render (progress ticks,
+// scrubbing re-render Reader). Hoist to module constant — stable identity,
+// zero per-render allocation on the WebView boundary.
+const YOMIBAKO_CSS_JSON = JSON.stringify(YOMIBAKO_CSS);
 // Direct stream uses image bridge, no prepareVolume copy needed for content://
 // import { prepareVolumeForWebView } from '../../services/fs/httpServer';
 
@@ -342,10 +346,14 @@ function MokuroWebView(
 
   React.useEffect(
     () => () => {
+      // F6: don't SecureStore-write on the exact frame goBack() mounts
+      // Library. Drop the trailing diag (low value) and let AppState flush
+      // handle persists; unmount just cancels the timer.
       if (diagTimer.current) clearTimeout(diagTimer.current);
-      void flushDiag();
+      diagTimer.current = null;
+      diagPending.current = false;
     },
-    [flushDiag]
+    []
   );
 
   const tokenRef = useRef<string | null>(null);
@@ -468,7 +476,7 @@ function MokuroWebView(
   }, []);
 
   function buildCssInject(customWordCSS: string, customPopupCSS: string, disableFade: boolean): string {
-    const baseRule = `let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${JSON.stringify(YOMIBAKO_CSS)}; document.head.appendChild(s);}`;
+    const baseRule = `let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${YOMIBAKO_CSS_JSON}; document.head.appendChild(s);}`;
     const wordRule = buildCustomWordInject(customWordCSS);
     const popupRule = buildCustomPopupInject(customPopupCSS);
     const fadeRule = buildFadeInject(disableFade);
@@ -764,6 +772,41 @@ function MokuroWebView(
   // ticks, scrubbing) can make the native WebView reload the whole volume.
   const source = React.useMemo(() => ({ html: html ?? '', baseUrl }), [html, baseUrl]);
 
+  // F8: navigation allowlist. Reader loads local file:// html; any http(s)
+  // navigation reloads the whole volume (perf) and runs unsandboxed page JS
+  // with universal file access + process-wide jpdb.io cookies (security).
+  const handleShouldStartLoad = useCallback((req: { url: string }) => {
+    const url = req.url ?? '';
+    if (url.startsWith('file://') || url.startsWith('about:') || url.startsWith('data:') || url === '') {
+      return true;
+    }
+    return false;
+  }, []);
+
+  const handleWebLayout = useCallback(
+    (event: { nativeEvent: { layout: { width: number; height: number } } }) => {
+      const { width, height } = event.nativeEvent.layout;
+      const previous = lastWebViewSize.current;
+      lastWebViewSize.current = { width, height };
+      if (previous.width > 0 && (Math.abs(previous.width - width) > 1 || Math.abs(previous.height - height) > 1)) {
+        run('window.__yomibakoRelayout && window.__yomibakoRelayout()');
+      }
+    },
+    [run]
+  );
+
+  // F4: hoist per-render template + JSON.stringify to memos keyed on directFile.
+  // ReaderScreen re-renders on every scrub/progress tick; rebuilding ~78KB of
+  // injected JS per tick is pure allocation + bridge churn.
+  const beforeContentLoaded = React.useMemo(
+    () => `${directFile ? 'window.__yomibakoDirectFile=true;' : ''}\n${YOMIBAKO_JS}`,
+    [directFile]
+  );
+  const injectedJS = React.useMemo(
+    () => `(function(){document.documentElement.style.setProperty('--textBoxDisplay','initial');let s=document.getElementById('yomibako-css');if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${YOMIBAKO_CSS_JSON}; document.head.appendChild(s); }if(window.__yomibakoObserve) window.__yomibakoObserve();if(window.__yomibakoReport) window.__yomibakoReport();true;})();`,
+    []
+  );
+
   if (!html)
     return (
       <View style={[s.c, { backgroundColor: '#000', justifyContent: 'center', alignItems: 'center', gap: 12 }]}>
@@ -803,8 +846,8 @@ function MokuroWebView(
         domStorageEnabled
         allowFileAccess
         allowFileAccessFromFileURLs
-        allowUniversalAccessFromFileURLs
-        mixedContentMode="always"
+        allowUniversalAccessFromFileURLs={false}
+        mixedContentMode="never"
         // The system font-scale is applied to WebView text on Android and blows
         // mokuro's absolutely positioned textBoxes off their panels.
         textZoom={100}
@@ -816,31 +859,13 @@ function MokuroWebView(
         allowsBackForwardNavigationGestures={false}
         automaticallyAdjustContentInsets={false}
         contentInsetAdjustmentBehavior="never"
-        onLayout={(event) => {
-          const { width, height } = event.nativeEvent.layout;
-          const previous = lastWebViewSize.current;
-          lastWebViewSize.current = { width, height };
-          if (previous.width > 0 && (Math.abs(previous.width - width) > 1 || Math.abs(previous.height - height) > 1)) {
-            run('window.__yomibakoRelayout && window.__yomibakoRelayout()');
-          }
-        }}
+        onLayout={handleWebLayout}
+        onShouldStartLoadWithRequest={handleShouldStartLoad}
         onMessage={onMessage}
         onRenderProcessGone={() => setRendererCrashed(true)}
         onContentProcessDidTerminate={() => setRendererCrashed(true)}
-        injectedJavaScriptBeforeContentLoaded={`${directFile ? 'window.__yomibakoDirectFile=true;' : ''}\n${YOMIBAKO_JS}`}
-        injectedJavaScript={`
-          (function(){
-            // Ensure mokuro textBoxes are visible, then hand control to the
-            // bundle. CSS/progress used to be duplicated here and fought the
-            // bundle's own reporter.
-            document.documentElement.style.setProperty('--textBoxDisplay','initial');
-            let s=document.getElementById('yomibako-css');
-            if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${JSON.stringify(YOMIBAKO_CSS)}; document.head.appendChild(s); }
-            if(window.__yomibakoObserve) window.__yomibakoObserve();
-            if(window.__yomibakoReport) window.__yomibakoReport();
-            true;
-          })();
-        `}
+        injectedJavaScriptBeforeContentLoaded={beforeContentLoaded}
+        injectedJavaScript={injectedJS}
       />
       {rendererCrashed ? (
         <View style={[StyleSheet.absoluteFill as any, { backgroundColor: 'rgba(0,0,0,0.92)', justifyContent: 'center', alignItems: 'center', gap: 10, padding: 24 }]}>

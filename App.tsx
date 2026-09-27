@@ -7,9 +7,13 @@ import { useColorScheme } from 'react-native';
 import AppNavigator from './src/navigation/AppNavigator';
 import JpdbSessionWebView from './src/components/system/JpdbSessionWebView';
 import ErrorBoundary from './src/components/system/ErrorBoundary';
+import { useAppStateFlush } from './src/hooks/useAppStateFlush';
 
 export default function App() {
   const scheme = useColorScheme();
+  // F6: flush debounced persists (progress 1200ms, prefs 250ms, index 800ms)
+  // on background so a hard kill never loses the last page turn or scan.
+  useAppStateFlush();
   // The hidden jpdb.io session view spawns a second renderer + network fetch
   // on cold start. Defer it well past the library scan so tab presses and
   // volume taps never compete with it; cookie-gated jobs queue until ready.

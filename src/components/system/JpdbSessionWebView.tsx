@@ -74,16 +74,23 @@ export default function JpdbSessionWebView() {
     } catch {}
   }, []);
 
+  const onNavState = useCallback((nav: { url: string }) => {
+    urlRef.current = nav.url;
+  }, []);
+
+  // F4: stable source identity — fresh {uri} per parent render churns bridge.
+  const source = React.useMemo(() => ({ uri: url }), [url]);
+
   return (
     <View style={{ position: 'absolute', width: 1, height: 1, opacity: 0 }} pointerEvents="none">
       <WebView
         ref={webRef}
-        source={{ uri: url }}
+        source={source}
         style={{ width: 1, height: 1 }}
         javaScriptEnabled
         domStorageEnabled
         onMessage={onMessage}
-        onNavigationStateChange={(nav) => { urlRef.current = nav.url; }}
+        onNavigationStateChange={onNavState}
         injectedJavaScriptBeforeContentLoaded={SESSION_BRIDGE_JS}
       />
     </View>

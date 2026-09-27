@@ -23,6 +23,11 @@ import { BROWSER_CSS, BROWSER_JS } from './browserBundle';
 import WordSheet from '../reader/WordSheet';
 import QuizModal from '../quiz/QuizModal';
 
+// F4: hoist JSON.stringify out of per-render inject builders. BrowserScreen
+// re-renders on every word hover (measureInWindow → setWebFrame); rebuilding
+// CSS strings per render is pure allocation churn.
+const BROWSER_CSS_JSON = JSON.stringify(BROWSER_CSS);
+
 // The browser is locked to the TTSU reader — no search, no address bar,
 // no manual navigation. TTSU is the only page ever shown.
 const TTSU_URL = 'https://reader.ttsu.app/';
@@ -43,7 +48,7 @@ function buildBridgeCssInject(customWordCSS: string, customPopupCSS: string, dis
   const popupInject = buildCustomPopupInject(customPopupCSS);
   const fadeInject = buildFadeInject(disableFade);
   return `(function(){
-          let s=document.getElementById('yomibako-browser-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-browser-css'; s.textContent=${JSON.stringify(BROWSER_CSS)}; document.head.appendChild(s);}
+          let s=document.getElementById('yomibako-browser-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-browser-css'; s.textContent=${BROWSER_CSS_JSON}; document.head.appendChild(s);}
           ${wordInject}
           ${popupInject}
           ${fadeInject}
@@ -60,19 +65,17 @@ async function loadBridgeCustomization(interactionRef: React.RefObject<{ showPop
 }
 
 async function resolveParseApiToken(): Promise<string | null> {
+  // F1: single cached config read replaces 2 SecureStore round-trips per
+  // parse message (no cache before). loadConfig is in-memory after first read.
+  try {
+    const cfg = await loadConfig();
+    if (cfg.apiToken) return cfg.apiToken;
+  } catch {}
   const token = await getItemAsync('jpdb_token');
   if (token) {
     return token;
   }
-  const raw = await getItemAsync('yomibako_config_json');
-  if (!raw) {
-    return null;
-  }
-  try {
-    return JSON.parse(raw).apiToken ?? null;
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 function extractParseTexts(msg: any): string[] {
@@ -353,7 +356,9 @@ function statusBarStyle(isDark: boolean): 'light' | 'dark' {
   return 'dark';
 }
 
-function BrowserWebContent({ url, colors, loading, webRef, webFrameRef, onLoadStart, onLoadEnd, onNavState, onMessage, onShouldStart, onMeasure, onOpenWiki }: {
+const BROWSER_CSS_INJECT = `(function(){ let s=document.getElementById('yomibako-browser-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-browser-css'; s.textContent=${BROWSER_CSS_JSON}; document.head.appendChild(s);} true;})();`;
+
+const BrowserWebContent = React.memo(function BrowserWebContent({ url, colors, loading, webRef, webFrameRef, onLoadStart, onLoadEnd, onNavState, onMessage, onShouldStart, onMeasure, onOpenWiki }: {
   readonly url: string;
   readonly colors: any;
   readonly loading: boolean;
@@ -374,12 +379,16 @@ function BrowserWebContent({ url, colors, loading, webRef, webFrameRef, onLoadSt
       </View>
     );
   }
+  // F4: source + css inject memoized — parent re-renders on every word hover
+  // (measureInWindow → setWebFrame). Fresh objects each render churn the bridge.
+  const source = React.useMemo(() => ({ uri: url }), [url]);
+  const webStyle = React.useMemo(() => ({ flex: 1, backgroundColor: colors.background }) as const, [colors.background]);
   return (
     <View ref={webFrameRef} style={{ flex: 1, backgroundColor: colors.background }} onLayout={onMeasure}>
       <WebView
         ref={webRef}
-        source={{ uri: url }}
-        style={{ flex: 1, backgroundColor: colors.background }}
+        source={source}
+        style={webStyle}
         javaScriptEnabled
         domStorageEnabled
         allowFileAccess
@@ -391,14 +400,14 @@ function BrowserWebContent({ url, colors, loading, webRef, webFrameRef, onLoadSt
         onNavigationStateChange={onNavState}
         onMessage={onMessage}
         injectedJavaScriptBeforeContentLoaded={BROWSER_JS}
-        injectedJavaScript={`(function(){ let s=document.getElementById('yomibako-browser-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-browser-css'; s.textContent=${JSON.stringify(BROWSER_CSS)}; document.head.appendChild(s);} true;})();`}
+        injectedJavaScript={BROWSER_CSS_INJECT}
         onShouldStartLoadWithRequest={onShouldStart}
         {...getIosWebViewProps()}
       />
       <ProgressHairline loading={loading} colors={colors} />
     </View>
   );
-}
+});
 
 function ProgressHairline({ loading, colors }: {
   readonly loading: boolean;

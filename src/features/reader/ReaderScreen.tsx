@@ -50,6 +50,21 @@ import {
 
 const AUTO_HIDE_MS = 2200;
 
+// F7: Android solid fallback over WebView. expo-blur over a WebView can't blur
+// its content on Android (translucent View / RenderEffect scrim at best) yet
+// still pays a full-screen re-composite per frame. Solid surface is visually
+// identical here and far cheaper. iOS keeps real blur.
+function ReaderBlur({ intensity, style, children }: { readonly intensity: number; readonly style: any; readonly children: React.ReactNode }) {
+  if (Platform.OS === 'android') {
+    return <View style={[style, { backgroundColor: 'rgba(20,20,22,0.92)' }]}>{children}</View>;
+  }
+  return (
+    <BlurView intensity={intensity} tint="dark" style={style}>
+      {children}
+    </BlurView>
+  );
+}
+
 // Scoped reader accent (P4): reader is always dark, deepened fill passes
 // 4.5:1 with white. Never use palette primary or bright hanko as fills.
 const READER_ACCENT_FILL = readerAccentFill('dark');
@@ -151,7 +166,7 @@ function useScrubController(
   // (Gesture.Pan hard-crashed the app on touch on some devices). Touch
   // coordinates are plain numbers, so no shared value is needed here.
   // scrubValue/scrubbing stay shared because the fill/thumb styles animate
-  // on the UI thread — shared values can be set from plain JS handlers.
+  // on the UI thread  Eshared values can be set from plain JS handlers.
   // Absolute track geometry: locationX goes unreliable when the finger moves
   // fast or leaves the track (it swings out of range, the clamp then pins
   // every preview to page 1 / last page). pageX is screen-absolute, so
@@ -178,7 +193,7 @@ function useScrubController(
   const previewAt = useCallback((value: number) => {
     if (total > 1) {
       const next = Math.round(clamp01(value) * (total - 1));
-      // Gesture fires per frame — skip React re-render when the page hasn't changed.
+      // Gesture fires per frame  Eskip React re-render when the page hasn't changed.
       setScrubTo((prev) => (prev === next ? prev : next));
     } else {
       setScrubTo((prev) => (prev === null ? prev : null));
@@ -294,7 +309,7 @@ function QuizOverlay({ words, onClose }: { readonly words: any[] | null; readonl
   return <QuizModal words={words} onClose={onClose} forceDark />;
 }
 
-// Direct page jump — the scrub bar can't land on an exact page like 80.
+// Direct page jump  Ethe scrub bar can't land on an exact page like 80.
 // The footer count opens this; input is 1-based, clamped to 1..total.
 function PageJumpDialog({ visible, total, current, onClose, onGo }: {
   readonly visible: boolean;
@@ -330,7 +345,7 @@ function PageJumpDialog({ visible, total, current, onClose, onGo }: {
           importantForAccessibility="yes"
         >
           <Text style={s.jumpTitle}>Go to page</Text>
-          <Text style={s.jumpSub}>1 – {total} · now on {current}</Text>
+          <Text style={s.jumpSub}>1  E{total} · now on {current}</Text>
           <TextInput
             value={text}
             onChangeText={setText}
@@ -570,7 +585,7 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
   } = params;
 
   // The page reports progress on every scroll frame. Re-rendering the whole
-  // reader chrome at 60fps drops frames — only commit visible changes.
+  // reader chrome at 60fps drops frames  Eonly commit visible changes.
   // During scrub the fill/thumb already track scrubValue on the UI thread;
   // committing progress to React state mid-scrub would re-render the whole
   // screen (including MokuroWebView hooks) hundreds of times.
@@ -602,7 +617,7 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
     }
     // A real lookup resolves any pending skeleton for the same spot.
     setWord(nextWord);
-    // "Auto-play pronunciation" — a tap plays the word's audio immediately.
+    // "Auto-play pronunciation"  Ea tap plays the word's audio immediately.
     maybePlayTapAudio(interactionRef.current.playSoundOnHover, nextWord, playWordAudio);
     void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, [cancelHoverAudio, playWordAudio]);
@@ -640,7 +655,7 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
       dismissWord,
       showPageToast,
     });
-    // Hide chrome on the turn that follows showing it — a page turn is a
+    // Hide chrome on the turn that follows showing it  Ea page turn is a
     // more natural dismissal than the 2200ms timer alone.
     if (chromeRef.current) {
       hideChrome();
@@ -665,7 +680,7 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
     readerRef.current?.goToPage(Math.max(0, Math.min(total - 1, Math.round(pageIndex))));
     void Haptics.selectionAsync();
     showChrome();
-  }, [total, showChrome]);  // Options bar actions — every one keeps the chrome alive so the bar does not
+  }, [total, showChrome]);  // Options bar actions  Eevery one keeps the chrome alive so the bar does not
   // vanish mid-interaction.
   const act = useCallback((fn: () => void) => {
     void Haptics.selectionAsync();
@@ -878,7 +893,7 @@ export default function ReaderScreen() {
     }
   }, [resumePage, firstPaint]);
 
-  // A page turn only lives in memory until the 1200ms debounce fires — flush
+  // A page turn only lives in memory until the 1200ms debounce fires  Eflush
   // on blur too, so navigating away fast never loses the last position.
   useEffect(() => navigation.addListener('blur', () => { dismissWord(); void flushProgress(); }), [dismissWord, navigation]);
   useEffect(() => () => {
@@ -911,7 +926,7 @@ export default function ReaderScreen() {
     <View style={s.root}>
       <StatusBar style="light" hidden={!chromeVisible} animated />
       {/* Edge-hugging 2px progress (P2): sits at the screen edge, transparent
-          track so only the fill shows — never a full-width bar cutting the page. */}
+          track so only the fill shows  Enever a full-width bar cutting the page. */}
       <View pointerEvents="none" style={s.hairlineTrack}>
         <View style={[s.hairlineFill, { width: `${Math.round(progress * 100)}%` }]} />
       </View>
@@ -952,7 +967,7 @@ export default function ReaderScreen() {
         }}
         style={[s.headerWrap, { paddingTop: insets.top + 6, pointerEvents: chromeVisible ? 'auto' : 'none' } as any, headerStyle]}
       >
-        <BlurView intensity={34} tint="dark" style={s.headerBlur}>
+        <ReaderBlur intensity={34} style={s.headerBlur}>
           <Pressable
             onPress={() => { void Haptics.selectionAsync(); void flushProgress(); navigation.goBack(); }}
             style={({ pressed }) => [s.circleButton, pressed && s.pressed]}
@@ -971,12 +986,12 @@ export default function ReaderScreen() {
           >
             <Icon name="settings" size={18} color={optionsOpen ? '#fff' : 'rgba(255,255,255,0.92)'} strokeWidth={2} />
           </Pressable>
-        </BlurView>
+        </ReaderBlur>
 
-        {/* Options bar — zoom, layout and re-parse. Collapsed by default so the
+        {/* Options bar  Ezoom, layout and re-parse. Collapsed by default so the
             page stays unobstructed. */}
         {shouldShowOptions(optionsOpen, word) ? (
-          <BlurView intensity={34} tint="dark" style={s.optionsBar}>
+          <ReaderBlur intensity={34} style={s.optionsBar}>
             <Segmented
               selected={zoomMode}
               items={[
@@ -992,7 +1007,7 @@ export default function ReaderScreen() {
             />
             <View style={s.chipRow}>
               <Chip label="Two pages" active={page.twoPage} onPress={() => act(() => readerRef.current?.toggle('twoPage'))} />
-              <Chip label={page.rtl ? '右 → 左' : '左 → 右'} onPress={() => act(() => readerRef.current?.toggle('rtl'))} />
+              <Chip label={page.rtl ? '右 ↁE左' : '左 ↁE右'} onPress={() => act(() => readerRef.current?.toggle('rtl'))} />
               <Chip label="Re-parse" onPress={() => act(() => readerRef.current?.retryParse())} />
               <Chip
                 label="mokuro"
@@ -1005,7 +1020,7 @@ export default function ReaderScreen() {
               />
             </View>
             <ControlErrorText message={controlError} />
-          </BlurView>
+          </ReaderBlur>
         ) : null}
       </Animated.View>
 
@@ -1013,7 +1028,7 @@ export default function ReaderScreen() {
         onLayout={(event) => { footerH.value = event.nativeEvent.layout.height + 10; }}
         style={[s.footerWrap, { bottom: Math.max(insets.bottom, 10), pointerEvents: chromeVisible && !word ? 'auto' : 'none' } as any, footerStyle]}
       >
-        <BlurView intensity={32} tint="dark" style={s.footerBlur}>
+        <ReaderBlur intensity={32} style={s.footerBlur}>
           <Pressable
             onPress={() => step(-1)}
             disabled={!canPage}
@@ -1055,7 +1070,7 @@ export default function ReaderScreen() {
           >
             <Text style={s.footerCount}>{pageLabel}</Text>
           </Pressable>
-        </BlurView>
+        </ReaderBlur>
       </Animated.View>
 
       <PageToast visible={canPage} text={pageLabel} bottom={Math.max(insets.bottom, 12) + 4} style={toastStyle} />
@@ -1064,7 +1079,7 @@ export default function ReaderScreen() {
           rides above the footer so the two never overlap. Icon-only by design. */}
       {shouldShowFab(word, quizWords) ? (
         <Animated.View style={[s.fab, { bottom: Math.max(insets.bottom, 12), right: Math.max(insets.right, 14) }, fabStyle]}>
-          <BlurView intensity={30} tint="dark" style={s.fabSurface}>
+          <ReaderBlur intensity={30} style={s.fabSurface}>
             <Pressable
               onPress={startQuiz}
               style={({ pressed }) => [s.fabButton, pressed && s.fabPressed]}
@@ -1074,7 +1089,7 @@ export default function ReaderScreen() {
             >
               <Icon name="repeat" size={18} color="rgba(255,255,255,0.92)" strokeWidth={2} />
             </Pressable>
-          </BlurView>
+          </ReaderBlur>
         </Animated.View>
       ) : null}
 

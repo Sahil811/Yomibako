@@ -7,6 +7,7 @@ import {
   evictOldCaches,
   prepareVolumeForWebView,
   httpServer,
+  __resetCacheManifestForTests,
 } from '../httpServer';
 import { __resetFS, __putDir, __putFile } from '../../../../test/mocks/expo-file-system';
 import { Platform } from 'react-native';
@@ -135,6 +136,7 @@ test('mokuro-only volume unzips to an html entry', async () => {
 
 test('evictOldCaches drops the stalest volume over budget', async () => {
   __resetFS();
+  __resetCacheManifestForTests();
   __putFile('file:///mock-cache/yomibako/A/V1/p.jpg', '1234567890');
   __putFile('file:///mock-cache/yomibako/B/V2/p.jpg', '1234567890');
   __putFile(

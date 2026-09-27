@@ -34,7 +34,7 @@ import { loadLibraryIndex, saveLibraryIndex } from './libraryCache';
 import { absorbSeries, compareTitle, pruneMissingSeries, recount, seriesKey } from './mergeLibrary';
 import type { AbsorbFn, AbsorbMode } from './mergeLibrary';
 import { clearRemoved, loadRemoved, markRemoved, restoreRemoved, withoutRemoved } from './removed';
-import { getSavedReading } from '../reader/progress';
+import { getBulkReading, getSavedReading } from '../reader/progress';
 import type { Volume, Series } from './types';
 import { darkColors, lightColors } from '../../theme/colors';
 import { Icon, type IconName } from '../../components/ui/Icon';
@@ -145,6 +145,7 @@ function volumeCardEqual(prev: VolumeCardProps, next: VolumeCardProps): boolean 
     prev.volume.coverUri === next.volume.coverUri &&
     prev.volume.pageCount === next.volume.pageCount &&
     (prev.volume.progress ?? 0) === (next.volume.progress ?? 0) &&
+    (prev.volume.lastOpened ?? 0) === (next.volume.lastOpened ?? 0) &&
     prev.selecting === next.selecting &&
     prev.selected === next.selected &&
     prev.layout === next.layout &&
@@ -485,24 +486,37 @@ const ActionSheet = React.memo(function ActionSheet({ title, subtitle, actions, 
   );
 });
 
-let lastFocusRefresh = 0;
+export function __resetLibraryFocusThrottleForTests() {
+  lastFocusRefreshFallback = 0;
+}
+
+let lastFocusRefreshFallback = 0;
 function refreshLibraryOnFocus(
   libraryRef: React.RefObject<Series[]>,
   setLibrary: React.Dispatch<React.SetStateAction<Series[]>>,
   scanningRef?: React.RefObject<boolean>,
   control?: import('./scan').ScanControl,
-  removedRef?: React.RefObject<Set<string>>
+  removedRef?: React.RefObject<Set<string>>,
+  throttleRef?: React.RefObject<number>
 ): void {
   const current = libraryRef.current;
   if (!current.length) {
     return;
   }
-  // Returning from Reader/Browser fires focus; re-hydrating 100+ SecureStore
-  // reads on every return queues taps behind storage. Throttle to 5s and
-  // skip entirely while a rescan is already hydrating.
+  // Returning from Reader/Browser fires focus; re-hydrating via the
+  // consolidated index (F1, single read) on every return still competes with
+  // navigation. Throttle to 5s and skip entirely while a rescan is hydrating.
+  // Throttle lives in a component ref (not module state) so a remount can't
+  // inherit a stale timestamp.
   if (scanningRef?.current) return;
-  if (Date.now() - lastFocusRefresh < 5000) return;
-  lastFocusRefresh = Date.now();
+  const now = Date.now();
+  if (throttleRef) {
+    if (now - (throttleRef.current ?? 0) < 5000) return;
+    throttleRef.current = now;
+  } else {
+    if (now - lastFocusRefreshFallback < 5000) return;
+    lastFocusRefreshFallback = now;
+  }
   void withSavedProgress(current, control).then((hydrated) => {
     // Re-check: a rescan may have started during the seconds-long SecureStore
     // reads. A plain replace here would roll back newly streamed volumes.
@@ -1042,8 +1056,10 @@ async function rescanAllRoots(
   }
 }
 
-async function hydrateOneVolume(volume: Volume): Promise<Volume> {
-  const saved = await getSavedReading(volume.progressKey ?? volume.uri);
+function applySavedToVolume(
+  volume: Volume,
+  saved: { page: number; total?: number; updatedAt: number } | null
+): Volume {
   if (!saved) return { ...volume, progress: 0, lastOpened: undefined };
   // Never fabricate pageCount: html/mokuro-only volumes legitimately have 0.
   // Writing `|| 1` inflates totalPages, prints "1 pages", and pins progress
@@ -1060,23 +1076,40 @@ async function hydrateOneVolume(volume: Volume): Promise<Volume> {
   };
 }
 
+async function hydrateOneVolume(volume: Volume): Promise<Volume> {
+  // Single-volume fallback (pick-folder flow, tests). Bulk path below is
+  // preferred for shelves: 1 index read instead of N SecureStore reads.
+  const saved = await getSavedReading(volume.progressKey ?? volume.uri);
+  return applySavedToVolume(volume, saved);
+}
+
 async function withSavedProgress(items: Series[], control?: import('./scan').ScanControl): Promise<Series[]> {
-  // SecureStore on Android is EncryptedSharedPreferences + Keystore:
-  // ~10-50ms per read and the bridge serializes. Firing 100+ reads in one
-  // Promise.all wedges startup. Batch 8 at a time + real frame gap + pause
-  // while the user is navigating so tab presses never queue behind hydration.
+  // F1: single consolidated index read replaces 100+ SecureStore round-trips
+  // + 13×25ms sleeps. Per-key entries stay authoritative inside getBulkReading
+  // (miss ⇒ per-key fallback + rebuild), so a partial blob loses nothing.
+  // Pause checks remain so tab presses never queue behind hydration.
+  const uris: string[] = [];
+  const seen = new Set<string>();
+  for (const series of items) {
+    for (const v of series.volumes) {
+      const key = v.progressKey ?? v.uri;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uris.push(key);
+      }
+    }
+  }
+  let bulk: Map<string, { page: number; total?: number; updatedAt: number } | null>;
+  try {
+    bulk = await getBulkReading(uris);
+  } catch {
+    bulk = new Map();
+  }
   const out: Series[] = [];
   for (const series of items) {
     if (control?.isCancelled?.()) break;
     if (control?.waitWhilePaused) await control.waitWhilePaused();
-    const volumes: Volume[] = [];
-    for (let i = 0; i < series.volumes.length; i += 8) {
-      if (control?.isCancelled?.()) break;
-      if (control?.waitWhilePaused) await control.waitWhilePaused();
-      const batch = series.volumes.slice(i, i + 8);
-      volumes.push(...(await Promise.all(batch.map(hydrateOneVolume))));
-      await new Promise<void>((r) => setTimeout(r, 25));
-    }
+    const volumes = series.volumes.map((v) => applySavedToVolume(v, bulk.get(v.progressKey ?? v.uri) ?? null));
     out.push(recount(series, volumes));
   }
   return out;
@@ -1171,7 +1204,7 @@ function TitleAppBar({ colors, headerTitle, headerSub, layout, onSearch, onToggl
   );
 }
 
-function LibraryAppBarContent(args: {
+const LibraryAppBarContent = React.memo(function LibraryAppBarContent(args: {
   readonly selecting: boolean;
   readonly searching: boolean;
   readonly colors: any;
@@ -1229,7 +1262,7 @@ function LibraryAppBarContent(args: {
       onOverflow={args.onOverflow}
     />
   );
-}
+});
 
 const ShelvesSection = React.memo(function ShelvesSection({ library, series, colors, onSelectSeries, onMenuSeries }: {
   readonly library: Series[];
@@ -1558,6 +1591,11 @@ export default function LibraryScreen() {
   const lastAbsorbRef = useRef(0);
   const lastProgressRef = useRef(0);
   const snackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastFocusRefreshRef = useRef(0);
+  // F6: replace 1.5s wall-clock tap swallow with navigation-aware guard.
+  // Wall-clock debounces punish the retry tap that a freeze provokes; this
+  // only ignores repeats while a navigation is still in flight.
+  const navigatedRef = useRef(false);
   libraryRef.current = library;
 
   const nav = useNavigation<any>();
@@ -1692,29 +1730,33 @@ export default function LibraryScreen() {
     void restoreCachedLibrary();
   }, [restoreCachedLibrary]);
 
-  useEffect(() => nav.addListener('focus', () => refreshLibraryOnFocus(
-    libraryRef,
-    setLibrary,
-    scanningRef,
-    scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef }),
-    removedRef
-  )), [nav]);
+  useEffect(() => nav.addListener('focus', () => {
+    navigatedRef.current = false;
+    refreshLibraryOnFocus(
+      libraryRef,
+      setLibrary,
+      scanningRef,
+      scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef }),
+      removedRef,
+      lastFocusRefreshRef
+    );
+  }), [nav]);
 
   const pickFolder = useCallback(async () => {
     await runPickFolderFlow({ removedRef, setLoading, setScanProgress, setRemoved, setLibrary, setActiveSeriesUri, absorb });
   }, [absorb, setRemoved]);
 
-  const lastOpenRef = useRef(0);
   const seriesRef = useRef<Series | null>(null);
   seriesRef.current = series;
   const openVolume = useCallback((volume: Volume) => {
-    // Queued taps during a freeze can fire back-to-back, opening multiple
-    // Readers each copying ~50MB. Ignore repeats within 1.5s.
-    const nowTap = Date.now();
-    if (nowTap - lastOpenRef.current < 1500) {
+    // Queued taps during a freeze used to open multiple Readers each copying
+    // ~50MB. The old 1.5s wall-clock debounce also swallowed the retry tap a
+    // freeze provokes, making jank feel worse. Now: ignore only while a
+    // navigation is still in flight; focus clears the guard.
+    if (navigatedRef.current) {
       return;
     }
-    lastOpenRef.current = nowTap;
+    navigatedRef.current = true;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     // Park the background scan BEFORE navigating so Reader mount + volume
     // copy don't compete with the SAF walk for the JS thread.
@@ -1838,6 +1880,62 @@ export default function LibraryScreen() {
     />
   ), [colors, isDark, layout, selecting, selectionSet, handlePressVolume, handleLongPressVolume, handleMenuVolume]);
 
+  // Stable handlers above the onboarding early-return so header memo holds.
+  // These were plain arrows before, defeating LibraryMainContent/header memo.
+  const handleToggleSelectAll = useCallback((allSelected: boolean, list: Volume[]) => {
+    Haptics.selectionAsync();
+    if (allSelected) {
+      setSelection([]);
+    } else {
+      setSelection(list.map((volume) => volume.id));
+    }
+  }, []);
+
+  const handleCloseSearch = useCallback(() => {
+    setSearching(false);
+    setQuery('');
+  }, []);
+
+  const handleToggleLayout = useCallback(() => {
+    Haptics.selectionAsync();
+    setLayout((current) => toggleLayoutValue(current));
+  }, []);
+
+  const handleSelectSeries = useCallback((item: Series) => {
+    Haptics.selectionAsync();
+    setActiveSeriesUri(seriesKey(item));
+    setQuery('');
+    exitSelection();
+  }, [exitSelection]);
+
+  const handleLongPressSeries = useCallback((item: Series) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setMenuSeries(item);
+  }, []);
+
+  const handleSelectVolumeForMenu = useCallback((volume: Volume) => {
+    setSelecting(true);
+    setSelection([volume.id]);
+  }, []);
+
+  const handleFilter = useCallback((next: Filter) => {
+    Haptics.selectionAsync();
+    setFilter(next);
+  }, []);
+
+  const handleRemoveVolumes = useCallback((volumes: Volume[]) => void removeVolumes(volumes), [removeVolumes]);
+  const handleClearQuery = useCallback(() => setQuery(''), []);
+  const handleSearch = useCallback(() => setSearching(true), []);
+  const handleOverflow = useCallback(() => setOverflowOpen(true), []);
+  const handleShowShelf = useCallback((target: Series) => {
+    setActiveSeriesUri(seriesKey(target));
+    setQuery('');
+  }, []);
+  const handleRemoveSeries = useCallback((target: Series) => removeSeries(target), [removeSeries]);
+  const handleCloseMenuVolume = useCallback(() => setMenuVolume(null), []);
+  const handleCloseMenuSeries = useCallback(() => setMenuSeries(null), []);
+  const handleCloseOverflow = useCallback(() => setOverflowOpen(false), []);
+
   // Hooks must stay above the onboarding early-return: adding a hook below it
   // changes the hook count once the library loads -> "Rendered more hooks".
   const overflowActions: SheetAction[] = React.useMemo(() => buildOverflowActionsOrEmpty(series, sort, removedCount, {
@@ -1863,42 +1961,6 @@ export default function LibraryScreen() {
     totalPages: series?.totalPages ?? 0,
   });
 
-  const handleToggleSelectAll = (allSelected: boolean, list: Volume[]) => {
-    Haptics.selectionAsync();
-    if (allSelected) {
-      setSelection([]);
-    } else {
-      setSelection(list.map((volume) => volume.id));
-    }
-  };
-
-  const handleCloseSearch = () => {
-    setSearching(false);
-    setQuery('');
-  };
-
-  const handleToggleLayout = () => {
-    Haptics.selectionAsync();
-    setLayout((current) => toggleLayoutValue(current));
-  };
-
-  const handleSelectSeries = (item: Series) => {
-    Haptics.selectionAsync();
-    setActiveSeriesUri(seriesKey(item));
-    setQuery('');
-    exitSelection();
-  };
-
-  const handleLongPressSeries = (item: Series) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setMenuSeries(item);
-  };
-
-  const handleSelectVolumeForMenu = (volume: Volume) => {
-    setSelecting(true);
-    setSelection([volume.id]);
-  };
-
   return (
     <View style={[s.root, { backgroundColor: colors.groupedBackground }]}>
       <AppBar colors={colors} isDark={isDark} topPad={insets.top + 8}>
@@ -1916,13 +1978,13 @@ export default function LibraryScreen() {
           layout={layout}
           onExitSelection={exitSelection}
           onToggleSelectAll={handleToggleSelectAll}
-          onRemoveVolumes={(volumes) => void removeVolumes(volumes)}
+          onRemoveVolumes={handleRemoveVolumes}
           onCloseSearch={handleCloseSearch}
           onQuery={setQuery}
-          onClearQuery={() => setQuery('')}
-          onSearch={() => setSearching(true)}
+          onClearQuery={handleClearQuery}
+          onSearch={handleSearch}
           onToggleLayout={handleToggleLayout}
-          onOverflow={() => setOverflowOpen(true)}
+          onOverflow={handleOverflow}
         />
       </AppBar>
 
@@ -1944,10 +2006,7 @@ export default function LibraryScreen() {
         onSelectSeries={handleSelectSeries}
         onMenuSeries={handleLongPressSeries}
         onMenuVolume={setMenuVolume}
-        onFilter={(next) => {
-          Haptics.selectionAsync();
-          setFilter(next);
-        }}
+        onFilter={handleFilter}
       />
 
       <LibraryFab selecting={selecting} searching={searching} colors={colors} snackVisible={!!snack} onPick={pickFolder} />
@@ -1963,17 +2022,14 @@ export default function LibraryScreen() {
         colors={colors}
         bottomInset={insets.bottom}
         overflowActions={overflowActions}
-        onCloseMenuVolume={() => setMenuVolume(null)}
-        onCloseMenuSeries={() => setMenuSeries(null)}
-        onCloseOverflow={() => setOverflowOpen(false)}
+        onCloseMenuVolume={handleCloseMenuVolume}
+        onCloseMenuSeries={handleCloseMenuSeries}
+        onCloseOverflow={handleCloseOverflow}
         openVolume={openVolume}
         onSelectVolumeForMenu={handleSelectVolumeForMenu}
-        onRemoveVolumes={(volumes) => void removeVolumes(volumes)}
-        onShowShelf={(target) => {
-          setActiveSeriesUri(seriesKey(target));
-          setQuery('');
-        }}
-        onRemoveSeries={(target) => removeSeries(target)}
+        onRemoveVolumes={handleRemoveVolumes}
+        onShowShelf={handleShowShelf}
+        onRemoveSeries={handleRemoveSeries}
       />
     </View>
   );

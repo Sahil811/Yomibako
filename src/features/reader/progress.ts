@@ -5,6 +5,7 @@
 // Conan alone can exceed that, so reads migrate transparently to independent
 // entries with no practical collection-size limit.
 import { getItemAsync, setItemAsync } from '../../services/storage';
+import { loadProgressIndex, saveProgressIndex, mergeIndexWithFallback } from '../../services/progressIndex';
 
 const LEGACY_KEY = 'yomibako_reader_positions';
 const ENTRY_PREFIX = 'yomibako_reader_position.';
@@ -16,6 +17,8 @@ let legacyCache: Blob | null = null;
 const entryCache = new Map<string, Entry | null>();
 const dirty = new Set<string>();
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
+let indexCache: Blob | null = null;
+let indexLoaded = false;
 
 // Stable, short id for a volume URI (content:// URIs are long and unstable to slice).
 export function volumeKey(uri: string): string {
@@ -91,6 +94,73 @@ export async function flush(): Promise<void> {
       dirty.delete(key);
     } catch {}
   }
+  // Keep the consolidated index fresh as a rebuildable cache (single write).
+  // Per-key entries above stay authoritative; a torn index write loses nothing.
+  if (keys.length && indexLoaded && indexCache) {
+    try {
+      for (const key of keys) {
+        const entry = entryCache.get(key);
+        if (entry) indexCache[key] = entry;
+      }
+      await saveProgressIndex(indexCache);
+    } catch {}
+  }
+}
+
+/**
+ * Bulk hydration for library shelf — F1. Single index read instead of 100+
+ * per-volume SecureStore round-trips. Misses fall back to per-key reads and
+ * rebuild the index in the background (no data loss on partial blob).
+ */
+export async function getBulkReading(
+  uris: string[]
+): Promise<Map<string, { page: number; total?: number; updatedAt: number } | null>> {
+  const out = new Map<string, { page: number; total?: number; updatedAt: number } | null>();
+  if (!uris.length) return out;
+  if (!indexLoaded) {
+    try {
+      indexCache = await loadProgressIndex();
+    } catch {
+      indexCache = {};
+    }
+    indexLoaded = true;
+  }
+  const index = indexCache ?? {};
+  const missing: string[] = [];
+  const keyFor = new Map<string, string>();
+  for (const uri of uris) {
+    const key = volumeKey(uri);
+    keyFor.set(uri, key);
+    const cached = entryCache.get(key);
+    if (cached !== undefined) {
+      out.set(uri, cached ? { page: cached.p, total: cached.n, updatedAt: cached.t } : null);
+      continue;
+    }
+    const indexed = index[key];
+    if (indexed && typeof indexed.p === 'number') {
+      entryCache.set(key, indexed);
+      out.set(uri, { page: indexed.p, total: indexed.n, updatedAt: indexed.t });
+    } else {
+      missing.push(uri);
+    }
+  }
+  if (missing.length) {
+    // Fallback path: per-key reads only for misses, then rebuild index.
+    const fallback: Record<string, Entry | null> = {};
+    for (const uri of missing) {
+      const entry = await readEntry(uri);
+      const key = keyFor.get(uri) ?? volumeKey(uri);
+      fallback[key] = entry;
+      out.set(uri, entry ? { page: entry.p, total: entry.n, updatedAt: entry.t } : null);
+    }
+    try {
+      const merged = mergeIndexWithFallback(index, fallback);
+      indexCache = merged;
+      // Best-effort rebuild, held automatically while storage is corrupt.
+      void saveProgressIndex(merged);
+    } catch {}
+  }
+  return out;
 }
 
 /** Test-only: clear in-memory caches and timers. */
@@ -98,6 +168,8 @@ export function __resetProgressForTests() {
   legacyCache = null;
   entryCache.clear();
   dirty.clear();
+  indexCache = null;
+  indexLoaded = false;
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;

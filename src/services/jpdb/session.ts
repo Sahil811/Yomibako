@@ -20,6 +20,7 @@ type PendingJob = {
   reject: (err: Error) => void;
   parts: string[];
   total: number;
+  received: number;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -98,7 +99,13 @@ async function loadCachedStatus() {
   } catch {}
 }
 
-void loadCachedStatus();
+let cachedStatusLoaded = false;
+
+export async function ensureSessionStatusLoaded(): Promise<void> {
+  if (cachedStatusLoaded) return;
+  cachedStatusLoaded = true;
+  await loadCachedStatus();
+}
 
 function setStatus(s: SessionStatus) {
   status = s;
@@ -134,6 +141,26 @@ export function getSessionStatusTime(): string {
   return statusTime;
 }
 
+/** Cancel an in-flight sessionFetch job (F6). No-op for unknown ids. */
+export function cancelSessionJob(id: string): boolean {
+  const job = pending.get(id);
+  if (!job) return false;
+  pending.delete(id);
+  try {
+    clearTimeout(job.timer);
+  } catch {}
+  lastJobError = 'cancelled';
+  try {
+    job.reject(new Error('JPDB request cancelled'));
+  } catch {}
+  return true;
+}
+
+/** Cancel all in-flight jobs — used on unmount/background. */
+export function cancelAllSessionJobs(): void {
+  for (const id of [...pending.keys()]) cancelSessionJob(id);
+}
+
 /** Test-only: number of in-flight jobs. */
 export function __pendingSessionJobsForTests(): number {
   return pending.size;
@@ -147,6 +174,7 @@ export function __resetSessionForTests() {
   statusTime = '';
   jobsRun = 0;
   jobsOk = 0;
+  cachedStatusLoaded = false;
   lastJobError = '';
   for (const [, job] of pending) {
     try { clearTimeout(job.timer); } catch {}
@@ -201,6 +229,7 @@ export async function sessionFetch(url: string, init: SessionFetchInit = {}): Pr
       reject: (err) => { clearTimeout(timer); lastJobError = String(err?.message ?? err).slice(0, 160); reject(err); },
       parts: [],
       total: -1,
+      received: 0,
       timer,
     });
     try {
@@ -226,6 +255,7 @@ function handleSessionMetaMessage(msg: any): void {
   if (!p || typeof msg.chunks !== 'number') return;
   p.total = msg.chunks;
   p.parts = new Array(msg.chunks);
+  p.received = 0;
   if (msg.chunks === 0) {
     pending.delete(msg.id);
     clearTimeout(p.timer);
@@ -236,9 +266,9 @@ function handleSessionMetaMessage(msg: any): void {
 function handleSessionChunkMessage(msg: any): void {
   const p = pending.get(msg.id);
   if (!p || typeof msg.i !== 'number' || typeof msg.part !== 'string') return;
+  if (p.parts[msg.i] === undefined) p.received += 1;
   p.parts[msg.i] = msg.part;
-  const got = p.parts.filter((x) => x !== undefined).length;
-  if (p.total < 0 || got < p.total) return;
+  if (p.total < 0 || p.received < p.total) return;
   pending.delete(msg.id);
   clearTimeout(p.timer);
   p.resolve(p.parts.join(''));

@@ -150,11 +150,12 @@ test('cached login status hydrates on load', async () => {
   (SecureStore as any).__seedSecureStore({
     yomibako_jpdb_session: JSON.stringify({ status: 'in', time: 't0' }),
   });
-  // Re-require a fresh copy of the module so top-level loadCachedStatus runs.
+  // Re-require a fresh copy of the module, then explicitly load cached status
+  // (F3: no longer at module eval — off the cold-start path).
   const path = require.resolve('../session');
   delete require.cache[path];
   const fresh = require('../session');
-  await new Promise((r) => setTimeout(r, 20));
+  await fresh.ensureSessionStatusLoaded();
   assert.equal(fresh.getSessionStatus(), 'in');
   assert.equal(fresh.getSessionStatusTime(), 't0');
   // Restore the original module instance for the remaining tests.
@@ -164,8 +165,8 @@ test('cached login status hydrates on load', async () => {
   // Corrupt cache never throws.
   (SecureStore as any).__seedSecureStore({ yomibako_jpdb_session: '{bad' });
   delete require.cache[path];
-  require('../session');
-  await new Promise((r) => setTimeout(r, 20));
+  const corruptMod = require('../session');
+  await corruptMod.ensureSessionStatusLoaded();
   delete require.cache[path];
   require('../session');
   __resetSessionForTests();

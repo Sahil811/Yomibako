@@ -31,38 +31,119 @@ const FREE_SPACE_FLOOR = 1024 * 1024 * 1024;
 /** Below this much free space opening a volume fails rather than half-copying. */
 const MIN_FREE_BYTES = 256 * 1024 * 1024;
 
-type CacheManifest = Record<string, { lastOpened: number }>;
+type CacheManifestEntry = { lastOpened: number; bytes?: number; complete?: boolean; fileCount?: number };
+type CacheManifest = Record<string, CacheManifestEntry>;
 
 export function volumeCacheKey(safeSeries: string, safeVolume: string) {
   return `${safeSeries}/${safeVolume}`;
 }
 
-function readManifest(): CacheManifest {
+// In-memory manifest (F2): readManifest used textSync() twice per volume open
+// plus a sync write each time. Hoist to a module cache with debounced async
+// flush — 0 size-walks on the open path after the first load. The tiny index
+// JSON itself is re-read to validate the cache (cheap) so FS resets /
+// external edits can't leave stale completion markers behind.
+let manifestCache: CacheManifest | null = null;
+let manifestRawCache = '';
+let manifestFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let manifestDirty = false;
+
+function readManifestFileRaw(): { raw: string; parsed: CacheManifest } {
   try {
     const file = new File(cacheDir(), MANIFEST_NAME);
-    if (!file.exists) return {};
-    const parsed = JSON.parse(file.textSync());
-    return parsed && typeof parsed === 'object' ? (parsed as CacheManifest) : {};
+    if (!file.exists) return { raw: '', parsed: {} };
+    const raw = file.textSync();
+    try {
+      const parsed = JSON.parse(raw);
+      return { raw, parsed: parsed && typeof parsed === 'object' ? (parsed as CacheManifest) : {} };
+    } catch {
+      return { raw, parsed: {} };
+    }
   } catch {
-    return {};
+    return { raw: '', parsed: {} };
   }
 }
 
-function writeManifest(manifest: CacheManifest) {
+function getManifest(): CacheManifest {
+  // Unflushed writes win — don't re-read over them.
+  if (manifestDirty && manifestCache) return manifestCache;
+  const { raw, parsed } = readManifestFileRaw();
+  if (!manifestCache || raw !== manifestRawCache) {
+    manifestCache = parsed;
+    manifestRawCache = raw;
+  }
+  return manifestCache;
+}
+
+function readManifest(): CacheManifest {
+  return getManifest();
+}
+
+function scheduleManifestFlush(): void {
+  if (manifestFlushTimer) clearTimeout(manifestFlushTimer);
+  manifestFlushTimer = setTimeout(() => {
+    manifestFlushTimer = null;
+    flushManifest();
+  }, 800);
+}
+
+function flushManifest(): void {
+  if (manifestFlushTimer) {
+    clearTimeout(manifestFlushTimer);
+    manifestFlushTimer = null;
+  }
+  if (!manifestDirty || !manifestCache) return;
+  manifestDirty = false;
+  const snapshot = manifestCache;
   try {
     ensureDir(cacheDir());
     const file = new File(cacheDir(), MANIFEST_NAME);
     if (!file.exists) file.create({ intermediates: true });
-    file.write(JSON.stringify(manifest), { encoding: 'utf8' });
+    const raw = JSON.stringify(snapshot);
+    file.write(raw, { encoding: 'utf8' });
+    manifestRawCache = raw;
   } catch (e) {
     console.warn('cache manifest write', e);
   }
 }
 
+function writeManifest(manifest: CacheManifest) {
+  manifestCache = manifest;
+  manifestDirty = true;
+  scheduleManifestFlush();
+}
+
 function touchVolumeCache(key: string) {
-  const manifest = readManifest();
-  manifest[key] = { lastOpened: Date.now() };
-  writeManifest(manifest);
+  const manifest = getManifest();
+  const prev = manifest[key];
+  manifest[key] = { ...prev, lastOpened: Date.now() };
+  manifestDirty = true;
+  scheduleManifestFlush();
+}
+
+/** Record copy completion (bytes + count) so probe.exists isn't the truth. */
+function markVolumeComplete(key: string, bytes: number, fileCount: number): void {
+  const manifest = getManifest();
+  const prev = manifest[key];
+  manifest[key] = { ...prev, lastOpened: Date.now(), bytes, complete: true, fileCount };
+  manifestDirty = true;
+  scheduleManifestFlush();
+}
+
+/** Test-only: flush manifest synchronously. */
+export function __flushCacheManifestForTests(): void {
+  flushManifest();
+}
+
+/** Test-only: reset in-memory manifest. */
+export function __resetCacheManifestForTests(): void {
+  if (manifestFlushTimer) {
+    clearTimeout(manifestFlushTimer);
+    manifestFlushTimer = null;
+  }
+  manifestCache = null;
+  manifestRawCache = '';
+  manifestDirty = false;
 }
 
 function directoryBytes(dir: Directory): number {
@@ -108,10 +189,14 @@ function listCachedVolumes(manifest: CacheManifest): CachedVolume[] {
     for (const entry of entries) {
       if (!(entry instanceof Directory)) continue;
       const key = volumeCacheKey(seriesDir.name, entry.name);
+      // F2: prefer manifest bytes recorded at copy time (no walk). Fall back
+      // to a walk only for pre-manifest volumes with no recorded size —
+      // cacheUsage() (Settings, off hot path) always walks.
+      const recorded = manifest[key]?.bytes;
       out.push({
         key,
         dir: entry,
-        bytes: directoryBytes(entry),
+        bytes: typeof recorded === 'number' ? recorded : directoryBytes(entry),
         // Volumes cached before the manifest existed fall back to mtime.
         lastOpened: manifest[key]?.lastOpened ?? directoryTime(entry),
       });
@@ -223,11 +308,27 @@ function isContentVolume(htmlUri: string, uri: string): boolean {
   return htmlUri.startsWith('content://') || uri.startsWith('content://');
 }
 
-async function copyVolumeImages(volumeUri: string, cacheVolumeDir: Directory, onProgress?: (done: number, total: number) => void) {
-  const probe = new File(cacheVolumeDir, 'page0001.jpeg');
-  if (probe.exists) {
-    onProgress?.(1, 1);
-    return;
+async function copyVolumeImages(
+  volumeUri: string,
+  cacheVolumeDir: Directory,
+  onProgress?: (done: number, total: number) => void,
+  cacheKey?: string
+) {
+  // F2: probe.exists(page0001.jpeg) is not a completeness check — volumes
+  // whose first page has a different name re-list every open, and interrupted
+  // copies stay half-populated forever. Manifest completion marker is truth.
+  if (cacheKey) {
+    const marked = getManifest()[cacheKey];
+    if (marked?.complete) {
+      onProgress?.(1, 1);
+      return;
+    }
+  } else {
+    const probe = new File(cacheVolumeDir, 'page0001.jpeg');
+    if (probe.exists) {
+      onProgress?.(1, 1);
+      return;
+    }
   }
   const all = new Directory(volumeUri).list();
   const imgs = all.filter(
@@ -235,10 +336,18 @@ async function copyVolumeImages(volumeUri: string, cacheVolumeDir: Directory, on
   );
   let done = 0;
   onProgress?.(0, imgs.length);
+  // Serial is correct here (F-plan Blocking #1): same ContentResolver +
+  // disk path, WebView decoding concurrently. Parallel workers raise peak
+  // memory + IOPS and corrupt the done/total progress callback.
   for (const entry of imgs) {
     await copySingleImage(entry, cacheVolumeDir);
     done++;
     if (done % 10 === 0 || done === imgs.length) onProgress?.(done, imgs.length);
+  }
+  if (cacheKey) {
+    // Estimate bytes from count (exact sizes need a walk — off-path only).
+    // fileCount is the invalidation signal; bytes refines eviction ordering.
+    markVolumeComplete(cacheKey, imgs.length * 300 * 1024, imgs.length);
   }
 }
 
@@ -305,7 +414,7 @@ export async function prepareVolumeForWebView(
 
   // Copy images for this volume (lazy, only if not cached)
   try {
-    await copyVolumeImages(volume.uri, cacheVolumeDir, onProgress);
+    await copyVolumeImages(volume.uri, cacheVolumeDir, onProgress, volumeCacheKey(safeSeries, safeVolume));
   } catch (e) {
     console.warn('copy images', e);
   }
@@ -403,6 +512,11 @@ export function clearPageCache() {
         console.warn('clear page cache', seriesDir.name, e);
       }
     }
+    // Reset in-memory manifest so the next open doesn't resurrect stale
+    // completion markers.
+    manifestCache = {};
+    manifestDirty = true;
+    scheduleManifestFlush();
     const manifest = new File(root, MANIFEST_NAME);
     if (manifest.exists) manifest.delete();
   } catch (e) {

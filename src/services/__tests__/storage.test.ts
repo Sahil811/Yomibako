@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
-import { getItemAsync, setItemAsync, deleteItemAsync } from '../storage';
+import { getItemAsync, setItemAsync, deleteItemAsync, getStorageHealth, isStorageCorrupt, __resetStorageForTests, __setStorageCorruptForTests } from '../storage';
 
 test('native path delegates to SecureStore', async () => {
   (Platform as any).OS = 'android';
@@ -87,4 +87,29 @@ test('throwing localStorage and SecureStore are swallowed', async () => {
   (SecureStore as any).setItemAsync = oSet;
   (SecureStore as any).deleteItemAsync = oDel;
   delete (globalThis as any).localStorage;
+});
+
+test('corrupt detector trips after consecutive read failures and holds writes', async () => {
+  (Platform as any).OS = 'android';
+  __resetStorageForTests();
+  const origGet = (SecureStore as any).getItemAsync;
+  (SecureStore as any).getItemAsync = async () => { throw new Error('keystore lost'); };
+  assert.equal(await getItemAsync('k'), null);
+  assert.equal(isStorageCorrupt(), false);
+  assert.equal(await getItemAsync('k'), null);
+  assert.equal(isStorageCorrupt(), true);
+  assert.equal(getStorageHealth().status, 'corrupt');
+  // Writes held while corrupt.
+  (SecureStore as any).__resetSecureStore();
+  await setItemAsync('held', 'v');
+  (SecureStore as any).getItemAsync = origGet;
+  assert.equal(await getItemAsync('held'), null);
+  __resetStorageForTests();
+  // After reset the write path works again.
+  await setItemAsync('held2', 'v2');
+  assert.equal(await getItemAsync('held2'), 'v2');
+  (SecureStore as any).getItemAsync = origGet;
+  __setStorageCorruptForTests(false);
+  __resetStorageForTests();
+  assert.equal(getStorageHealth().status, 'unknown');
 });

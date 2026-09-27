@@ -1,7 +1,7 @@
 // SecureStore backed config for jpdb — mirrors jpd-breader 13.0 background/config.js
 // Full parity minus Anki (no anki export). Supports all 25 keys of jpd-breader 13.0.
 // Web-safe via services/storage (localStorage fallback).
-import { getItemAsync, setItemAsync, deleteItemAsync } from '../storage';
+import { getItemAsync, setItemAsync } from '../storage';
 import { POPUP_THEME_IDS, type PopupThemeId } from '../../theme/popupThemes';
 
 export const CURRENT_SCHEMA_VERSION = 5;
@@ -239,20 +239,11 @@ export async function saveConfig(newConfig: YomibakoConfig): Promise<void> {
     // Publish before awaiting storage. A newer staged edit must not be rolled
     // back when this older write eventually completes.
     configCache = { ...newConfig };
+    // Single consolidated write (F1). Legacy mirror keys (jpdb_token + 4 deck
+    // ids, 6 sequential SecureStore ops) are dead — schema is v5 and every
+    // migration is complete. loadLegacyIntoConfig still reads them once for
+    // pre-parity installs, but we no longer write them back.
     await setItemAsync(CONFIG_JSON_KEY, JSON.stringify(newConfig));
-    // also mirror legacy keys for api token + decks so older code still works
-    if (newConfig.apiToken) await setItemAsync(LEGACY_KEYS.token, String(newConfig.apiToken));
-    else await deleteItemAsync(LEGACY_KEYS.token);
-    for (const [k, legacyKey] of [
-      ['miningDeckId', LEGACY_KEYS.miningDeckId],
-      ['blacklistDeckId', LEGACY_KEYS.blacklistDeckId],
-      ['neverForgetDeckId', LEGACY_KEYS.neverForgetDeckId],
-      ['forqDeckId', LEGACY_KEYS.forqDeckId],
-    ] as const) {
-      const v = (newConfig as any)[k];
-      if (v == null || v === '') await deleteItemAsync(legacyKey);
-      else await setItemAsync(legacyKey, String(v));
-    }
   } catch (e) {
     console.warn('[config] save failed', e);
   }
@@ -342,5 +333,21 @@ export async function importConfigJson(json: string): Promise<void> {
   const parsed = JSON.parse(json);
   migrateSchema(parsed);
   const cfg = { ...defaultConfig, ...parsed } as YomibakoConfig;
+  // F8: custom CSS flows into WebView injectJavaScript holding the jpdb.io
+  // cookie jar. Cap + neutralize style-breakout so a pasted config can't
+  // break out of the injected <style> context. Self-inflicted, low severity.
+  cfg.customWordCSS = sanitizeImportedCss(cfg.customWordCSS);
+  cfg.customPopupCSS = sanitizeImportedCss(cfg.customPopupCSS);
   await saveConfig(cfg);
+}
+
+function sanitizeImportedCss(raw: unknown): string {
+  if (typeof raw !== 'string' || !raw) return '';
+  // 20KB is ample for popup/word tweaks; larger blobs are almost certainly
+  // pasted page HTML, not CSS.
+  let out = raw.slice(0, 20000);
+  // Neutralize style-tag breakout; JSON.stringify already escapes quotes for
+  // the inject path, this closes the </style><script> vector.
+  out = out.replace(/<\/style/gi, '<\\/style').replace(/<script/gi, '<\\script');
+  return out;
 }

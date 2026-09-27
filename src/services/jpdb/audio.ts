@@ -20,6 +20,9 @@ const audioHashCache = new Map<string, string | null>(); // vid:spelling -> hash
 let currentPlayer: AudioPlayer | null = null;
 let currentPlayerSubscription: { remove: () => void } | null = null;
 let currentRemoteFinished: ((reason: RemoteAudioFinishReason) => void) | null = null;
+// F6: dangling 4s load-check timer fired after release. Tracked so release
+// clears it.
+let loadCheckTimer: ReturnType<typeof setTimeout> | null = null;
 let lastError = '';
 let audioModeReady = false;
 let playbackGeneration = 0;
@@ -31,6 +34,12 @@ function releaseCurrentPlayer(reason: RemoteAudioFinishReason = 'stopped') {
   currentRemoteFinished = null;
   try { currentPlayerSubscription?.remove(); } catch {}
   currentPlayerSubscription = null;
+  if (loadCheckTimer) {
+    try {
+      clearTimeout(loadCheckTimer);
+    } catch {}
+    loadCheckTimer = null;
+  }
   if (currentPlayer) {
     try { currentPlayer.remove(); } catch {}
   }
@@ -201,7 +210,13 @@ function monitorPlaybackLoad(player: AudioPlayer, generation: number) {
     } else if (status.didJustFinish) releaseCurrentPlayer('ended');
   });
   currentPlayerSubscription = sub;
-  setTimeout(() => {
+  if (loadCheckTimer) {
+    try {
+      clearTimeout(loadCheckTimer);
+    } catch {}
+  }
+  loadCheckTimer = setTimeout(() => {
+    loadCheckTimer = null;
     try {
       if (isCurrentRequest(generation) && currentPlayer === player && !player.isLoaded) {
         lastError = 'Decoder could not load the recording';
@@ -304,6 +319,12 @@ export function __resetAudioForTests() {
   currentPlayer = null;
   currentPlayerSubscription = null;
   currentRemoteFinished = null;
+  if (loadCheckTimer) {
+    try {
+      clearTimeout(loadCheckTimer);
+    } catch {}
+    loadCheckTimer = null;
+  }
   lastError = '';
   audioModeReady = false;
   playbackGeneration = 0;

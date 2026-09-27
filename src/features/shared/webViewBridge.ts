@@ -45,6 +45,9 @@ export function parseBridgeCustomization(cfgRaw: string | null | undefined): Par
 
 /** Read the customization keys from storage and parse them. */
 export async function readBridgeCustomization(): Promise<ParsedBridgeConfig> {
+  // bridgeReady fires once per volume — correctness (seeing the latest saved
+  // Settings) beats saving one SecureStore read here. The hot parse path
+  // already uses cached loadConfig via getToken/resolveParseApiToken.
   return parseBridgeCustomization(await getItemAsync('yomibako_config_json'));
 }
 

@@ -1,16 +1,19 @@
-import React from 'react';
+import React, { Suspense } from 'react';
 import { NavigationContainer, DefaultTheme, DarkTheme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { useColorScheme, Text, View, Pressable, StyleSheet, Platform } from 'react-native';
+import { useColorScheme, Text, View, Pressable, StyleSheet, Platform, ActivityIndicator } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import Animated, { useSharedValue, useAnimatedStyle, withSpring } from 'react-native-reanimated';
+// F3: screen-level lazy splits the cold-start require graph. Library stays
+// eager (startup tab); Reader/Browser/Settings pull yomibakoBundle,
+// browserBundle, WordSheet, QuizModal, kanjiData + expo-audio only on demand.
 import LibraryScreen from '../features/library/LibraryScreen';
-import ReaderScreen from '../features/reader/ReaderScreen';
-import SettingsScreen from '../features/library/SettingsScreen';
-import BrowserScreen from '../features/browser/BrowserScreen';
+const ReaderScreen = React.lazy(() => import('../features/reader/ReaderScreen'));
+const SettingsScreen = React.lazy(() => import('../features/library/SettingsScreen'));
+const BrowserScreen = React.lazy(() => import('../features/browser/BrowserScreen'));
 import { lightColors, darkColors } from '../theme/colors';
 import { Icon, type IconName } from '../components/ui/Icon';
 import ErrorBoundary from '../components/system/ErrorBoundary';
@@ -64,20 +67,30 @@ const TabButton = React.memo(function TabButton({ isFocused, colors, onPress, la
 });
 
 const lastTabNav: Record<string, number> = {};
+const tabNavigating: Record<string, boolean> = {};
 function TabBarTab({ route, isFocused, colors, navigation }: any) {
   const meta = TAB_META[route.name] ?? { label: route.name, icon: 'book' as IconName };
   const onPress = React.useCallback(() => {
-    // Queued taps during a freeze can fire back-to-back. One navigation
-    // per 1.5s per tab — extras are duplicates.
+    // F6: wall-clock 1.5s debounce swallowed the retry tap a freeze provokes.
+    // Now: ignore only while a navigation is still in flight; focus clears it
+    // via navigation listener side-effect below. Fallback timestamp guards
+    // the case where focus never fires.
+    if (tabNavigating[route.name]) {
+      return;
+    }
     const nowTap = Date.now();
-    if (nowTap - (lastTabNav[route.name] ?? 0) < 1500) {
+    if (nowTap - (lastTabNav[route.name] ?? 0) < 400) {
       return;
     }
     lastTabNav[route.name] = nowTap;
     const e = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
     if (!isFocused && !e.defaultPrevented) {
+      tabNavigating[route.name] = true;
       Haptics.selectionAsync();
       navigation.navigate(route.name);
+      setTimeout(() => {
+        tabNavigating[route.name] = false;
+      }, 800);
     } else if (isFocused) {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     }
@@ -134,13 +147,35 @@ function TabsWrapperRenderTabBar(props: any) {
   return <TabBar {...props} />;
 }
 
+function ScreenFallback() {
+  return (
+    <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
+      <ActivityIndicator />
+    </View>
+  );
+}
+
+function lazyScreen(Component: React.ComponentType<any>) {
+  return function LazyScreen(props: any) {
+    return (
+      <Suspense fallback={<ScreenFallback />}>
+        <Component {...props} />
+      </Suspense>
+    );
+  };
+}
+
+const LazyReader = lazyScreen(ReaderScreen);
+const LazyBrowser = lazyScreen(BrowserScreen);
+const LazySettings = lazyScreen(SettingsScreen);
+
 function TabsWrapper() {
   return (
     <View style={{ flex: 1 }}>
       <Tab.Navigator tabBar={TabsWrapperRenderTabBar} screenOptions={{ headerShown: false, tabBarHideOnKeyboard: true, lazy: true }}>
         <Tab.Screen name="Library" component={LibraryScreen} />
-        <Tab.Screen name="Browser" component={BrowserScreen} />
-        <Tab.Screen name="Settings" component={SettingsScreen} />
+        <Tab.Screen name="Browser" component={LazyBrowser} />
+        <Tab.Screen name="Settings" component={LazySettings} />
       </Tab.Navigator>
     </View>
   );
@@ -152,7 +187,9 @@ function TabsWrapper() {
 function GuardedReader(props: any) {
   return (
     <ErrorBoundary label="Reader" resetLabel="Back to library" onReset={() => props.navigation.goBack()}>
-      <ReaderScreen {...props} />
+      <Suspense fallback={<ScreenFallback />}>
+        <LazyReader {...props} />
+      </Suspense>
     </ErrorBoundary>
   );
 }
