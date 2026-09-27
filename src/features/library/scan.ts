@@ -114,6 +114,12 @@ async function yieldCooperatively(control?: ScanControl): Promise<boolean> {
   return !control?.isCancelled?.();
 }
 
+async function shouldContinueWalk(control?: ScanControl): Promise<boolean> {
+  if (control?.isCancelled?.()) return false;
+  if (control?.waitWhilePaused) await control.waitWhilePaused();
+  return !control?.isCancelled?.();
+}
+
 // Phase 1 (instant, 1 SAF call already done): shells from names only.
 // pageCount 0 + no cover until fillDetails runs. Non-volume dirs get
 // filtered in phase 2 — a couple of extras may flash briefly.
@@ -248,9 +254,7 @@ async function fillDetails(
   let n = 0;
   const totalDirs = shells.length;
   for (const shell of shells) {
-    if (control?.isCancelled?.()) break;
-    if (control?.waitWhilePaused) await control.waitWhilePaused();
-    if (control?.isCancelled?.()) break;
+    if (!(await shouldContinueWalk(control))) break;
     const dir = byUri.get(shell.uri);
     if (!dir) {
       n++;
@@ -374,6 +378,34 @@ function isDirectVolumeFolder(top: Level, dir: Directory): boolean {
   return readableAtLevel(top, dir.name) || isVolumeName(dir.name);
 }
 
+function routeShelfDir(
+  top: Level,
+  dir: Directory,
+  shape: FolderShape,
+  seriesFolders: Directory[],
+  directVolumeFolders: Directory[]
+): void {
+  if (shape === 'series') {
+    seriesFolders.push(dir);
+    return;
+  }
+  if (shape === 'volume' || isDirectVolumeFolder(top, dir)) {
+    directVolumeFolders.push(dir);
+  }
+}
+
+async function maybeReportShelfProgress(
+  index: number,
+  totalDirs: number,
+  rootName: string,
+  onProgress?: (seriesName: string, done: number, totalDirs: number) => void,
+  control?: ScanControl
+): Promise<boolean> {
+  if ((index + 1) % 4 !== 0) return true;
+  onProgress?.(rootName, index + 1, totalDirs);
+  return yieldCooperatively(control);
+}
+
 async function partitionShelfDirs(
   top: Level,
   rootName: string,
@@ -383,24 +415,15 @@ async function partitionShelfDirs(
   const seriesFolders: Directory[] = [];
   const directVolumeFolders: Directory[] = [];
   for (let index = 0; index < top.dirs.length; index++) {
-    if (control?.isCancelled?.()) break;
-    if (control?.waitWhilePaused) await control.waitWhilePaused();
-    if (control?.isCancelled?.()) break;
+    if (!(await shouldContinueWalk(control))) break;
     const dir = top.dirs[index];
     const shape = inspectFolder(dir, control);
     if (shape === 'unreadable') {
       // Listed but unlistable: keep stale shelf, do not prune.
       continue;
     }
-    if (shape === 'series') {
-      seriesFolders.push(dir);
-    } else if (shape === 'volume' || isDirectVolumeFolder(top, dir)) {
-      directVolumeFolders.push(dir);
-    }
-    if ((index + 1) % 4 === 0) {
-      onProgress?.(rootName, index + 1, top.dirs.length);
-      if (!(await yieldCooperatively(control))) break;
-    }
+    routeShelfDir(top, dir, shape, seriesFolders, directVolumeFolders);
+    if (!(await maybeReportShelfProgress(index, top.dirs.length, rootName, onProgress, control))) break;
   }
   return { seriesFolders, directVolumeFolders };
 }

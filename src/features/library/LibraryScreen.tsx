@@ -932,6 +932,84 @@ async function finishPickedScan(found: Series[], deps: PickFolderDeps, complete 
   await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 }
 
+async function shouldContinueRescan(
+  refs: ScanRefs,
+  control: import('./scan').ScanControl
+): Promise<boolean> {
+  if (refs.goneRef.current) return false;
+  if (control.waitWhilePaused) await control.waitWhilePaused();
+  return !refs.goneRef.current;
+}
+
+function accumulateRescanKeys(
+  hydrated: Series[],
+  uri: string,
+  liveKeys: Set<string>,
+  walkedSources: Set<string>
+): void {
+  walkedSources.add(uri);
+  for (const s of hydrated) {
+    liveKeys.add(seriesKey(s));
+    if (s.sourceRootUri) walkedSources.add(s.sourceRootUri);
+  }
+}
+
+async function collectRescanKeys(
+  roots: string[],
+  refs: ScanRefs,
+  control: import('./scan').ScanControl,
+  setScanProgress: (v: string) => void,
+  setLoading: (v: boolean) => void,
+  absorb: AbsorbFn
+): Promise<{ liveKeys: Set<string>; walkedSources: Set<string> }> {
+  const liveKeys = new Set<string>();
+  const walkedSources = new Set<string>();
+  for (const uri of roots) {
+    if (!(await shouldContinueRescan(refs, control))) break;
+    const hydrated = await scanOneRoot(uri, refs, setScanProgress, setLoading, absorb);
+    // null = failed/cancelled/incomplete: keep stale shelf, do not prune.
+    // [] with complete walk = genuinely empty: prune series from this source.
+    // scanOneRoot returns null for incomplete walks (markIncomplete) so an
+    // unreadable root (iOS grant expired, SD unmounted) never wipes the shelf.
+    if (hydrated !== null) {
+      accumulateRescanKeys(hydrated, uri, liveKeys, walkedSources);
+    }
+  }
+  return { liveKeys, walkedSources };
+}
+
+function commitRescanPrune(
+  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>,
+  liveKeys: Set<string>,
+  walkedSources: Set<string>,
+  refs: ScanRefs
+): Series[] | null {
+  // Drop series whose source was completely walked but whose root no longer
+  // exists. This is the only place a whole series may disappear (patch never
+  // removes). Capture the committed value inside the updater — setTimeout(0)
+  // is not a React commit barrier and would persist pre-prune state.
+  if (!walkedSources.size || refs.goneRef.current) return null;
+  let committed: Series[] | null = null;
+  setLibrary((current) => {
+    committed = pruneMissingSeries(current, liveKeys, walkedSources);
+    return committed;
+  });
+  return committed;
+}
+
+function persistRescanSnapshot(
+  committed: Series[] | null,
+  refs: ScanRefs,
+  roots: string[]
+): void {
+  // Snapshot the finished scan so the next cold start paints instantly.
+  // saveLibraryIndex early-returns on empty, so a total wipe is never baked
+  // in; a partial prune is, using the exact committed array above.
+  if (refs.goneRef.current) return;
+  const toSave = committed ?? refs.libraryRef.current;
+  if (toSave.length) saveLibraryIndex(toSave, roots);
+}
+
 async function rescanAllRoots(
   refs: ScanRefs & { scanningRef: React.RefObject<boolean> },
   setLoading: (v: boolean) => void,
@@ -947,45 +1025,16 @@ async function rescanAllRoots(
   try {
     const roots = await getRoots().catch(() => [] as string[]);
     const control = scanControlFromRefs(refs);
-    const liveKeys = new Set<string>();
-    const walkedSources = new Set<string>();
-    for (const uri of roots) {
-      if (refs.goneRef.current) {
-        break;
-      }
-      if (control.waitWhilePaused) await control.waitWhilePaused();
-      if (refs.goneRef.current) break;
-      const hydrated = await scanOneRoot(uri, refs, setScanProgress, setLoading, absorb);
-      // null = failed/cancelled/incomplete: keep stale shelf, do not prune.
-      // [] with complete walk = genuinely empty: prune series from this source.
-      // scanOneRoot returns null for incomplete walks (markIncomplete) so an
-      // unreadable root (iOS grant expired, SD unmounted) never wipes the shelf.
-      if (hydrated !== null) {
-        walkedSources.add(uri);
-        for (const s of hydrated) {
-          liveKeys.add(seriesKey(s));
-          if (s.sourceRootUri) walkedSources.add(s.sourceRootUri);
-        }
-      }
-    }
-    // Drop series whose source was completely walked but whose root no longer
-    // exists. This is the only place a whole series may disappear (patch never
-    // removes). Capture the committed value inside the updater — setTimeout(0)
-    // is not a React commit barrier and would persist pre-prune state.
-    let committed: Series[] | null = null;
-    if (walkedSources.size && !refs.goneRef.current) {
-      setLibrary((current) => {
-        committed = pruneMissingSeries(current, liveKeys, walkedSources);
-        return committed;
-      });
-    }
-    // Snapshot the finished scan so the next cold start paints instantly.
-    // saveLibraryIndex early-returns on empty, so a total wipe is never baked
-    // in; a partial prune is, using the exact committed array above.
-    if (!refs.goneRef.current) {
-      const toSave = committed ?? refs.libraryRef.current;
-      if (toSave.length) saveLibraryIndex(toSave, roots);
-    }
+    const { liveKeys, walkedSources } = await collectRescanKeys(
+      roots,
+      refs,
+      control,
+      setScanProgress,
+      setLoading,
+      absorb
+    );
+    const committed = commitRescanPrune(setLibrary, liveKeys, walkedSources, refs);
+    persistRescanSnapshot(committed, refs, roots);
   } finally {
     refs.scanningRef.current = false;
     setLoading(false);
