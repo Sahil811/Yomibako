@@ -10,6 +10,8 @@ export type ReaderPreferences = {
   twoPage: boolean;
   /** Left-to-right page order — the base default. Toggle to RTL for manga. */
   rtl: boolean;
+  /** Follows system reduced-motion; bundle reads it for slide vs instant turns. */
+  reduceMotion?: boolean;
 };
 
 const KEY = 'yomibako_reader_prefs_v1';
@@ -30,6 +32,7 @@ function normalize(raw: any): ReaderPreferences {
     zoomMode: zoom === 'width' || zoom === 'original' ? zoom : 'screen',
     twoPage: raw?.twoPage === true,
     rtl: raw?.rtl === true,
+    reduceMotion: raw?.reduceMotion === true ? true : undefined,
   };
 }
 
@@ -84,4 +87,43 @@ export function __resetPreferencesForTests() {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
+}
+
+// Per-volume layout opt-in (P5): rtl/twoPage chosen inside a volume must not
+// clobber the global singleton on unmount. New key, global fallback on first
+// open. Keys are hashed (SecureStore allows [a-zA-Z0-9._-]).
+const LAYOUT_PREFIX = 'yomibako_reader_layout_v1_';
+
+function hashUri(uri: string): string {
+  let h = 5381;
+  for (let i = 0; i < uri.length; i++) h = Math.trunc((h * 33 + (uri.codePointAt(i) ?? 0)) % 4294967296);
+  return h.toString(16);
+}
+
+export function volumeLayoutKey(progressUri: string): string {
+  return `${LAYOUT_PREFIX}${hashUri(progressUri)}`;
+}
+
+export type VolumeLayout = { rtl?: boolean; twoPage?: boolean };
+
+export async function loadVolumeLayout(progressUri: string): Promise<VolumeLayout | null> {
+  try {
+    const raw = await getItemAsync(volumeLayoutKey(progressUri));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const out: VolumeLayout = {};
+    if (typeof parsed.rtl === 'boolean') out.rtl = parsed.rtl;
+    if (typeof parsed.twoPage === 'boolean') out.twoPage = parsed.twoPage;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveVolumeLayout(progressUri: string, patch: VolumeLayout): Promise<void> {
+  try {
+    const prev = (await loadVolumeLayout(progressUri)) ?? {};
+    const next = { ...prev, ...patch };
+    await setItemAsync(volumeLayoutKey(progressUri), JSON.stringify(next));
+  } catch {}
 }

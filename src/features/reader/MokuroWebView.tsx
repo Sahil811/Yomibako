@@ -4,6 +4,7 @@ import { WebView, WebViewMessageEvent } from 'react-native-webview';
 import { Directory, File } from 'expo-file-system';
 import { prepareVolumeForWebView } from '../../services/fs/httpServer';
 import { getItemAsync, setItemAsync } from '../../services/storage';
+import { loadConfig, getConfig } from '../../services/jpdb/config';
 import { YOMIBAKO_BUNDLE_VERSION, YOMIBAKO_CSS, YOMIBAKO_JS } from './yomibakoBundle';
 import { jpdbApi } from '../../services/jpdb/api';
 import { Icon } from '../../components/ui/Icon';
@@ -39,6 +40,8 @@ type Props = {
   onProgress?: (p: number) => void;
   onPage?: (info: ReaderPageInfo) => void;
   onControl?: (info: ReaderControlInfo) => void;
+  /** Fired once after prefs applied + layout (decoded pages, not index>=0). */
+  onFirstPaint?: () => void;
   /** Reply to collectWords(): every parsed card the volume has produced. */
   onWords?: (words: any[]) => void;
   onOpenSettings?: () => void;
@@ -55,6 +58,7 @@ export type ReaderPageInfo = {
   twoPage: boolean;
   zoomMode?: ZoomMode;
   menuOpen: boolean;
+  wordCount?: number;
 };
 
 export type ReaderControlInfo = {
@@ -141,8 +145,41 @@ async function readCustomCss(): Promise<{ customWordCSS: string; customPopupCSS:
   return { customWordCSS, customPopupCSS, disableFade };
 }
 
+type DiagRef = {
+  current: {
+    guardedTextTaps: number;
+    pendingTaps: number;
+    deferredLookups: number;
+    tLookupMs: number;
+  };
+};
+
+// Extracted from handleWordMessages to keep its Cognitive Complexity within
+// budget: counts the tap and forwards unparsed-text taps (with point/rect) to
+// the reader for skeleton UI instead of 8s of silence.
+function handleTextGuardMessage(
+  msg: any,
+  diag: DiagRef,
+  onWordTap: ((data: any) => void) | undefined,
+  saveDiag: () => void,
+): void {
+  diag.current.guardedTextTaps++;
+  diag.current.pendingTaps++;
+  if (msg.pending) {
+    diag.current.deferredLookups++;
+  }
+  // Bundle may include tap-point timing for lookup latency (P0 instrument).
+  if (typeof msg.tLookupMs === 'number') {
+    diag.current.tLookupMs = msg.tLookupMs;
+  }
+  if (msg.pending && msg.point && onWordTap) {
+    onWordTap({ ...msg, pending: true, vid: -1, sid: -1 });
+  }
+  saveDiag();
+}
+
 function MokuroWebView(
-  { htmlUri, mokuroUri, volumeDir, title, series, initialPage, initialPreferences, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onProgress, onPage, onControl, onWords, onOpenSettings, onTapBackground, onViewReset }: Props,
+  { htmlUri, mokuroUri, volumeDir, title, series, initialPage, initialPreferences, onWordTap, onWordHover, onWordAnchor, onWordAnchorLost, onProgress, onPage, onControl, onFirstPaint, onWords, onOpenSettings, onTapBackground, onViewReset }: Props,
   ref: React.Ref<MokuroWebViewHandle>
 ) {
   const [html, setHtml] = useState<string | null>(null);
@@ -152,6 +189,8 @@ function MokuroWebView(
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [directFile, setDirectFile] = useState(false);
   const [rendererCrashed, setRendererCrashed] = useState(false);
+  const [safError, setSafError] = useState(false);
+  const imageFailCount = useRef(0);
   const lastWebViewSize = useRef({ width: 0, height: 0 });
   const webRef = useRef<WebView>(null);
   // basename (lowercased) -> real SAF document URI. SAF tree children are NOT
@@ -260,10 +299,14 @@ function MokuroWebView(
     parseReq: 0, parseOk: 0, parseErr: 0, lastErr: '',
     lookups: 0, taps: 0, guardedTextTaps: 0, deferredLookups: 0,
     applied: 0, applyErr: 0,
+    pendingTaps: 0, chunksSkipped: 0,
+    tLookupMs: 0, tFirstAppliedMs: 0, tCardMountMs: 0,
   });
   // Throttled diag persistence: taps/parse/progress fire many times per
-  // second and SecureStore is encrypted/slow. Coalesce to at most one write
-  // per 5s; unmount flushes the tail so diagnostics are never lost.
+  // second and SecureStore is encrypted/slow (10-50ms Android, serialized).
+  // Coalesce to at most one write per 15s; unmount flushes the tail so
+  // diagnostics are never lost. Hot paths must call saveDiag() freely —
+  // the throttle keeps it off the JS thread during reading.
   const diagTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const diagPending = useRef(false);
   const lastDiagWrite = useRef(0);
@@ -282,9 +325,9 @@ function MokuroWebView(
     } catch {}
   }, [title]);
   const saveDiag = useCallback(() => {
-    // First write (or >5s since last) goes out immediately so Diagnostics
+    // First write (or >15s since last) goes out immediately so Diagnostics
     // stays fresh; bursts within the window coalesce to one trailing write.
-    if (!diagPending.current && Date.now() - lastDiagWrite.current > 5000) {
+    if (!diagPending.current && Date.now() - lastDiagWrite.current > 15000) {
       void flushDiag();
       return;
     }
@@ -294,7 +337,7 @@ function MokuroWebView(
       diagTimer.current = null;
       diagPending.current = false;
       void flushDiag();
-    }, 5000);
+    }, 15000);
   }, [flushDiag]);
 
   React.useEffect(
@@ -305,7 +348,25 @@ function MokuroWebView(
     [flushDiag]
   );
 
+  const tokenRef = useRef<string | null>(null);
   const getToken = useCallback(async (): Promise<string | null> => {
+    // Fast path: cached config (no SecureStore round-trip). loadConfig is
+    // cached after first read; legacy jpdb_token key is fallback only.
+    // Previously every parse chunk did 1-2 SecureStore reads (10-50ms each
+    // on Android, serialized) — with MAX_INFLIGHT=3 that stalled the pipeline.
+    const cached = getConfig().apiToken;
+    if (cached) {
+      tokenRef.current = cached;
+      return cached;
+    }
+    if (tokenRef.current) return tokenRef.current;
+    try {
+      const cfg = await loadConfig();
+      if (cfg.apiToken) {
+        tokenRef.current = cfg.apiToken;
+        return cfg.apiToken;
+      }
+    } catch {}
     let token: string | null = await getItemAsync('jpdb_token');
     if (!token) {
       const raw = await getItemAsync('yomibako_config_json');
@@ -315,7 +376,8 @@ function MokuroWebView(
         } catch {}
       }
     }
-    return token || null;
+    tokenRef.current = token || null;
+    return tokenRef.current;
   }, []);
 
   const alertNoToken = useCallback(() => {
@@ -343,7 +405,10 @@ function MokuroWebView(
       parseReq: 0, parseOk: 0, parseErr: 0, lastErr: '',
       lookups: 0, taps: 0, guardedTextTaps: 0, deferredLookups: 0,
       applied: 0, applyErr: 0,
+      pendingTaps: 0, chunksSkipped: 0,
+      tLookupMs: 0, tFirstAppliedMs: 0, tCardMountMs: 0,
     };
+    tokenRef.current = null;
     retriesLeft.current = 4;
     tokenAlertShown.current = false;
     parseErrShown.current = false;
@@ -527,11 +592,7 @@ function MokuroWebView(
       return;
     }
     if (msg.type === 'textGuard') {
-      diag.current.guardedTextTaps++;
-      if (msg.pending) {
-        diag.current.deferredLookups++;
-      }
-      saveDiag();
+      handleTextGuardMessage(msg, diag, onWordTap, saveDiag);
       return;
     }
     if (msg.type === 'tap') {
@@ -552,6 +613,11 @@ function MokuroWebView(
   const handleStatusMessages = useCallback((msg: any) => {
     if (msg.type === 'applied') {
       diag.current.applied += Number(msg.spans ?? 0);
+      if (!diag.current.tFirstAppliedMs && typeof msg.tFirstAppliedMs === 'number') {
+        diag.current.tFirstAppliedMs = msg.tFirstAppliedMs;
+      }
+      // Per-bubble applied (P1 latency): bundle may report bubblesLive so
+      // the top bubble is lookup-able after the first reply.
       saveDiag();
       return;
     }
@@ -578,7 +644,12 @@ function MokuroWebView(
         twoPage: !!msg.twoPage,
         zoomMode: msg.zoomMode,
         menuOpen: !!msg.menuOpen,
+        wordCount: typeof msg.wordCount === 'number' ? msg.wordCount : undefined,
       });
+      return;
+    }
+    if (msg.type === 'firstPaint') {
+      onFirstPaint?.();
       return;
     }
     if (msg.type === 'control') {
@@ -593,7 +664,7 @@ function MokuroWebView(
     if (msg.type === 'layoutError') {
       console.warn('[MokuroWebView] layout failed', msg.error, msg.stack ?? '');
     }
-  }, [saveDiag, scheduleRetry, onProgress, onPage, onControl]);
+  }, [saveDiag, scheduleRetry, onProgress, onPage, onFirstPaint, onControl]);
 
   const handleFetchImageMessage = useCallback(async (msg: any) => {
     // Safety net only: in direct-file mode the bundle no longer hijacks
@@ -646,6 +717,15 @@ function MokuroWebView(
       webRef.current?.injectJavaScript(`window.__yomibakoOnImage && window.__yomibakoOnImage(${JSON.stringify(id)}, ${JSON.stringify(dataUri)}); true;`);
     } catch (e: any) {
       console.warn('[MokuroWebView] fetchImage skipped', orig, e?.message ?? e);
+      imageFailCount.current++;
+      // SAF permission loss mid-read (revoked content:// grant, SD eject)
+      // surfaces as blank images + null resolveImageUri. After a batch of
+      // failures, surface a re-pick CTA instead of a silent blank volume.
+      if (imageFailCount.current >= 5) {
+        setSafError(true);
+        diag.current.lastErr = 'Images unreadable — folder permission may be revoked';
+        saveDiag();
+      }
       webRef.current?.injectJavaScript(`window.__yomibakoOnImageError && window.__yomibakoOnImageError(${JSON.stringify(id)}, ${JSON.stringify(String(e?.message ?? e).slice(0, 200))}); true;`);
     }
   }
@@ -777,6 +857,21 @@ function MokuroWebView(
           </Pressable>
         </View>
       ) : null}
+      {safError && !rendererCrashed ? (
+        <View style={[StyleSheet.absoluteFill as any, { backgroundColor: 'rgba(0,0,0,0.88)', justifyContent: 'center', alignItems: 'center', gap: 10, padding: 24 }]}>
+          <Text style={{ color: 'rgba(255,255,255,0.92)', fontFamily: 'System', fontSize: 15, fontWeight: '600', textAlign: 'center' }}>Images unreadable</Text>
+          <Text style={{ color: 'rgba(255,255,255,0.60)', fontFamily: 'System', fontSize: 12, textAlign: 'center' }}>Folder permission may have been revoked. Re-pick the folder in Library to restore access. Progress is saved.</Text>
+          <Pressable
+            onPress={() => { setSafError(false); imageFailCount.current = 0; setLoadAttempt((n) => n + 1); }}
+            style={({ pressed }) => [s.retryButton, { opacity: pressed ? 0.75 : 1 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Retry loading images"
+          >
+            <Icon name="reload" size={15} color="#fff" strokeWidth={2.1} />
+            <Text style={s.retryText}>Try again</Text>
+          </Pressable>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -785,7 +880,8 @@ const s = StyleSheet.create({
   c: { flex: 1 },
   loadIcon: { width: 56, height: 56, borderRadius: 18, backgroundColor: 'rgba(255,255,255,0.08)', borderWidth: StyleSheet.hairlineWidth, borderColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center' },
   loadError: { color: 'rgba(255,255,255,0.46)', fontFamily: 'System', fontSize: 12, lineHeight: 17, textAlign: 'center', maxWidth: 300, paddingHorizontal: 12 },
-  retryButton: { minHeight: 40, paddingHorizontal: 16, borderRadius: 20, backgroundColor: '#0A84FF', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 },
+  // Scoped reader accent (P4): deepened fill passes AA, not bright hanko.
+  retryButton: { minHeight: 40, paddingHorizontal: 16, borderRadius: 20, backgroundColor: '#A62A12', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 },
   retryText: { color: '#fff', fontFamily: 'System', fontSize: 14, fontWeight: '700' },
 });
 

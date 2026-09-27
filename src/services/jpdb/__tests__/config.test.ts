@@ -122,11 +122,19 @@ test('setDeckId parses numbers and clears on empty', async () => {
 test('export/import json roundtrip migrates', async () => {
   await reset();
   await saveConfig({ ...(await loadConfig()), apiToken: 'e1' } as any);
-  const json = await exportConfigJson();
+  const json = await exportConfigJson(false);
   assert.ok(json.includes('e1'));
   await reset();
   await importConfigJson(json);
   assert.equal(await getApiToken(), 'e1');
+});
+
+test('export redacts secrets by default', async () => {
+  await reset();
+  await saveConfig({ ...(await loadConfig()), apiToken: 'secret-tok', geminiApiKey: 'gemini-secret' } as any);
+  const json = await exportConfigJson();
+  assert.ok(!json.includes('secret-tok'));
+  assert.ok(!json.includes('gemini-secret'));
 });
 
 test('legacy keys seed fresh installs', async () => {

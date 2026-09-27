@@ -329,9 +329,13 @@ export function hotkeyToString(hk: Hotkey): string {
   return hk.code;
 }
 
-export async function exportConfigJson(): Promise<string> {
+export async function exportConfigJson(redactSecrets = true): Promise<string> {
   const cfg = await loadConfig();
-  return JSON.stringify(cfg, null, 2);
+  if (!redactSecrets) return JSON.stringify(cfg, null, 2);
+  // Redact by default (P4 security): pasting settings JSON into a forum must
+  // not leak the paid Gemini key or JPDB token.
+  const { apiToken: _t, geminiApiKey: _g, ...rest } = cfg as any;
+  return JSON.stringify({ ...rest, apiToken: null, geminiApiKey: null }, null, 2);
 }
 
 export async function importConfigJson(json: string): Promise<void> {

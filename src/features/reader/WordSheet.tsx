@@ -295,7 +295,9 @@ function computeCap(winH: number, popupExpanded: boolean): number {
   if (popupExpanded) {
     return Math.min(Math.round(winH * 0.68), 560);
   }
-  return Math.min(Math.round(winH * 0.56), 440);
+  // Collapsed 0.44 (was 0.56): more page stays visible, card grows
+  // downward on expand instead of covering the next-read region.
+  return Math.min(Math.round(winH * 0.44), 380);
 }
 
 function buildDismiss(
@@ -432,10 +434,27 @@ function ImmersionBody({
   );
 }
 
-async function awaitExampleAudio(soundUrl: string): Promise<'ended' | 'stopped' | 'error'> {
+async function awaitExampleAudio(soundUrl: string, timeoutMs = 15000): Promise<'ended' | 'stopped' | 'error'> {
   return new Promise<'ended' | 'stopped' | 'error'>((resolve) => {
-    void playRemoteAudio(soundUrl, { onFinished: resolve }).then((ok) => {
-      if (!ok) resolve('error');
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve('error');
+      }
+    }, timeoutMs);
+    void playRemoteAudio(soundUrl, { onFinished: (r) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(r);
+      }
+    } }).then((ok) => {
+      if (!ok && !settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve('error');
+      }
     });
   });
 }
@@ -547,12 +566,14 @@ function useImmersionController(
 
   const fetchImmersion = useCallback(async (w: string, autoplay = true) => {
     const request = ++ikRequest.current;
-    setShowExamples(true);
+    // Defer reveal until fetch resolves (P3): setting showExamples=true here
+    // grows the card (collapsed→expanded) after the user started reading it.
     setIkLoading(true);
     setIkError(null);
     try {
       const examples = await fetchImmersionExamples(w);
       if (request !== ikRequest.current) return;
+      setShowExamples(true);
       applyFetchedExamples(examples, autoplay, {
         setExamples: setIkExamples,
         setIndex: setIkIndex,
@@ -561,6 +582,7 @@ function useImmersionController(
     } catch (error: any) {
       if (request !== ikRequest.current) return;
       setIkExamples([]);
+      setShowExamples(true);
       setIkError(error?.message ? String(error.message) : 'ImmersionKit is unavailable.');
     } finally {
       if (request === ikRequest.current) setIkLoading(false);
@@ -658,21 +680,28 @@ function useWordActions(args: {
   const [geminiError, setGeminiError] = useState<string | null>(null);
   const [geminiLoading, setGeminiLoading] = useState(false);
   const lastAudioAlert = useRef(0);
+  // Stabilized (P2 perf): `args` is a fresh literal every render. Destructure
+  // to primitives so the five actions below keep stable identities instead of
+  // rebuilding on every ReaderScreen re-render (including scrub frames).
+  const { vid, sid, spelling: wSpelling, reading: wReading, meanings: wMeanings, pitchAccent: wPitch,
+    sentence: wSentence, translation: wTranslation, forq: wForq, cfg: wCfg,
+    pushState: wPush, dismiss: wDismiss, setPlaying: wSetPlaying,
+    pronunciationRun: wRun, setShowDetails: wShowDetails } = args;
 
   const explainWithGemini = useCallback(async () => {
     if (geminiLoading) return;
-    if (!args.cfg?.geminiApiKey) {
+    if (!wCfg?.geminiApiKey) {
       Alert.alert('AI Explain', 'Add your Gemini API key in Settings → JPDB to use AI explanations.');
       return;
     }
     Haptics.selectionAsync();
-    args.setShowDetails(true);
+    wShowDetails(true);
     setGeminiError(null);
     setGeminiText(null);
     setGeminiLoading(true);
     try {
-      const prompt = buildGeminiPrompt(args.spelling, args.reading, args.meanings, args.pitchAccent, args.sentence);
-      const text = await geminiApi.explainWord({ apiKey: args.cfg.geminiApiKey, prompt });
+      const prompt = buildGeminiPrompt(wSpelling, wReading, wMeanings, wPitch, wSentence);
+      const text = await geminiApi.explainWord({ apiKey: wCfg.geminiApiKey, prompt });
       const trimmed = text?.trim();
       if (trimmed) {
         setGeminiText(trimmed);
@@ -685,81 +714,93 @@ function useWordActions(args: {
     } finally {
       setGeminiLoading(false);
     }
-  }, [geminiLoading, args]);
+  }, [geminiLoading, wCfg, wShowDetails, wSpelling, wReading, wMeanings, wPitch, wSentence]);
 
+  const [mineError, setMineError] = useState<string | null>(null);
   const mine = useCallback(async (rating?: ReviewRating) => {
     if (adding) return;
     setAdding(true);
+    setMineError(null);
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     try {
-      const token = args.cfg?.apiToken;
+      const token = wCfg?.apiToken;
       if (!token) throw new Error('Missing JPDB token — open Settings');
-      await jpdbApi.mine({ vid: args.vid, sid: args.sid, apiToken: token, sentence: args.sentence || undefined, translation: args.translation || undefined, forq: args.forq, reviewRating: rating });
+      // Non-atomic chain (P6): report which leg failed so retry doesn't double-add.
+      try {
+        await jpdbApi.mine({ vid, sid, apiToken: token, sentence: wSentence || undefined, translation: wTranslation || undefined, forq: wForq, reviewRating: rating });
+      } catch (e: any) {
+        throw new Error(`Mine failed (add): ${e?.message ?? e}`);
+      }
       setDone(true);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      const st = await jpdbApi.getCardState({ vid: args.vid, sid: args.sid, apiToken: token });
-      args.pushState(st);
-      if (!rating) setTimeout(args.dismiss, 650);
+      try {
+        const st = await jpdbApi.getCardState({ vid, sid, apiToken: token });
+        wPush(st);
+      } catch {
+        // State repaint is best-effort; mining already succeeded.
+      }
+      if (!rating) setTimeout(wDismiss, 650);
     } catch (e: any) {
-      Alert.alert('Mine failed', String(e.message));
+      // Inline (P6): modal Alert kills fast-loop momentum — show on button.
+      setMineError(String(e?.message ?? e).slice(0, 160));
     }
     setAdding(false);
-  }, [args, adding]);
+  }, [wCfg, wSentence, wTranslation, wForq, vid, sid, wPush, wDismiss, adding]);
 
   const toggleFlag = useCallback(async (flag: FlagName, localState: string[]) => {
     if (flagLoading !== null) return;
     setFlagLoading(flag);
     try {
-      const token = args.cfg?.apiToken;
+      const token = wCfg?.apiToken;
       if (!token) throw new Error('No token');
       const stateKey = flag === 'blacklist' ? 'blacklisted' : 'never-forget';
       const currently = localState.includes(stateKey);
-      await jpdbApi.setFlag({ vid: args.vid, sid: args.sid, flag, state: !currently, apiToken: token });
-      const st = await jpdbApi.getCardState({ vid: args.vid, sid: args.sid, apiToken: token });
-      args.pushState(st);
+      await jpdbApi.setFlag({ vid, sid, flag, state: !currently, apiToken: token });
+      const st = await jpdbApi.getCardState({ vid, sid, apiToken: token });
+      wPush(st);
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (e: any) {
       console.warn(`[wordsheet] flag ${flag} failed`, e);
       Alert.alert('Flag failed', String(e?.message ?? e));
     }
     setFlagLoading(null);
-  }, [args, flagLoading]);
+  }, [wCfg, vid, sid, wPush, flagLoading]);
 
   const review = useCallback(async (rating: ReviewRating) => {
     if (reviewLoading !== null) return;
     setReviewLoading(rating);
     try {
-      await jpdbApi.review({ vid: args.vid, sid: args.sid, rating });
-      const token = args.cfg?.apiToken;
+      await jpdbApi.review({ vid, sid, rating });
+      const token = wCfg?.apiToken;
       if (token) {
-        const st = await jpdbApi.getCardState({ vid: args.vid, sid: args.sid, apiToken: token });
-        args.pushState(st);
+        const st = await jpdbApi.getCardState({ vid, sid, apiToken: token });
+        wPush(st);
       }
       await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } catch (e: any) {
       Alert.alert('Review failed', String(e.message));
     }
     setReviewLoading(null);
-  }, [args, reviewLoading]);
+  }, [wCfg, vid, sid, wPush, reviewLoading]);
 
   const play = useCallback(async () => {
-    args.setPlaying(true);
+    wSetPlaying(true);
     Haptics.selectionAsync();
-    const run = ++args.pronunciationRun.current;
-    const ok = await playAudioForWord(args.vid, args.spelling);
-    if (args.pronunciationRun.current === run) args.setPlaying(false);
+    const run = ++wRun.current;
+    const ok = await playAudioForWord(vid, wSpelling);
+    if (wRun.current === run) wSetPlaying(false);
     if (!ok) {
       const reason = lastAudioError();
       const noisy = reason && reason !== 'No JPDB recording for this word';
-      if (args.pronunciationRun.current === run && noisy && Date.now() - lastAudioAlert.current > 10000) {
+      if (wRun.current === run && noisy && Date.now() - lastAudioAlert.current > 10000) {
         lastAudioAlert.current = Date.now();
         Alert.alert('Audio unavailable', reason);
       }
     }
-  }, [args]);
+  }, [wSetPlaying, wRun, vid, wSpelling]);
 
   return {
-    adding, done, flagLoading, reviewLoading,
+    adding, done, flagLoading, reviewLoading, mineError,
     geminiText, setGeminiText, geminiError, setGeminiError, geminiLoading,
     explainWithGemini, mine, toggleFlag, review, play,
   };
@@ -1162,19 +1203,30 @@ function SentenceSection(props: {
   }
   return (
     <View style={[s.section, { marginTop: 8 }]}>
-      <Pressable
-        onPress={onToggleSentence}
-        style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
-        hitSlop={6}
-      >
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4 }}>
+      {/* Un-nested (P3 a11y): FORQ pill is a sibling, not a child, of the
+          sentence toggle — nested Pressables are unreliable on both platforms. */}
+      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Pressable
+          onPress={onToggleSentence}
+          style={{ flexDirection: 'row', alignItems: 'center', gap: 4, minHeight: 36, justifyContent: 'center' }}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: showSentence }}
+        >
           <Text style={[s.posText, { color: colors.secondaryLabel }]}>Sentence</Text>
           <Icon name={showSentence ? 'chevronDown' : 'chevronRight'} size={13} color={colors.tertiaryLabel} strokeWidth={2.2} />
-        </View>
-        <Pressable onPress={onToggleForq} style={[s.forqPill, { backgroundColor: forq ? colors.primary : 'transparent', borderColor: forq ? colors.primary : colors.separator }]}>
+        </Pressable>
+        <Pressable
+          onPress={onToggleForq}
+          style={[s.forqPill, { backgroundColor: forq ? colors.primary : 'transparent', borderColor: forq ? colors.primary : colors.separator }]}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityState={{ selected: forq }}
+          accessibilityLabel={forq ? 'FORQ on' : 'FORQ off'}
+        >
           <Text style={[s.forqText, { color: forq ? '#fff' : colors.secondaryLabel }]}>{forq ? '✓ FORQ' : 'FORQ'}</Text>
         </Pressable>
-      </Pressable>
+      </View>
       {!showSentence && sentence ? (
         <Text style={[s.footnote, { color: colors.secondaryLabel, marginTop: 3 }]} numberOfLines={2}>{sentence}</Text>
       ) : null}
@@ -1368,7 +1420,7 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
   );
 
   const {
-    adding, done, flagLoading, reviewLoading,
+    adding, done, flagLoading, reviewLoading, mineError,
     geminiText, setGeminiText, geminiError, setGeminiError, geminiLoading,
     explainWithGemini, mine, toggleFlag, review, play,
   } = useWordActions({
@@ -1446,6 +1498,47 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
   const ghostPurple = { borderColor: isDark ? '#d7aefb' : '#7b1fa2', fg: isDark ? '#d7aefb' : '#7b1fa2' };
   const currentExample = ikExamples?.[ikIndex];
   const exampleAccent = isDark ? '#FFB340' : '#C65D00';
+
+  // Pending skeleton (P1): tap landed on unparsed text. Same anchored geometry,
+  // instant hairline feedback instead of 8s silence. Real lookup replaces it.
+  if ((word as any)?.pending) {
+    return (
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill as any}>
+        <Animated.View
+          onLayout={onSheetLayout}
+          style={[
+            s.sheet,
+            {
+              width: placement.width,
+              maxHeight: placement.maxHeight,
+              left: placement.left,
+              right: placement.right,
+              top: placement.top,
+              bottom: placement.bottom,
+            },
+            { backgroundColor: colors.surface, borderColor: colors.separator },
+            animatedSheetStyle,
+          ]}
+          accessibilityRole="progressbar"
+          accessibilityLabel="Parsing tapped text"
+        >
+          <View style={{ padding: 16, gap: 10, flexDirection: 'row', alignItems: 'center' }}>
+            <ActivityIndicator size="small" color={colors.primary} />
+            <View style={{ flex: 1, gap: 4 }}>
+              <Text style={[s.bodySmall, { color: colors.onSurface, fontWeight: '600' }]}>Parsing…</Text>
+              <Text style={[s.footnote, { color: colors.secondaryLabel }]}>Looking up the tapped sentence.</Text>
+            </View>
+            <Pressable onPress={dismiss} hitSlop={10} style={s.iconBtn} accessibilityLabel="Close lookup">
+              <Icon name="close" size={15} color={colors.secondaryLabel} strokeWidth={2.2} />
+            </Pressable>
+          </View>
+          {mineError ? (
+            <Text style={[s.footnote, { color: colors.error, paddingHorizontal: 16, paddingBottom: 8 }]}>{mineError}</Text>
+          ) : null}
+        </Animated.View>
+      </View>
+    );
+  }
 
   return (
     <View
@@ -1545,6 +1638,9 @@ export default function WordSheet({ word, onClose, forceDark, onStateChange, anc
                 onExplain={explainWithGemini}
                 onToggleDetails={() => { Haptics.selectionAsync(); setShowDetails((v) => !v); }}
               />
+              {mineError ? (
+                <Text style={[s.footnote, { color: colors.error, paddingHorizontal: 12, paddingTop: 6 }]}>{mineError}</Text>
+              ) : null}
 
               <ExamplesSection
                 showExamples={showExamples}
@@ -1633,24 +1729,24 @@ const s = StyleSheet.create({
   statePill: { paddingHorizontal: em(0.62), paddingVertical: em(0.15), borderRadius: 999 },
   statePillText: { fontFamily: 'System', fontSize: em(0.73), fontWeight: '700' as const, letterSpacing: em(0.73) * 0.08, textTransform: 'uppercase' as const },
   iconBtn: { width: 28, height: 28, borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
-  moreBtn: { alignSelf: 'flex-start', marginTop: em(0.3), paddingVertical: em(0.3), paddingHorizontal: em(0.4), borderRadius: 6 },
+  moreBtn: { alignSelf: 'flex-start', marginTop: em(0.3), paddingVertical: em(0.3), paddingHorizontal: em(0.4), minHeight: 36, justifyContent: 'center', borderRadius: 6 },
   moreText: { fontFamily: 'System', fontSize: em(0.88), fontWeight: '600' as const },
   quickActions: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 4, marginTop: 7, paddingHorizontal: em(0.7), paddingVertical: 7, borderTopWidth: StyleSheet.hairlineWidth },
-  quickAction: { minHeight: 32, paddingHorizontal: 9, borderRadius: 9, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 3 },
-  primaryAction: { minHeight: 32, paddingHorizontal: 12, borderRadius: 9, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5 },
+  quickAction: { minHeight: 44, paddingHorizontal: 9, borderRadius: 9, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 3 },
+  primaryAction: { minHeight: 44, paddingHorizontal: 12, borderRadius: 9, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5 },
   quickActionText: { fontFamily: 'System', fontSize: 12.5, fontWeight: '700' as const, letterSpacing: -0.1 },
   // Review pills (popup.css #review-buttons)
   // popup.css pads each section rather than the scroll container, so dividers
   // and the review row can run full-bleed.
   section: { paddingHorizontal: em(0.92) },
   reviewRow: { flexDirection: 'row', gap: 5, paddingTop: 8, paddingBottom: 8, paddingHorizontal: em(0.92), borderBottomWidth: StyleSheet.hairlineWidth, marginTop: 2 },
-  reviewBtn: { flex: 1, minHeight: 30, paddingVertical: 5, borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
+  reviewBtn: { flex: 1, minHeight: 44, paddingVertical: 5, borderRadius: 6, alignItems: 'center', justifyContent: 'center' },
   reviewText: { fontFamily: 'System', fontSize: 11, fontWeight: '600' as const, color: '#fff' },
   kanjiWrap: { paddingTop: 8, paddingHorizontal: em(0.92), gap: 6 },
   kanjiHeader: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   countBadge: { minWidth: 18, height: 18, paddingHorizontal: 5, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
   countText: { fontFamily: 'System', fontSize: 11, fontWeight: '800' as const, fontVariant: ['tabular-nums'] as any },
-  kanjiChip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 9, paddingVertical: 4, borderRadius: 999, borderWidth: 1 },
+  kanjiChip: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 9, paddingVertical: 4, minHeight: 36, borderRadius: 999, borderWidth: 1 },
   kanjiMean: { fontFamily: 'System', fontSize: 12, fontWeight: '500' as const, maxWidth: 110 },
   kanjiDetail: { marginTop: 2, borderRadius: 10, borderWidth: 1, padding: 10, gap: 2 },
   miniClose: { width: 22, height: 22, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
@@ -1666,17 +1762,17 @@ const s = StyleSheet.create({
   caption: { fontFamily: 'System', fontSize: 12, lineHeight: 15, fontWeight: '400' as const },
   textArea: { minHeight: 44, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8, fontFamily: 'System', fontSize: 14, lineHeight: 19, fontWeight: '400' as const, textAlignVertical: 'top' as any, marginTop: 6 },
   linkText: { fontFamily: 'System', fontSize: 13, fontWeight: '500' as const },
-  forqPill: { paddingHorizontal: 9, height: 24, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  forqPill: { paddingHorizontal: 9, height: 32, minWidth: 64, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   forqText: { fontFamily: 'System', fontSize: 11, fontWeight: '700' as const, letterSpacing: 0.3 },
   aiBox: { marginTop: 8, marginHorizontal: em(0.92), borderRadius: 10, borderWidth: 1, padding: 10 },
   exampleCard: { marginHorizontal: em(0.7), marginTop: 2, marginBottom: 6, borderRadius: 12, borderWidth: StyleSheet.hairlineWidth, overflow: 'hidden' },
   exampleHeader: { minHeight: 38, paddingHorizontal: 8, paddingVertical: 5, flexDirection: 'row', alignItems: 'center', gap: 5 },
   exampleSource: { flex: 1, minWidth: 0, fontFamily: 'System', fontSize: 11, lineHeight: 14, fontWeight: '600' as const },
   exampleNav: { flexDirection: 'row', alignItems: 'center', gap: 0 },
-  exampleNavBtn: { width: 26, height: 28, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
+  exampleNavBtn: { width: 36, height: 36, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
   exampleCounter: { minWidth: 30, textAlign: 'center', fontFamily: 'System', fontSize: 10.5, fontWeight: '700' as const, fontVariant: ['tabular-nums'] as any },
   exampleControlDivider: { width: StyleSheet.hairlineWidth, height: 18, marginHorizontal: 3 },
-  exampleAllBtn: { minWidth: 34, height: 28, paddingHorizontal: 5, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
+  exampleAllBtn: { minWidth: 44, height: 36, paddingHorizontal: 5, borderRadius: 8, alignItems: 'center', justifyContent: 'center' },
   exampleAllText: { fontFamily: 'System', fontSize: 10.5, fontWeight: '800' as const },
   exampleLoading: { minHeight: 72, paddingHorizontal: 12, paddingVertical: 14, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9 },
   exampleRetry: { minHeight: 30, paddingHorizontal: 11, borderRadius: 15, alignItems: 'center', justifyContent: 'center' },

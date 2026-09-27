@@ -19,6 +19,11 @@ export const brand = {
   hankoFaint: { light: 'rgba(190,58,34,0.07)', dark: 'rgba(255,107,74,0.10)' },
   hankoContainer: { light: '#FFE7DC', dark: '#4D2016' },
   onHankoContainer: { light: '#5C1F12', dark: '#FFDAD2' },
+  // Scoped reader accent (P4): reader chrome is always dark, so the dark fill
+  // is deepened to #A62A12 to pass 4.5:1 with white (bright #FF6B4A is 2.82).
+  // Card interiors keep their popup-theme palette — this slot is chrome only.
+  readerAccent: { light: '#BE3A22', dark: '#A62A12' },
+  readerAccentSoft: { light: 'rgba(190,58,34,0.12)', dark: 'rgba(166,42,18,0.28)' },
   // Deep indigo from the app mark — shelves, onboarding glow, header ink.
   indigo: { light: '#2B2F6B', dark: '#9AA3D6' },
   indigoSoft: { light: 'rgba(43,47,107,0.08)', dark: 'rgba(154,163,214,0.16)' },

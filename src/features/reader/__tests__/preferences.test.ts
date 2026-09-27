@@ -6,6 +6,9 @@ import {
   setReaderPreferences,
   flushReaderPreferences,
   defaultReaderPreferences,
+  loadVolumeLayout,
+  saveVolumeLayout,
+  volumeLayoutKey,
   __resetPreferencesForTests,
 } from '../preferences';
 import * as SecureStore from 'expo-secure-store';
@@ -73,4 +76,13 @@ test('flush never throws when storage fails', async () => {
   } finally {
     (storage as any).setItemAsync = orig;
   }
+});
+
+test('per-volume layout is opt-in with global fallback, safe keys', async () => {
+  await reset();
+  assert.equal(await loadVolumeLayout('content://volume/1'), null);
+  await saveVolumeLayout('content://volume/1', { rtl: true });
+  assert.deepEqual(await loadVolumeLayout('content://volume/1'), { rtl: true });
+  assert.equal(await loadVolumeLayout('content://volume/2'), null);
+  assert.ok(/^[a-zA-Z0-9._-]+$/.test(volumeLayoutKey('content://a/b?c=d')));
 });

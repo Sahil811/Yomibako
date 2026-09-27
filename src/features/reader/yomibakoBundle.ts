@@ -10,7 +10,7 @@
 // injectedJavaScriptBeforeContentLoaded only runs on document load, so editing
 // the strings below does nothing to an already-mounted WebView. Bump this when
 // changing them and the reader remounts instead of running the previous build.
-export const YOMIBAKO_BUNDLE_VERSION = '2026-09-20.swipe-fitwidth-fix';
+export const YOMIBAKO_BUNDLE_VERSION = '2026-09-27.pending-skeleton-count';
 
 export const YOMIBAKO_CSS = `
 /* Mobile reading baseline — kill the blue tap flash, the 300ms click delay and
@@ -142,13 +142,22 @@ export const YOMIBAKO_JS = `
     const d=t.jpdbData.token.card;
     var anchor=anchorFor(t,ev);
     activeWord = t;
+    // Visual-viewport offsets (P4): layout viewport == visual while
+    // user-scalable=no, but Android force-zoom can break that. Send offsets
+    // so native shiftPoint stays correct instead of silently misplacing.
+    var vis=null;
+    try{
+      var vv=window.visualViewport;
+      if(vv && (vv.offsetLeft || vv.offsetTop)) vis={ offsetLeft:vv.offsetLeft||0, offsetTop:vv.offsetTop||0 };
+    }catch(_){}
     post(type, {
       vid:d.vid, sid:d.sid, spelling:d.spelling, reading:d.reading,
       state:d.state, meanings:d.meanings, frequencyRank:d.frequencyRank, pitchAccent:d.pitchAccent, partOfSpeech:d.partOfSpeech,
       context:t.jpdbData.context, contextOffset:t.jpdbData.contextOffset,
       rect:anchor.rect, rects:anchor.rects, boxRect:anchor.boxRect,
       point:anchor.point, pointerType:anchor.pointerType,
-      vertical:anchor.vertical, vw:window.innerWidth, vh:window.innerHeight
+      vertical:anchor.vertical, vw:window.innerWidth, vh:window.innerHeight,
+      visual:vis
     });
   }
 
@@ -209,9 +218,15 @@ export const YOMIBAKO_JS = `
       if(t.isConnected===false){ activeWord=null; post('anchorLost'); return; }
       var a=anchorFor(t,null);
       if(!a.rect){ activeWord=null; post('anchorLost'); return; }
+      var avis=null;
+      try{
+        var avv=window.visualViewport;
+        if(avv && (avv.offsetLeft || avv.offsetTop)) avis={ offsetLeft:avv.offsetLeft||0, offsetTop:avv.offsetTop||0 };
+      }catch(_){}
       post('anchor',{
         rect:a.rect, rects:a.rects, boxRect:a.boxRect,
-        vertical:a.vertical, vw:window.innerWidth, vh:window.innerHeight
+        vertical:a.vertical, vw:window.innerWidth, vh:window.innerHeight,
+        visual:avis
       });
     },120);
   }
@@ -310,7 +325,17 @@ export const YOMIBAKO_JS = `
   function deferTextLookup(box,x,y,pointerType){
     var p={ box:box, x:x, y:y, pointerType:pointerType, expires:Date.now()+8000 };
     pendingTextTap=p;
-    post('textGuard',{ pending:true });
+    // P1 latency: surface the tap point + box geometry so native can render
+    // an anchored skeleton instead of silence. tLookupMs lets Diagnostics
+    // measure tap→receipt latency.
+    var rect=null;
+    try{
+      var r=box && box.getBoundingClientRect ? box.getBoundingClientRect() : null;
+      if(r) rect={ x:r.left, y:r.top, w:r.width, h:r.height };
+    }catch(_){}
+    var tMs=0;
+    try{ tMs=Math.round(performance.now()); }catch(_){}
+    post('textGuard',{ pending:true, point:{ x:x, y:y }, rect:rect, tLookupMs:tMs });
     var page=owningPage(box);
     if(page) prioritizeTextPage(page);
     setTimeout(function(){ if(pendingTextTap===p) clearPendingTextTap(); },8100);
@@ -667,7 +692,9 @@ export const YOMIBAKO_JS = `
               const toks=tokensArray && tokensArray[i];
               if(toks) spans+=applyTokens(b.frags, toks);
             });
-            post('applied', { id, spans });
+            var tApplied=0;
+            try{ tApplied=Math.round(performance.now()); }catch(_){}
+            post('applied', { id, spans, tFirstAppliedMs:tApplied, bubblesLive:spans });
             resolvePendingTextTap();
           }catch(err){ console.warn('[yomibako] apply failed', err); post('applyError', { id, error: String((err && err.message) || err).slice(0,200) }); }
           onChunkSettled(true);
@@ -913,10 +940,22 @@ export const YOMIBAKO_JS = `
       lastIdx=idx; lastTotal=total; lastP=value;
       var st = mokuroState();
       var hasPager=!!document.getElementById('pageIdxInput') && total>1;
+      // Quiz FAB count source (P6): cheap live count on displayed pages so
+      // native can label "Quiz this page (N)" without a round-trip.
+      var wordCount=0;
+      try{
+        var dp=displayedPages();
+        for(var wi=0;wi<dp.length;wi++){
+          var spans=dp[wi] && dp[wi].querySelectorAll ? dp[wi].querySelectorAll('.jpdb-word') : [];
+          for(var wj=0;wj<spans.length;wj++){ if(spans[wj].jpdbData) wordCount++; }
+          if(wordCount>500) break;
+        }
+      }catch(_){}
       post('page', {
         index: idx, total: total, value: value, paged: !!st || hasPager || fallbackControls.active,
         rtl: navRtl(), twoPage: !!fallbackControls.twoPage,
-        zoomMode: fallbackControls.zoomMode || 'screen', menuOpen: !!mokuroMenuOpen
+        zoomMode: fallbackControls.zoomMode || 'screen', menuOpen: !!mokuroMenuOpen,
+        wordCount: wordCount
       });
     }catch(_){}
   }
@@ -1556,6 +1595,14 @@ export const YOMIBAKO_JS = `
     if(fallbackControls.twoPage && target%2===1) target-=1;
     applyFallbackLayout(target<0?0:target);
     navReport(true);
+    // First-paint signal (P1): skeleton clears onto decoded pages, not onto
+    // index>=0 which can fire before images decode on long strips.
+    try{
+      if(!window.__yomibakoFirstPaintSent){
+        window.__yomibakoFirstPaintSent=true;
+        post('firstPaint', { index: target<0?0:target });
+      }
+    }catch(_){}
   };
   window.__yomibakoRelayout = function(){
     if(fallbackControls.active) directZoom();

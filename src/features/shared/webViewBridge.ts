@@ -90,6 +90,7 @@ const STATUS_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'page',
   'control',
   'layoutError',
+  'firstPaint',
 ]);
 
 /** Every message type the reader bundle is allowed to send. */

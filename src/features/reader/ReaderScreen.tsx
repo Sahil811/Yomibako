@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Modal, PanResponder, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { AccessibilityInfo, Modal, PanResponder, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { BlurView } from 'expo-blur';
@@ -8,6 +8,7 @@ import * as ScreenOrientation from 'expo-screen-orientation';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
 import * as Haptics from 'expo-haptics';
 import { darkColors } from '../../theme/colors';
+import { readerAccentFill } from './readerAccent';
 import { Icon } from '../../components/ui/Icon';
 import MokuroWebView, { type MokuroWebViewHandle, type ReaderControlInfo, type ReaderPageInfo } from './MokuroWebView';
 import WordSheet from './WordSheet';
@@ -44,11 +45,14 @@ import {
   reanchorWord,
   shouldShowFab,
   shouldShowOptions,
-  shouldShowWebView,
   type ReaderPageState,
 } from './readerHelpers';
 
 const AUTO_HIDE_MS = 2200;
+
+// Scoped reader accent (P4): reader is always dark, deepened fill passes
+// 4.5:1 with white. Never use palette primary or bright hanko as fills.
+const READER_ACCENT_FILL = readerAccentFill('dark');
 
 function ReaderEmptyState({ onBack }: { readonly onBack: () => void }) {
   const colors = darkColors;
@@ -319,8 +323,12 @@ function PageJumpDialog({ visible, total, current, onClose, onGo }: {
   return (
     <Modal visible transparent animationType="fade" statusBarTranslucent onRequestClose={onClose}>
       <View style={s.jumpOverlay}>
-        <Pressable style={StyleSheet.absoluteFill as any} onPress={onClose} accessibilityLabel="Dismiss go to page" />
-        <View style={s.jumpCard}>
+        <Pressable style={StyleSheet.absoluteFill as any} onPress={onClose} accessibilityLabel="Dismiss go to page" accessibilityRole="button" />
+        <View
+          style={s.jumpCard}
+          accessibilityViewIsModal
+          importantForAccessibility="yes"
+        >
           <Text style={s.jumpTitle}>Go to page</Text>
           <Text style={s.jumpSub}>1 – {total} · now on {current}</Text>
           <TextInput
@@ -525,6 +533,7 @@ type UseReaderCallbacksParams = {
   readonly setPage: React.Dispatch<React.SetStateAction<ReaderPageState>>;
   readonly setControlError: React.Dispatch<React.SetStateAction<string | null>>;
   readonly setQuizWords: React.Dispatch<React.SetStateAction<any[] | null>>;
+  readonly scrubbingRef?: { current: any };
   readonly cancelHoverAudio: (stop?: boolean) => void;
   readonly scheduleHoverAudio: (word: any) => void;
   readonly playWordAudio: (word: any) => void;
@@ -554,6 +563,7 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
     setPage,
     setControlError,
     setQuizWords,
+    scrubbingRef,
     cancelHoverAudio,
     scheduleHoverAudio,
     playWordAudio,
@@ -561,9 +571,16 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
 
   // The page reports progress on every scroll frame. Re-rendering the whole
   // reader chrome at 60fps drops frames — only commit visible changes.
+  // During scrub the fill/thumb already track scrubValue on the UI thread;
+  // committing progress to React state mid-scrub would re-render the whole
+  // screen (including MokuroWebView hooks) hundreds of times.
   const handleProgress = useCallback((p: number) => {
+    try {
+      const holder = scrubbingRef?.current as { value?: unknown } | null | undefined;
+      if (holder?.value === 1) return;
+    } catch {}
     setProgress((prev) => nextProgressValue(prev, p));
-  }, []);
+  }, [scrubbingRef, setProgress]);
 
   const dismissWord = useCallback(() => {
     cancelHoverAudio(true);
@@ -576,6 +593,14 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
   const onWordTap = useCallback((nextWord: any) => {
     cancelHoverAudio(true);
     setOptionsOpen(false);
+    // Pending skeleton (P1): tap landed on unparsed text. Show anchored
+    // skeleton immediately instead of 8s silence; never autoplay audio.
+    if (nextWord?.pending) {
+      setWord(nextWord);
+      void Haptics.selectionAsync();
+      return;
+    }
+    // A real lookup resolves any pending skeleton for the same spot.
     setWord(nextWord);
     // "Auto-play pronunciation" — a tap plays the word's audio immediately.
     maybePlayTapAudio(interactionRef.current.playSoundOnHover, nextWord, playWordAudio);
@@ -615,7 +640,12 @@ function useReaderCallbacks(params: UseReaderCallbacksParams) {
       dismissWord,
       showPageToast,
     });
-  }, [dismissWord, progressUri, volumePageCount, showPageToast, setMokuroMenu, setPage, setZoomMode]);
+    // Hide chrome on the turn that follows showing it — a page turn is a
+    // more natural dismissal than the 2200ms timer alone.
+    if (chromeRef.current) {
+      hideChrome();
+    }
+  }, [dismissWord, progressUri, volumePageCount, showPageToast, setMokuroMenu, setPage, setZoomMode, hideChrome]);
 
   const onControl = useCallback((info: ReaderControlInfo) => {
     handleControlInfo(info, setControlError, setZoomMode, setPage);
@@ -731,6 +761,7 @@ export default function ReaderScreen() {
   const [controlError, setControlError] = useState<string | null>(null);
   const [quizWords, setQuizWords] = useState<any[] | null>(null);
   const [jumpOpen, setJumpOpen] = useState(false);
+  const [firstPaint, setFirstPaint] = useState(false);
 
   const interactionRef = useRef({ showPopupOnHover: true, playSoundOnHover: false });
   const wordRef = useRef<any>(null);
@@ -760,12 +791,36 @@ export default function ReaderScreen() {
 
   useEffect(() => navigation.addListener('focus', () => { void applyInteraction(false); }), [applyInteraction, navigation]);
 
+  // Reduced motion (P4): thread system setting through prefs so the bundle
+  // can use instant turns instead of slides.
+  useEffect(() => {
+    let alive = true;
+    AccessibilityInfo.isReduceMotionEnabled?.().then((v) => {
+      if (alive && v) {
+        setReaderPreferences({ reduceMotion: true } as any);
+        setPrefs((p) => (p ? { ...p, reduceMotion: true } : p));
+      }
+    }).catch(() => {});
+    const sub = (AccessibilityInfo as any).addEventListener?.('reduceMotionChanged', (v: boolean) => {
+      setReaderPreferences({ reduceMotion: v } as any);
+      setPrefs((p) => (p ? { ...p, reduceMotion: v } : p));
+    });
+    return () => {
+      alive = false;
+      try { sub?.remove?.(); } catch {}
+    };
+  }, []);
+
   useReaderSystemEffects();
 
   const { cancel: cancelHoverAudio, scheduleHover: scheduleHoverAudio, playNow: playWordAudio } = useWordAudio();
 
   const total = page.total || volume.pageCount || 0;
   const canPage = page.paged && total > 1;
+
+  // Holder for scrubbing shared value so handleProgress can skip commits
+  // mid-scrub (fill/thumb already animate on UI thread).
+  const scrubbingHolder = useRef<any>(null);
 
   const {
     handleProgress,
@@ -808,10 +863,20 @@ export default function ReaderScreen() {
     setPage,
     setControlError,
     setQuizWords,
+    scrubbingRef: scrubbingHolder,
     cancelHoverAudio,
     scheduleHoverAudio,
     playWordAudio,
   });
+
+  // Resume arrives async via SecureStore; the WebView mounts immediately
+  // with defaults (P1) so first paint is never gated on storage. Jump once
+  // the saved page is known.
+  useEffect(() => {
+    if (resumePage !== null && firstPaint) {
+      readerRef.current?.goToPage(resumePage);
+    }
+  }, [resumePage, firstPaint]);
 
   // A page turn only lives in memory until the 1200ms debounce fires — flush
   // on blur too, so navigating away fast never loses the last position.
@@ -833,6 +898,8 @@ export default function ReaderScreen() {
 
   const scrubController = useScrubController(total, progress, showChrome, seekTo);
   const { scrubTo, trackView, measureTrack, scrubResponder, fillStyle, thumbStyle } = scrubController;
+  // Publish scrubbing state for handleProgress skip.
+  (scrubbingHolder as any).current = (scrubController as any).scrubbing ?? null;
   const currentIndex = currentIndexFor(scrubTo, page.index);
   const pageLabel = formatPageLabel(canPage, total, currentIndex, progress);
 
@@ -843,8 +910,13 @@ export default function ReaderScreen() {
   return (
     <View style={s.root}>
       <StatusBar style="light" hidden={!chromeVisible} animated />
+      {/* Edge-hugging 2px progress (P2): sits at the screen edge, transparent
+          track so only the fill shows — never a full-width bar cutting the page. */}
+      <View pointerEvents="none" style={s.hairlineTrack}>
+        <View style={[s.hairlineFill, { width: `${Math.round(progress * 100)}%` }]} />
+      </View>
       <View style={s.readerStage}>
-        {shouldShowWebView(resumePage, prefs) ? (
+        {isReadableVolume(volume) ? (
           <MokuroWebView
             ref={readerRef}
             htmlUri={volume.htmlUri}
@@ -852,8 +924,8 @@ export default function ReaderScreen() {
             volumeDir={volume.uri}
             title={volume.title}
             series={volume.series}
-            initialPage={resumePage as number}
-            initialPreferences={prefs as ReaderPreferences}
+            initialPage={resumePage ?? 0}
+            initialPreferences={prefs ?? defaultReaderPreferences}
             onOpenSettings={openSettings}
             onWordTap={onWordTap}
             onWordHover={onWordHover}
@@ -862,6 +934,7 @@ export default function ReaderScreen() {
             onProgress={handleProgress}
             onPage={onPage}
             onControl={onControl}
+            onFirstPaint={() => setFirstPaint(true)}
             onWords={onWords}
             onTapBackground={handleCenterTap}
             onViewReset={() => { void Haptics.selectionAsync(); }}
@@ -985,10 +1058,10 @@ export default function ReaderScreen() {
         </BlurView>
       </Animated.View>
 
-      <PageToast visible={canPage} text={`${Math.min(total, page.index + 1)} / ${total}`} bottom={Math.max(insets.bottom, 12) + 4} style={toastStyle} />
+      <PageToast visible={canPage} text={pageLabel} bottom={Math.max(insets.bottom, 12) + 4} style={toastStyle} />
 
       {/* Quiz is one tap from anywhere in the page, within thumb reach. It
-          rides above the footer so the two never overlap. */}
+          rides above the footer so the two never overlap. Icon-only by design. */}
       {shouldShowFab(word, quizWords) ? (
         <Animated.View style={[s.fab, { bottom: Math.max(insets.bottom, 12), right: Math.max(insets.right, 14) }, fabStyle]}>
           <BlurView intensity={30} tint="dark" style={s.fabSurface}>
@@ -1039,7 +1112,7 @@ const s = StyleSheet.create({
     boxShadow: '0 8px 24px rgba(0,0,0,0.34)',
   },
   circleButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.08)' },
-  circleButtonActive: { backgroundColor: '#0A84FF' },
+  circleButtonActive: { backgroundColor: READER_ACCENT_FILL },
   pressed: { opacity: 0.68, transform: [{ scale: 0.96 }] },
   optionsBar: {
     marginTop: 8,
@@ -1055,7 +1128,7 @@ const s = StyleSheet.create({
   },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   chip: { paddingHorizontal: 11, height: 30, borderRadius: 15, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(255,255,255,0.09)' },
-  chipActive: { backgroundColor: '#0A84FF' },
+  chipActive: { backgroundColor: READER_ACCENT_FILL },
   chipText: { color: 'rgba(255,255,255,0.80)', fontFamily: 'System', fontSize: 13, fontWeight: '600', letterSpacing: -0.1 },
   chipTextActive: { color: '#fff' },
   segment: { flexDirection: 'row', borderRadius: 9, padding: 2, gap: 2, backgroundColor: 'rgba(255,255,255,0.09)' },
@@ -1082,9 +1155,9 @@ const s = StyleSheet.create({
     gap: 6,
     boxShadow: '0 7px 22px rgba(0,0,0,0.34)',
   },
-  scrubHit: { flex: 1, paddingVertical: 18, justifyContent: 'center' },
+  scrubHit: { flex: 1, paddingVertical: 20, minHeight: 44, justifyContent: 'center' },
   scrubTrack: { height: 3, borderRadius: 2, backgroundColor: 'rgba(255,255,255,0.18)', justifyContent: 'center' },
-  scrubFill: { position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 2, backgroundColor: '#0A84FF' },
+  scrubFill: { position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 2, backgroundColor: READER_ACCENT_FILL },
   scrubThumb: { position: 'absolute', width: 12, height: 12, borderRadius: 6, marginLeft: -6, top: -4.5, backgroundColor: '#fff', boxShadow: '0 2px 5px rgba(0,0,0,0.28)' },
   footerCount: { minWidth: 48, textAlign: 'right', color: 'rgba(255,255,255,0.72)', fontFamily: 'System', fontSize: 11.5, lineHeight: 16, fontWeight: '600', fontVariant: ['tabular-nums'] as any },
   toast: { position: 'absolute', alignSelf: 'center', paddingHorizontal: 11, paddingVertical: 5, borderRadius: 13, backgroundColor: 'rgba(0,0,0,0.68)', zIndex: 9 },
@@ -1097,7 +1170,7 @@ const s = StyleSheet.create({
   jumpRow: { flexDirection: 'row', gap: 8, marginTop: 12 },
   jumpButton: { flex: 1, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
   jumpCancel: { backgroundColor: 'rgba(255,255,255,0.10)' },
-  jumpGo: { backgroundColor: '#0A84FF' },
+  jumpGo: { backgroundColor: READER_ACCENT_FILL },
   jumpCancelText: { color: '#fff', fontFamily: 'System', fontSize: 15, fontWeight: '600' },
   jumpGoText: { color: '#fff', fontFamily: 'System', fontSize: 15, fontWeight: '700' },
   fab: { position: 'absolute', zIndex: 11 },
@@ -1111,11 +1184,13 @@ const s = StyleSheet.create({
     backgroundColor: 'rgba(18,18,20,0.66)',
     boxShadow: '0 6px 16px rgba(0,0,0,0.30)',
   },
-  fabButton: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  fabButton: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 4, paddingHorizontal: 6 },
   fabPressed: { opacity: 0.55 },
+  hairlineTrack: { position: 'absolute', top: 0, left: 0, right: 0, height: 2, zIndex: 20, backgroundColor: 'transparent' },
+  hairlineFill: { height: 2, backgroundColor: READER_ACCENT_FILL, opacity: 0.92 },
   empty: { alignItems: 'center', justifyContent: 'center', padding: 24, gap: 9 },
   emptyTitle: { color: '#fff', fontFamily: 'System', fontSize: 20, fontWeight: '700' },
   emptySub: { color: 'rgba(255,255,255,0.56)', fontFamily: 'System', fontSize: 14, textAlign: 'center', lineHeight: 19 },
-  emptyButton: { marginTop: 10, height: 44, paddingHorizontal: 20, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0A84FF' },
+  emptyButton: { marginTop: 10, height: 44, paddingHorizontal: 20, borderRadius: 14, alignItems: 'center', justifyContent: 'center', backgroundColor: READER_ACCENT_FILL },
   emptyButtonText: { color: '#fff', fontFamily: 'System', fontSize: 15, fontWeight: '600' },
 });
