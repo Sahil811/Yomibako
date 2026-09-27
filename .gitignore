@@ -48,3 +48,7 @@ coverage/
 # generated native folders
 /ios
 /android
+
+# SonarQube scanner working files (local analysis output, never commit)
+.scannerwork/
+

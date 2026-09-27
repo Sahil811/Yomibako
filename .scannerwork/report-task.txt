@@ -1,6 +1,0 @@
-projectKey=yomibako
-serverUrl=http://localhost:9000
-serverVersion=26.9.0.129388
-dashboardUrl=http://localhost:9000/dashboard?id=yomibako
-ceTaskId=15ff4b47-73c4-46b9-8291-e8a847d808bb
-ceTaskUrl=http://localhost:9000/api/ce/task?id=15ff4b47-73c4-46b9-8291-e8a847d808bb
