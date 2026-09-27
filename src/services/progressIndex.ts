@@ -76,5 +76,7 @@ export function mergeIndexWithFallback(
   return out;
 }
 
-/** Test-only: nothing cached here (stateless over storage). */
-export function __resetProgressIndexForTests(): void {}
+/** Test-only: stateless over storage, nothing cached — kept for symmetry. */
+export function __resetProgressIndexForTests(): void {
+  void 0;
+}

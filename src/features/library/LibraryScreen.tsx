@@ -135,17 +135,25 @@ type VolumeCardProps = {
   onMenu: (volume: Volume) => void;
 };
 
+// Painted volume fields only — streaming scans replace object identity per
+// batch, so default shallow memo would re-render all 100+ cards.
+function volumePaintEqual(prev: Volume, next: Volume): boolean {
+  return (
+    prev.id === next.id &&
+    prev.title === next.title &&
+    prev.coverUri === next.coverUri &&
+    prev.pageCount === next.pageCount &&
+    (prev.progress ?? 0) === (next.progress ?? 0) &&
+    (prev.lastOpened ?? 0) === (next.lastOpened ?? 0)
+  );
+}
+
 // Custom equality: streaming scans replace every object identity on each batch,
 // so a default shallow memo would still re-render all 100+ cards. Only the
 // fields actually painted are compared — unrelated batches skip render.
 function volumeCardEqual(prev: VolumeCardProps, next: VolumeCardProps): boolean {
   return (
-    prev.volume.id === next.volume.id &&
-    prev.volume.title === next.volume.title &&
-    prev.volume.coverUri === next.volume.coverUri &&
-    prev.volume.pageCount === next.volume.pageCount &&
-    (prev.volume.progress ?? 0) === (next.volume.progress ?? 0) &&
-    (prev.volume.lastOpened ?? 0) === (next.volume.lastOpened ?? 0) &&
+    volumePaintEqual(prev.volume, next.volume) &&
     prev.selecting === next.selecting &&
     prev.selected === next.selected &&
     prev.layout === next.layout &&

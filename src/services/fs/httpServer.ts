@@ -177,6 +177,22 @@ function listSeriesDirs(): Directory[] {
 
 type CachedVolume = { key: string; dir: Directory; bytes: number; lastOpened: number };
 
+function cachedVolumeFor(seriesName: string, entry: File | Directory, manifest: CacheManifest): CachedVolume | null {
+  if (!(entry instanceof Directory)) return null;
+  const key = volumeCacheKey(seriesName, entry.name);
+  // F2: prefer manifest bytes recorded at copy time (no walk). Fall back
+  // to a walk only for pre-manifest volumes with no recorded size —
+  // cacheUsage() (Settings, off hot path) always walks.
+  const recorded = manifest[key]?.bytes;
+  return {
+    key,
+    dir: entry,
+    bytes: typeof recorded === 'number' ? recorded : directoryBytes(entry),
+    // Volumes cached before the manifest existed fall back to mtime.
+    lastOpened: manifest[key]?.lastOpened ?? directoryTime(entry),
+  };
+}
+
 function listCachedVolumes(manifest: CacheManifest): CachedVolume[] {
   const out: CachedVolume[] = [];
   for (const seriesDir of listSeriesDirs()) {
@@ -187,19 +203,8 @@ function listCachedVolumes(manifest: CacheManifest): CachedVolume[] {
       continue;
     }
     for (const entry of entries) {
-      if (!(entry instanceof Directory)) continue;
-      const key = volumeCacheKey(seriesDir.name, entry.name);
-      // F2: prefer manifest bytes recorded at copy time (no walk). Fall back
-      // to a walk only for pre-manifest volumes with no recorded size —
-      // cacheUsage() (Settings, off hot path) always walks.
-      const recorded = manifest[key]?.bytes;
-      out.push({
-        key,
-        dir: entry,
-        bytes: typeof recorded === 'number' ? recorded : directoryBytes(entry),
-        // Volumes cached before the manifest existed fall back to mtime.
-        lastOpened: manifest[key]?.lastOpened ?? directoryTime(entry),
-      });
+      const cached = cachedVolumeFor(seriesDir.name, entry, manifest);
+      if (cached) out.push(cached);
     }
   }
   return out;

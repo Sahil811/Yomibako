@@ -158,7 +158,7 @@ export function cancelSessionJob(id: string): boolean {
 
 /** Cancel all in-flight jobs — used on unmount/background. */
 export function cancelAllSessionJobs(): void {
-  for (const id of [...pending.keys()]) cancelSessionJob(id);
+  for (const id of pending.keys()) cancelSessionJob(id);
 }
 
 /** Test-only: number of in-flight jobs. */

@@ -348,6 +348,6 @@ function sanitizeImportedCss(raw: unknown): string {
   let out = raw.slice(0, 20000);
   // Neutralize style-tag breakout; JSON.stringify already escapes quotes for
   // the inject path, this closes the </style><script> vector.
-  out = out.replace(/<\/style/gi, '<\\/style').replace(/<script/gi, '<\\script');
+  out = out.replace(/<\/style/gi, String.raw`<\/style`).replace(/<script/gi, String.raw`<\\script`);
   return out;
 }

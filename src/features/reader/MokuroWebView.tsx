@@ -23,6 +23,14 @@ import {
 // scrubbing re-render Reader). Hoist to module constant — stable identity,
 // zero per-render allocation on the WebView boundary.
 const YOMIBAKO_CSS_JSON = JSON.stringify(YOMIBAKO_CSS);
+
+function buildCssInject(customWordCSS: string, customPopupCSS: string, disableFade: boolean): string {
+  const baseRule = `let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${YOMIBAKO_CSS_JSON}; document.head.appendChild(s);}`;
+  const wordRule = buildCustomWordInject(customWordCSS);
+  const popupRule = buildCustomPopupInject(customPopupCSS);
+  const fadeRule = buildFadeInject(disableFade);
+  return `(function(){ ${baseRule} ${wordRule} ${popupRule} ${fadeRule} true;})();`;
+}
 // Direct stream uses image bridge, no prepareVolume copy needed for content://
 // import { prepareVolumeForWebView } from '../../services/fs/httpServer';
 
@@ -474,14 +482,6 @@ function MokuroWebView(
       webRef.current?.injectJavaScript(script);
     }
   }, []);
-
-  function buildCssInject(customWordCSS: string, customPopupCSS: string, disableFade: boolean): string {
-    const baseRule = `let s=document.getElementById('yomibako-css'); if(!s){ s=document.createElement('style'); s.id='yomibako-css'; s.textContent=${YOMIBAKO_CSS_JSON}; document.head.appendChild(s);}`;
-    const wordRule = buildCustomWordInject(customWordCSS);
-    const popupRule = buildCustomPopupInject(customPopupCSS);
-    const fadeRule = buildFadeInject(disableFade);
-    return `(function(){ ${baseRule} ${wordRule} ${popupRule} ${fadeRule} true;})();`;
-  }
 
   const handleBridgeReady = useCallback(async (msg: any) => {
     // The bundle posts exactly one bridgeReady with payload. Ignore

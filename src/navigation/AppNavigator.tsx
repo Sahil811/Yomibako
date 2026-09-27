@@ -155,19 +155,31 @@ function ScreenFallback() {
   );
 }
 
-function lazyScreen(Component: React.ComponentType<any>) {
-  return function LazyScreen(props: any) {
-    return (
-      <Suspense fallback={<ScreenFallback />}>
-        <Component {...props} />
-      </Suspense>
-    );
-  };
+// Module-scope lazy wrappers (F3). Defined here — not nested in another
+// component — so each screen splits out of the cold-start require graph.
+function LazyReader(props: any) {
+  return (
+    <Suspense fallback={<ScreenFallback />}>
+      <ReaderScreen {...props} />
+    </Suspense>
+  );
 }
 
-const LazyReader = lazyScreen(ReaderScreen);
-const LazyBrowser = lazyScreen(BrowserScreen);
-const LazySettings = lazyScreen(SettingsScreen);
+function LazyBrowser(props: any) {
+  return (
+    <Suspense fallback={<ScreenFallback />}>
+      <BrowserScreen {...props} />
+    </Suspense>
+  );
+}
+
+function LazySettings(props: any) {
+  return (
+    <Suspense fallback={<ScreenFallback />}>
+      <SettingsScreen {...props} />
+    </Suspense>
+  );
+}
 
 function TabsWrapper() {
   return (
@@ -187,9 +199,7 @@ function TabsWrapper() {
 function GuardedReader(props: any) {
   return (
     <ErrorBoundary label="Reader" resetLabel="Back to library" onReset={() => props.navigation.goBack()}>
-      <Suspense fallback={<ScreenFallback />}>
-        <LazyReader {...props} />
-      </Suspense>
+      <LazyReader {...props} />
     </ErrorBoundary>
   );
 }

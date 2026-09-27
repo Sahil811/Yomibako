@@ -107,30 +107,30 @@ export async function flush(): Promise<void> {
   }
 }
 
-/**
- * Bulk hydration for library shelf — F1. Single index read instead of 100+
- * per-volume SecureStore round-trips. Misses fall back to per-key reads and
- * rebuild the index in the background (no data loss on partial blob).
- */
-export async function getBulkReading(
-  uris: string[]
-): Promise<Map<string, { page: number; total?: number; updatedAt: number } | null>> {
-  const out = new Map<string, { page: number; total?: number; updatedAt: number } | null>();
-  if (!uris.length) return out;
-  if (!indexLoaded) {
-    try {
-      indexCache = await loadProgressIndex();
-    } catch {
-      indexCache = {};
-    }
-    indexLoaded = true;
-  }
-  const index = indexCache ?? {};
-  const missing: string[] = [];
+type BulkHit = { page: number; total?: number; updatedAt: number } | null;
+
+function collectBulkKeys(uris: string[]): { uris: string[]; keyFor: Map<string, string> } {
+  const seen = new Set<string>();
+  const deduped: string[] = [];
   const keyFor = new Map<string, string>();
   for (const uri of uris) {
-    const key = volumeKey(uri);
-    keyFor.set(uri, key);
+    if (seen.has(uri)) continue;
+    seen.add(uri);
+    deduped.push(uri);
+    keyFor.set(uri, volumeKey(uri));
+  }
+  return { uris: deduped, keyFor };
+}
+
+function fillBulkFromCaches(
+  uris: string[],
+  keyFor: Map<string, string>,
+  index: Blob,
+  out: Map<string, BulkHit>,
+  missing: string[]
+): void {
+  for (const uri of uris) {
+    const key = keyFor.get(uri) ?? volumeKey(uri);
     const cached = entryCache.get(key);
     if (cached !== undefined) {
       out.set(uri, cached ? { page: cached.p, total: cached.n, updatedAt: cached.t } : null);
@@ -144,21 +144,51 @@ export async function getBulkReading(
       missing.push(uri);
     }
   }
-  if (missing.length) {
-    // Fallback path: per-key reads only for misses, then rebuild index.
-    const fallback: Record<string, Entry | null> = {};
-    for (const uri of missing) {
-      const entry = await readEntry(uri);
-      const key = keyFor.get(uri) ?? volumeKey(uri);
-      fallback[key] = entry;
-      out.set(uri, entry ? { page: entry.p, total: entry.n, updatedAt: entry.t } : null);
-    }
+}
+
+async function fallbackBulkMissing(
+  missing: string[],
+  keyFor: Map<string, string>,
+  index: Blob,
+  out: Map<string, BulkHit>
+): Promise<void> {
+  const fallback: Record<string, Entry | null> = {};
+  for (const uri of missing) {
+    const entry = await readEntry(uri);
+    const key = keyFor.get(uri) ?? volumeKey(uri);
+    fallback[key] = entry;
+    out.set(uri, entry ? { page: entry.p, total: entry.n, updatedAt: entry.t } : null);
+  }
+  try {
+    const merged = mergeIndexWithFallback(index, fallback);
+    indexCache = merged;
+    // Best-effort rebuild, held automatically while storage is corrupt.
+    void saveProgressIndex(merged);
+  } catch {}
+}
+
+/**
+ * Bulk hydration for library shelf — F1. Single index read instead of 100+
+ * per-volume SecureStore round-trips. Misses fall back to per-key reads and
+ * rebuild the index in the background (no data loss on partial blob).
+ */
+export async function getBulkReading(uris: string[]): Promise<Map<string, BulkHit>> {
+  const out = new Map<string, BulkHit>();
+  if (!uris.length) return out;
+  if (!indexLoaded) {
     try {
-      const merged = mergeIndexWithFallback(index, fallback);
-      indexCache = merged;
-      // Best-effort rebuild, held automatically while storage is corrupt.
-      void saveProgressIndex(merged);
-    } catch {}
+      indexCache = await loadProgressIndex();
+    } catch {
+      indexCache = {};
+    }
+    indexLoaded = true;
+  }
+  const index = indexCache ?? {};
+  const { uris: deduped, keyFor } = collectBulkKeys(uris);
+  const missing: string[] = [];
+  fillBulkFromCaches(deduped, keyFor, index, out, missing);
+  if (missing.length) {
+    await fallbackBulkMissing(missing, keyFor, index, out);
   }
   return out;
 }
