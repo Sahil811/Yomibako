@@ -4,6 +4,14 @@
 
 import { Directory, File } from 'expo-file-system';
 import type { Volume, Series } from './types';
+import { compareTitle } from './mergeLibrary';
+
+// File names (covers, images, ocr json) need deterministic numeric order
+// independent of case/accent equality: variant-sensitive, unlike titles which
+// use sensitivity 'base' for user-facing sorting.
+function compareFileName(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { numeric: true });
+}
 
 const LEADING_NUMBER_RE = /^\d{1,4}(?:$|[\s._-])/;
 const VOLUME_KEYWORD_RE = /(?:^|[\s._-])(?:vol(?:ume)?|book|chapter|ch)\s*\d+\b/i;
@@ -41,12 +49,13 @@ type Level = {
   ocrDir: Directory | null;
 };
 
-function readLevel(uri: string): Level | null {
+function readLevel(uri: string, control?: ScanControl): Level | null {
   let items: (File | Directory)[];
   try {
     items = new Directory(uri).list();
   } catch (e) {
     console.warn('scanSeries list failed', uri, e);
+    control?.markIncomplete?.();
     return null;
   }
   const files = new Map<string, string>();
@@ -86,6 +95,13 @@ export type ScanControl = {
   isCancelled?: () => boolean;
   /** Resolve when it is safe to continue (used to pause while user navigates). */
   waitWhilePaused?: () => Promise<void>;
+  /**
+   * Called when any part of the walk was unreadable (list() threw).
+   * Callers must treat the result as partial: patch, never replace/prune.
+   * Without this, an unreadable root (iOS session grant expired, SD
+   * unmounted) looks identical to a deleted folder and gets pruned.
+   */
+  markIncomplete?: () => void;
 };
 
 const yieldToUI = (ms = 25) => new Promise<void>((r) => setTimeout(r, ms));
@@ -142,7 +158,7 @@ function trackVolumeFile(media: VolumeMedia, name: string, uri: string): void {
   }
 }
 
-function collectVolumeMedia(dir: Directory): VolumeMedia | null {
+function collectVolumeMedia(dir: Directory, control?: ScanControl): VolumeMedia | null {
   try {
     const media: VolumeMedia = { jpegs: [], nestedHtml: undefined, nestedMokuro: undefined };
     for (const entry of dir.list()) {
@@ -156,6 +172,9 @@ function collectVolumeMedia(dir: Directory): VolumeMedia | null {
     }
     return media;
   } catch {
+    // Unlistable volume folder: distinct from an emptied folder.
+    // Caller must not prune it.
+    control?.markIncomplete?.();
     return null;
   }
 }
@@ -170,7 +189,10 @@ function isSkippableVolume(
   if (shell.htmlUri || shell.mokuroUri || media.nestedHtml || media.nestedMokuro) {
     return false;
   }
-  return !isVolumeName(shell.title);
+  // No images and no readable file: folder is empty/unreadable.
+  // Must be skippable regardless of name, otherwise an emptied "001" volume
+  // is re-emitted with pageCount 0 and survives forever via cached-count fallback.
+  return true;
 }
 
 function findVolumeCover(jpegs: File[]): File | undefined {
@@ -182,7 +204,7 @@ function findVolumeCover(jpegs: File[]): File | undefined {
   if (byFirstPage) {
     return byFirstPage;
   }
-  return jpegs.toSorted((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))[0];
+  return jpegs.toSorted((a, b) => compareFileName(a.name, b.name))[0];
 }
 
 function pushVolumeDetail(
@@ -234,8 +256,12 @@ async function fillDetails(
       n++;
       continue;
     }
-    const media = collectVolumeMedia(dir);
-    if (media === null || isSkippableVolume(shell, media)) {
+    const media = collectVolumeMedia(dir, control);
+    if (media === null) {
+      // Unreadable: keep stale shelf, do not treat as deleted.
+      continue;
+    }
+    if (isSkippableVolume(shell, media)) {
       continue;
     }
     pushVolumeDetail(out, shell, media, total);
@@ -271,7 +297,7 @@ function isCountableChildDir(name: string): boolean {
   return name.toLowerCase() !== '_ocr';
 }
 
-function countFolderContents(dir: Directory): FolderCounts {
+function countFolderContents(dir: Directory, control?: ScanControl): FolderCounts | null {
   const counts: FolderCounts = { images: 0, readable: 0, childDirs: 0 };
   try {
     for (const item of dir.list()) {
@@ -289,7 +315,9 @@ function countFolderContents(dir: Directory): FolderCounts {
       }
     }
   } catch {
-    // Unreadable dir keeps zero counts, classified as 'empty' downstream.
+    // Unreadable dir is not empty — caller must not prune it.
+    control?.markIncomplete?.();
+    return null;
   }
   return counts;
 }
@@ -312,11 +340,16 @@ function classifyFolderCounts(counts: FolderCounts): FolderShape {
   return 'empty';
 }
 
-function inspectFolder(dir: Directory): FolderShape {
+type InspectResult = FolderShape | 'unreadable';
+
+function inspectFolder(dir: Directory, control?: ScanControl): InspectResult {
   try {
-    return classifyFolderCounts(countFolderContents(dir));
+    const counts = countFolderContents(dir, control);
+    if (counts === null) return 'unreadable';
+    return classifyFolderCounts(counts);
   } catch {
-    return 'empty';
+    control?.markIncomplete?.();
+    return 'unreadable';
   }
 }
 
@@ -354,7 +387,11 @@ async function partitionShelfDirs(
     if (control?.waitWhilePaused) await control.waitWhilePaused();
     if (control?.isCancelled?.()) break;
     const dir = top.dirs[index];
-    const shape = inspectFolder(dir);
+    const shape = inspectFolder(dir, control);
+    if (shape === 'unreadable') {
+      // Listed but unlistable: keep stale shelf, do not prune.
+      continue;
+    }
     if (shape === 'series') {
       seriesFolders.push(dir);
     } else if (shape === 'volume' || isDirectVolumeFolder(top, dir)) {
@@ -453,7 +490,7 @@ export async function scanLibrary(
   onUpdate?: (series: Series[]) => void,
   control?: ScanControl
 ): Promise<Series[]> {
-  const top = readLevel(rootUri);
+  const top = readLevel(rootUri, control);
   if (!top || top.dirs.length === 0) {
     return scanSingleSeriesRoot(rootUri, rootName, onProgress, onUpdate, control);
   }
@@ -503,7 +540,7 @@ function buildSingleImageVolume(
   seriesName: string,
   rootImages: string[]
 ): Series {
-  const sorted = rootImages.toSorted((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const sorted = rootImages.toSorted(compareFileName);
   const coverName = findRootCoverName(sorted);
   const volumes: Volume[] = [
     {
@@ -574,7 +611,7 @@ function buildStandaloneSeries(
       pageCount: 0,
     });
   }
-  volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
+  volumes.sort(compareTitle);
   return { name: seriesName, rootUri, volumes, totalPages: 0 };
 }
 
@@ -609,7 +646,7 @@ function snapshotSeries(state: SeriesScanState): Series {
   return {
     name: state.seriesName,
     rootUri: state.rootUri,
-    volumes: [...state.volumes].sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true })),
+    volumes: [...state.volumes].sort(compareTitle),
     totalPages: state.total.pages,
   };
 }
@@ -630,7 +667,7 @@ async function fillSeriesLevel(level: Level, state: SeriesScanState & { control?
 
 type NestedCandidate = { dir: Directory; subdirs: number };
 
-function countNestedDir(dir: Directory): NestedCandidate | null {
+function countNestedDir(dir: Directory, control?: ScanControl): NestedCandidate | null {
   try {
     const items = dir.list();
     let images = 0;
@@ -650,14 +687,15 @@ function countNestedDir(dir: Directory): NestedCandidate | null {
     }
     return null;
   } catch {
+    control?.markIncomplete?.();
     return null;
   }
 }
 
-function collectNestedCandidates(current: Level, depth: number): NestedCandidate[] {
+function collectNestedCandidates(current: Level, depth: number, control?: ScanControl): NestedCandidate[] {
   const candidates: NestedCandidate[] = [];
   for (const dir of current.dirs.slice(0, 20)) {
-    const candidate = countNestedDir(dir);
+    const candidate = countNestedDir(dir, control);
     if (candidate) {
       candidates.push(candidate);
     }
@@ -671,10 +709,10 @@ function collectNestedCandidates(current: Level, depth: number): NestedCandidate
 
 async function attemptNestedDescents(
   candidates: NestedCandidate[],
-  state: SeriesScanState
+  state: SeriesScanState & { control?: ScanControl }
 ): Promise<{ descended: boolean; next: Level | null }> {
   for (const candidate of candidates.slice(0, 3)) {
-    const nested = readLevel(candidate.dir.uri);
+    const nested = readLevel(candidate.dir.uri, state.control);
     if (!nested) {
       continue;
     }
@@ -699,7 +737,7 @@ async function descendNestedLevels(top: Level, state: SeriesScanState & { contro
     if (state.control?.isCancelled?.()) break;
     if (state.control?.waitWhilePaused) await state.control.waitWhilePaused();
     if (state.control?.isCancelled?.()) break;
-    const candidates = collectNestedCandidates(current, depth);
+    const candidates = collectNestedCandidates(current, depth, state.control);
     const outcome = await attemptNestedDescents(candidates, state);
     if (!outcome.descended) {
       break;
@@ -725,7 +763,7 @@ export async function scanSeries(
   topDirectoryUris?: Set<string>,
   control?: ScanControl
 ): Promise<Series> {
-  const top = readLevel(rootUri);
+  const top = readLevel(rootUri, control);
   if (!top) return { name: seriesName, rootUri, volumes: [], totalPages: 0 };
 
   const bare = scanBareRoot(top, rootUri, seriesName);
@@ -748,7 +786,7 @@ export async function scanSeries(
   if (control?.isCancelled?.()) return { name: seriesName, rootUri, volumes: state.volumes, totalPages: state.total.pages };
   await descendNestedLevels(top, state);
 
-  state.volumes.sort((a, b) => a.title.localeCompare(b.title, undefined, { numeric: true }));
+  state.volumes.sort(compareTitle);
   return { name: seriesName, rootUri, volumes: state.volumes, totalPages: state.total.pages };
 }
 

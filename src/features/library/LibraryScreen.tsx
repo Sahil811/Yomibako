@@ -31,6 +31,8 @@ import Animated, {
 import { scanLibrary } from './scan';
 import { getRoots, removeRoot, saveRoot } from '../../services/fs/saf';
 import { loadLibraryIndex, saveLibraryIndex } from './libraryCache';
+import { absorbSeries, compareTitle, pruneMissingSeries, recount, seriesKey } from './mergeLibrary';
+import type { AbsorbFn, AbsorbMode } from './mergeLibrary';
 import { clearRemoved, loadRemoved, markRemoved, restoreRemoved, withoutRemoved } from './removed';
 import { getSavedReading } from '../reader/progress';
 import type { Volume, Series } from './types';
@@ -58,12 +60,6 @@ const SORT_LABEL: Record<Sort, string> = {
   progress: 'progress',
   recent: 'recently read',
 };
-
-// Cached collator: String.localeCompare with { numeric: true } allocates a new
-// collator per comparison — brutal when re-sorting 100+ volumes on every
-// streaming scan update. One shared instance does the same ordering.
-const titleCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-const compareTitle = (a: { title: string }, b: { title: string }) => titleCollator.compare(a.title, b.title);
 
 // Deterministic muted tint so volumes without cover art still read as distinct books.
 function tintFor(seed: string, isDark: boolean): string {
@@ -489,37 +485,13 @@ const ActionSheet = React.memo(function ActionSheet({ title, subtitle, actions, 
   );
 });
 
-function seriesKey(series: Series): string {
-  return series.rootUri;
-}
-
-const seriesCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-
-function mergeSeries(current: Series[], incoming: Series[]): Series[] {
-  const byRoot = new Map(current.map((item) => [seriesKey(item), item]));
-  for (const item of incoming) byRoot.set(seriesKey(item), item);
-  return [...byRoot.values()].sort((a, b) => seriesCollator.compare(a.name, b.name));
-}
-
-function recount(series: Series, volumes: Volume[]): Series {
-  return { ...series, volumes, totalPages: volumes.reduce((count, volume) => count + volume.pageCount, 0) };
-}
-
-function filterHydratedToLive(latest: Series[], hydrated: Series[]): Series[] {
-  const live = new Set(latest.map(seriesKey));
-  return hydrated.filter((item) => live.has(seriesKey(item)));
-}
-
-function mergeHydratedIntoLibrary(latest: Series[], hydrated: Series[]): Series[] {
-  return mergeSeries(latest, filterHydratedToLive(latest, hydrated));
-}
-
 let lastFocusRefresh = 0;
 function refreshLibraryOnFocus(
   libraryRef: React.RefObject<Series[]>,
   setLibrary: React.Dispatch<React.SetStateAction<Series[]>>,
   scanningRef?: React.RefObject<boolean>,
-  control?: import('./scan').ScanControl
+  control?: import('./scan').ScanControl,
+  removedRef?: React.RefObject<Set<string>>
 ): void {
   const current = libraryRef.current;
   if (!current.length) {
@@ -532,7 +504,16 @@ function refreshLibraryOnFocus(
   if (Date.now() - lastFocusRefresh < 5000) return;
   lastFocusRefresh = Date.now();
   void withSavedProgress(current, control).then((hydrated) => {
-    setLibrary((latest) => mergeHydratedIntoLibrary(latest, hydrated));
+    // Re-check: a rescan may have started during the seconds-long SecureStore
+    // reads. A plain replace here would roll back newly streamed volumes.
+    if (scanningRef?.current) return;
+    setLibrary((latest) => {
+      // Only patch series still on the shelf; a snapshot taken before a
+      // removal/rescan must not resurrect or roll back the live list.
+      const live = new Set(latest.map(seriesKey));
+      const filtered = hydrated.filter((item) => live.has(seriesKey(item)));
+      return absorbSeries(latest, withoutRemoved(filtered, removedRef?.current ?? new Set<string>()), 'patch');
+    });
   });
 }
 
@@ -694,13 +675,23 @@ async function scanOneRoot(
   refs: ScanRefs,
   setScanProgress: (v: string) => void,
   setLoading: (v: boolean) => void,
-  absorb: (incoming: Series[]) => void
-): Promise<void> {
+  absorb: AbsorbFn
+): Promise<Series[] | null> {
   if (refs.goneRef.current) {
-    return;
+    return null;
   }
   const name = await resolveRootDisplayName(uri, 'Manga');
   const control = scanControlFromRefs(refs);
+  // Completeness: any list() throw during the walk marks incomplete.
+  // Incomplete (iOS grant expired, SD unmounted) looks like [] but must not
+  // prune — only a complete walk is evidence of deletion.
+  let incomplete = false;
+  const tracked: import('./scan').ScanControl = {
+    ...control,
+    markIncomplete: () => {
+      incomplete = true;
+    },
+  };
   try {
     const found = await scanLibrary(
       uri,
@@ -718,25 +709,41 @@ async function scanOneRoot(
         if (refs.goneRef.current) {
           return;
         }
-        const isFinal = draft.length > 0 && draft.every((s) => s.totalPages > 0);
+        // html/mokuro-only volumes have totalPages 0 forever; detail means
+        // counts>0 OR readable links present, not just totalPages>0.
+        const isFinal =
+          draft.length > 0 &&
+          draft.every((s) => s.totalPages > 0 || s.volumes.some((v) => v.htmlUri || v.mokuroUri));
         if (shouldThrottleAbsorb(refs, isFinal)) return;
         if (refs.lastAbsorbRef) refs.lastAbsorbRef.current = Date.now();
-        absorb(draft);
+        // A draft is partial by construction (shells, or volumes scanned so
+        // far). Patch so the cached covers/counts stay put while detail
+        // arrives, instead of the shelf being rebuilt in front of the user.
+        absorb(draft, 'patch');
         if (draft.length) {
           setLoading(false);
         }
       },
-      control
+      tracked
     );
-    if (refs.goneRef.current) return;
+    if (refs.goneRef.current) return null;
     if (control.waitWhilePaused) await control.waitWhilePaused();
-    if (refs.goneRef.current) return;
-    const hydrated = await withSavedProgress(found, control);
-    if (!refs.goneRef.current) {
-      absorb(hydrated);
+    if (refs.goneRef.current) return null;
+    const hydrated = await withSavedProgress(found, tracked);
+    if (refs.goneRef.current) return null;
+    if (incomplete) {
+      // Partial walk: patch in what we found, but return null so the caller
+      // does not prune this source. Replace would delete unreadable volumes.
+      absorb(hydrated, 'patch');
+      return null;
     }
+    // Root walk finished completely: this is the truth about that folder,
+    // so volumes deleted on disk are allowed to disappear here (and only here).
+    absorb(hydrated, 'replace');
+    return hydrated;
   } catch (error) {
     console.warn('[Library] scan root failed', uri, error);
+    return null;
   }
 }
 
@@ -823,9 +830,10 @@ async function persistPickedRoot(uri: string, removedRef: React.RefObject<Set<st
 async function scanPickedDirectory(
   uri: string,
   seriesName: string,
-  absorb: (incoming: Series[]) => void,
+  absorb: AbsorbFn,
   setScanProgress: (v: string) => void,
-  setLoading: (v: boolean) => void
+  setLoading: (v: boolean) => void,
+  control?: import('./scan').ScanControl
 ): Promise<Series[]> {
   return scanLibrary(
     uri,
@@ -837,9 +845,12 @@ async function scanPickedDirectory(
       // Instant UI: shells (all pageCount 0) show names right after the
       // 1 root listing; snapshots (counts > 0) stream in behind.
       // Either way, stop showing the spinner — the library is visible.
-      absorb(detected);
+      // Patch: re-picking a folder that is already on the shelf must not
+      // blank the covers and counts the shelf already had.
+      absorb(detected, 'patch');
       setLoading(false);
-    }
+    },
+    control
   );
 }
 
@@ -857,7 +868,7 @@ type PickFolderDeps = {
   setRemoved: (n: Set<string>) => void;
   setLibrary: React.Dispatch<React.SetStateAction<Series[]>>;
   setActiveSeriesUri: (v: string | null) => void;
-  absorb: (incoming: Series[]) => void;
+  absorb: AbsorbFn;
 };
 
 async function runPickFolderFlow(deps: PickFolderDeps): Promise<void> {
@@ -881,8 +892,14 @@ async function scanPickedRoot(dir: { uri: string; name?: string | null }, deps: 
   try {
     await persistPickedRoot(dir.uri, deps.removedRef, deps.setRemoved);
     const seriesName = decodeRootName(dir.name ?? 'Library', 'Library');
-    const found = await scanPickedDirectory(dir.uri, seriesName, deps.absorb, deps.setScanProgress, deps.setLoading);
-    await finishPickedScan(found, deps);
+    let incomplete = false;
+    const control: import('./scan').ScanControl = {
+      markIncomplete: () => {
+        incomplete = true;
+      },
+    };
+    const found = await scanPickedDirectory(dir.uri, seriesName, deps.absorb, deps.setScanProgress, deps.setLoading, control);
+    await finishPickedScan(found, deps, !incomplete);
   } catch (e: any) {
     const msg = String(e?.message ?? e);
     console.warn('pickFolder scan', e);
@@ -893,7 +910,7 @@ async function scanPickedRoot(dir: { uri: string; name?: string | null }, deps: 
   }
 }
 
-async function finishPickedScan(found: Series[], deps: PickFolderDeps): Promise<void> {
+async function finishPickedScan(found: Series[], deps: PickFolderDeps, complete = true): Promise<void> {
   const volumeCount = found.reduce((count, item) => count + item.volumes.length, 0);
   console.log('[Library] scan', found.length, 'series', volumeCount, 'volumes');
   if (volumeCount === 0) {
@@ -905,7 +922,12 @@ async function finishPickedScan(found: Series[], deps: PickFolderDeps): Promise<
   }
   const hydrated = await withSavedProgress(found);
   const visible = withoutRemoved(hydrated, deps.removedRef.current);
-  deps.setLibrary((current) => mergeSeries(current, visible));
+  if (!visible.length) return;
+  // Finished pick is authoritative for its root(s) only when the walk was
+  // complete: replace lets on-disk deletions take effect, patch path already
+  // handled streaming drafts. Incomplete (unreadable subfolders) must patch
+  // so unreadable volumes are kept, not deleted.
+  deps.setLibrary((current) => absorbSeries(current, visible, complete ? 'replace' : 'patch'));
   deps.setActiveSeriesUri(visible[0]?.rootUri ?? null);
   await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 }
@@ -914,7 +936,8 @@ async function rescanAllRoots(
   refs: ScanRefs & { scanningRef: React.RefObject<boolean> },
   setLoading: (v: boolean) => void,
   setScanProgress: (v: string) => void,
-  absorb: (incoming: Series[]) => void
+  absorb: AbsorbFn,
+  setLibrary: React.Dispatch<React.SetStateAction<Series[]>>
 ): Promise<void> {
   if (refs.scanningRef.current) {
     return;
@@ -924,17 +947,44 @@ async function rescanAllRoots(
   try {
     const roots = await getRoots().catch(() => [] as string[]);
     const control = scanControlFromRefs(refs);
+    const liveKeys = new Set<string>();
+    const walkedSources = new Set<string>();
     for (const uri of roots) {
       if (refs.goneRef.current) {
         break;
       }
       if (control.waitWhilePaused) await control.waitWhilePaused();
       if (refs.goneRef.current) break;
-      await scanOneRoot(uri, refs, setScanProgress, setLoading, absorb);
+      const hydrated = await scanOneRoot(uri, refs, setScanProgress, setLoading, absorb);
+      // null = failed/cancelled/incomplete: keep stale shelf, do not prune.
+      // [] with complete walk = genuinely empty: prune series from this source.
+      // scanOneRoot returns null for incomplete walks (markIncomplete) so an
+      // unreadable root (iOS grant expired, SD unmounted) never wipes the shelf.
+      if (hydrated !== null) {
+        walkedSources.add(uri);
+        for (const s of hydrated) {
+          liveKeys.add(seriesKey(s));
+          if (s.sourceRootUri) walkedSources.add(s.sourceRootUri);
+        }
+      }
+    }
+    // Drop series whose source was completely walked but whose root no longer
+    // exists. This is the only place a whole series may disappear (patch never
+    // removes). Capture the committed value inside the updater — setTimeout(0)
+    // is not a React commit barrier and would persist pre-prune state.
+    let committed: Series[] | null = null;
+    if (walkedSources.size && !refs.goneRef.current) {
+      setLibrary((current) => {
+        committed = pruneMissingSeries(current, liveKeys, walkedSources);
+        return committed;
+      });
     }
     // Snapshot the finished scan so the next cold start paints instantly.
+    // saveLibraryIndex early-returns on empty, so a total wipe is never baked
+    // in; a partial prune is, using the exact committed array above.
     if (!refs.goneRef.current) {
-      saveLibraryIndex(refs.libraryRef.current, roots);
+      const toSave = committed ?? refs.libraryRef.current;
+      if (toSave.length) saveLibraryIndex(toSave, roots);
     }
   } finally {
     refs.scanningRef.current = false;
@@ -946,11 +996,16 @@ async function rescanAllRoots(
 async function hydrateOneVolume(volume: Volume): Promise<Volume> {
   const saved = await getSavedReading(volume.progressKey ?? volume.uri);
   if (!saved) return { ...volume, progress: 0, lastOpened: undefined };
-  const total = volume.pageCount || saved.total || 1;
-  const denominator = Math.max(1, total - 1);
+  // Never fabricate pageCount: html/mokuro-only volumes legitimately have 0.
+  // Writing `|| 1` inflates totalPages, prints "1 pages", and pins progress
+  // to 1.0 via denominator Math.max(1, 1-1)=1. Keep the scanned count.
+  const totalForProgress = volume.pageCount || saved.total || 0;
+  if (!totalForProgress) {
+    return { ...volume, progress: 0, lastOpened: saved.updatedAt };
+  }
+  const denominator = Math.max(1, totalForProgress - 1);
   return {
     ...volume,
-    pageCount: total,
     progress: Math.max(0, Math.min(1, saved.page / denominator)),
     lastOpened: saved.updatedAt,
   };
@@ -1494,17 +1549,21 @@ export default function LibraryScreen() {
 
   // Single funnel for scan results, so a removed series can never be
   // resurrected by a streaming update that started before the removal.
-  const absorb = useCallback((incoming: Series[]) => {
+  // 'patch' = a partial draft mid-walk, 'replace' = the finished root result.
+  // Mode is mandatory: defaulting to replace lets a partial draft wipe progress.
+  const absorb = useCallback((incoming: Series[], mode: AbsorbMode) => {
     const visible = withoutRemoved(incoming, removedRef.current);
     if (!visible.length) return;
-    setLibrary((current) => mergeSeries(current, visible));
+    setLibrary((current) => absorbSeries(current, visible, mode));
     setActiveSeriesUri((current) => current ?? visible[0].rootUri);
   }, []);
 
   useEffect(() => {
     const incoming = route.params?.series as Series | undefined;
     if (!incoming) return;
-    absorb([incoming]);
+    // Browse hands raw scanSeries output (no progress, no sourceRootUri).
+    // Patch so returning from Browse never wipes progress or sourceRootUri.
+    absorb([incoming], 'patch');
     setActiveSeriesUri(seriesKey(incoming));
   }, [route.params?.series, absorb]);
 
@@ -1513,7 +1572,7 @@ export default function LibraryScreen() {
   // pausedRef parks the SAF walk while the user is on Browser/Settings/Reader
   // so tab presses and volume taps never queue behind the scan.
   const rescan = useCallback(async () => {
-    await rescanAllRoots({ goneRef, libraryRef, removedRef, scanningRef, pausedRef, lastAbsorbRef, lastProgressRef }, setLoading, setScanProgress, absorb);
+    await rescanAllRoots({ goneRef, libraryRef, removedRef, scanningRef, pausedRef, lastAbsorbRef, lastProgressRef }, setLoading, setScanProgress, absorb, setLibrary);
   }, [absorb]);
 
   // Pause the background SAF walk the moment the user leaves the shelf.
@@ -1549,12 +1608,15 @@ export default function LibraryScreen() {
       if (cached.length && !goneRef.current) {
         // Paint shells instantly; hydrate progress in background so the
         // first tap never waits behind 100+ SecureStore reads.
-        absorb(cached);
+        absorb(cached, 'patch');
         const control = scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef });
         void withSavedProgress(cached, control).then((hydrated) => {
-          if (!goneRef.current) {
-            setLibrary((current) => mergeSeries(current, hydrated));
-          }
+          if (goneRef.current) return;
+          // Patch, and re-apply the removal set: these 100+ SecureStore reads
+          // finish seconds later, so a plain replace here would roll back a
+          // rescan that already picked up newly added volumes — and a removed
+          // volume would come straight back out of the cache.
+          setLibrary((current) => absorbSeries(current, withoutRemoved(hydrated, removedRef.current), 'patch'));
         });
       }
     }
@@ -1585,7 +1647,8 @@ export default function LibraryScreen() {
     libraryRef,
     setLibrary,
     scanningRef,
-    scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef })
+    scanControlFromRefs({ goneRef, libraryRef, removedRef, pausedRef, lastAbsorbRef, lastProgressRef }),
+    removedRef
   )), [nav]);
 
   const pickFolder = useCallback(async () => {
@@ -1593,6 +1656,8 @@ export default function LibraryScreen() {
   }, [absorb, setRemoved]);
 
   const lastOpenRef = useRef(0);
+  const seriesRef = useRef<Series | null>(null);
+  seriesRef.current = series;
   const openVolume = useCallback((volume: Volume) => {
     // Queued taps during a freeze can fire back-to-back, opening multiple
     // Readers each copying ~50MB. Ignore repeats within 1.5s.
@@ -1605,16 +1670,26 @@ export default function LibraryScreen() {
     // Park the background scan BEFORE navigating so Reader mount + volume
     // copy don't compete with the SAF walk for the JS thread.
     pausedRef.current = true;
+    const tappedSeries = seriesRef.current;
+    const tappedSeriesKey = tappedSeries ? seriesKey(tappedSeries) : null;
     // Defer the shelf state write until after navigation commits — the
     // merge + sort of 100+ volumes otherwise delays the transition.
     requestAnimationFrame(() => {
-      if (series) {
-        const next = markVolumeOpened(series, volume.id);
-        setLibrary((current) => mergeSeries(current, [next]));
-      }
+      if (!tappedSeriesKey) return;
+      // Resolve against latest, not the render closure: a streaming absorb
+      // landing between tap and rAF must not be rolled back.
+      setLibrary((current) => {
+        const live = current.find((item) => seriesKey(item) === tappedSeriesKey);
+        if (!live) return current;
+        if (!live.volumes.some((v) => v.id === volume.id)) return current;
+        return current.map((item) => (item === live ? markVolumeOpened(live, volume.id) : item));
+      });
     });
-    nav.navigate('Reader', { volume, series });
-  }, [nav, series]);
+    // VolumeCard memo omits html/mokuro/ocr uris, so the tapped object can be
+    // stale. Resolve detail links from the latest series for the Reader.
+    const liveVolume = tappedSeries?.volumes.find((v) => v.id === volume.id) ?? volume;
+    nav.navigate('Reader', { volume: liveVolume, series: tappedSeries });
+  }, [nav]);
 
   const exitSelection = useCallback(() => {
     setSelecting(false);
